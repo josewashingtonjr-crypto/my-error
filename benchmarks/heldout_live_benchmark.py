@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent live-command benchmark for my-error v1.2.
+"""Independent live-command benchmark for my-error v0.3.
 
 Runs real failing commands in a temporary project, repeats them without protection
 (baseline), then feeds the observed failure + successful narrow correction to
@@ -210,7 +210,7 @@ def main() -> int:
 
     db.close()
     result = {
-        "benchmark": "my-error v1.2 independent live held-out A/B",
+        "benchmark": "my-error v0.3 independent live held-out A/B",
         "plugin_version": me.VERSION,
         "attempted_pairs": len(pairs), "valid_pairs": valid_pairs, "skipped": skipped,
         "baseline": {
@@ -239,7 +239,7 @@ def main() -> int:
         "false_block_commands": false_blocks,
         "temp_project": str(project),
     }
-    out_path = ROOT / "benchmarks" / "v1.2-heldout-result.json"
+    out_path = ROOT / "benchmarks" / "v0.3-heldout-result.json"
     out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result["pass_100"] else 1

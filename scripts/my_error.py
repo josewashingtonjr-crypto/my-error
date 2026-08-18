@@ -41,9 +41,19 @@ LAST_SEEN_REFRESH_SECONDS = 300
 # Recall policy. A lesson unused for this long stops being injected automatically;
 # it stays stored, stays queryable via `review`, and returns to the active set the
 # moment it is used again. Age alone never deletes anything.
-# Pre-committed decision rule for the SHADOW experiment, fixed 2026-08-18, BEFORE
-# any data existed. It lives in code precisely so that day-30 cannot be argued
-# from the numbers: whatever they turn out to be, the verdict was already written.
+# FROZEN EXPERIMENT PARAMETERS -- DO NOT EDIT BEFORE 2026-09-17.
+#
+# Fixed 2026-08-18T14:24:26Z, before a single measurement existed, precisely so
+# that day 30 cannot be argued from the numbers. Whatever they turn out to be,
+# the verdict was already written. Changing either constant in response to an
+# observed result invalidates the experiment rather than improving it.
+#
+#   confirmed == 0                  -> REMOVE the auto-guard from the code
+#   refuted > confirmed             -> REMOVE
+#   confirmed >= 3 and refuted == 0 -> PROMOTE to ENFORCE
+#   anything else                   -> EXTEND another 30 days
+#
+# Experiment start: 2026-08-18T14:24:26Z   Decision due: 2026-09-17
 SHADOW_EXPERIMENT_DAYS = 30
 SHADOW_PROMOTE_THRESHOLD = 3
 

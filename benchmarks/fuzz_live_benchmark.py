@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generated held-out typo benchmark for my-error v1.2.
+"""Generated held-out typo benchmark for my-error v0.3.
 
 The plugin does not know these concrete typo strings in advance. We generate
 single-token variants after loading the frozen implementation, execute them for
@@ -92,8 +92,8 @@ def main():
         out=me.run_guard(db,pid,{'tool_name':'Bash','tool_input':{'command':good}})
         if out and out.get('hookSpecificOutput',{}).get('permissionDecision')=='deny': false_blocks.append(good)
     learned=sum(x['learned'] for x in valid); blocked=sum(x['blocked'] for x in valid); baseline=sum(x['baseline_repeat_failed'] for x in valid)
-    result={'benchmark':'my-error v1.2 generated typo fuzz A/B','plugin_version':me.VERSION,'generated_pairs':len(pairs),'valid_pairs':len(valid),'baseline_repeat_failures':baseline,'learned':learned,'blocked':blocked,'prevention_rate':blocked/len(valid) if valid else 0,'false_blocks':len(false_blocks),'pass_100':bool(valid and baseline==len(valid) and learned==len(valid) and blocked==len(valid) and not false_blocks),'details':details,'false_block_commands':false_blocks}
-    (ROOT/'benchmarks'/'v1.2-fuzz-result.json').write_text(json.dumps(result,indent=2,ensure_ascii=False)+'\n')
+    result={'benchmark':'my-error v0.3 generated typo fuzz A/B','plugin_version':me.VERSION,'generated_pairs':len(pairs),'valid_pairs':len(valid),'baseline_repeat_failures':baseline,'learned':learned,'blocked':blocked,'prevention_rate':blocked/len(valid) if valid else 0,'false_blocks':len(false_blocks),'pass_100':bool(valid and baseline==len(valid) and learned==len(valid) and blocked==len(valid) and not false_blocks),'details':details,'false_block_commands':false_blocks}
+    (ROOT/'benchmarks'/'v0.3-fuzz-result.json').write_text(json.dumps(result,indent=2,ensure_ascii=False)+'\n')
     print(json.dumps({k:v for k,v in result.items() if k!='details'},indent=2))
     return 0 if result['pass_100'] else 1
 

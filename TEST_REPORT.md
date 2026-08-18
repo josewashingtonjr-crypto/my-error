@@ -36,7 +36,7 @@ figure was environment-specific, not a property of the algorithm.
 - Semantic recall: 10/10 expected lessons ranked #1 for differently worded prompts.
 - False blocks: 0. Anti-superstition false lessons: 0. Control commands checked: 32.
 
-Raw result: `benchmarks/v1.2-heldout-result.json`
+Raw result: `benchmarks/v0.3-heldout-result.json`
 
 ### 2. Generated typo fuzz A/B
 
@@ -46,7 +46,7 @@ the plugin.
 - 30 generated valid pairs. Baseline repeated failures: 30/30.
 - Learned 30/30, exact recurrences blocked 30/30 (100%), false blocks 0.
 
-Raw result: `benchmarks/v1.2-fuzz-result.json`
+Raw result: `benchmarks/v0.3-fuzz-result.json`
 
 ### 3. Regression benchmark
 

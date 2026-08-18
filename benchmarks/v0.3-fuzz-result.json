@@ -1,5 +1,5 @@
 {
-  "benchmark": "my-error v1.2 generated typo fuzz A/B",
+  "benchmark": "my-error v0.3 generated typo fuzz A/B",
   "plugin_version": "0.3.0",
   "generated_pairs": 30,
   "valid_pairs": 30,
