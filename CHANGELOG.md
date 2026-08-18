@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.3.1 — split-brain database (bugfix)
+
+Two defects found by using the plugin, not by reading it. No experiment parameter,
+learning criterion, guard rule, error family, heuristic, locale behaviour or recorded
+metric was touched.
+
+### Fixed
+
+- **The plugin kept two databases and the readable one was not the written one.**
+  `${CLAUDE_PLUGIN_DATA}` is injected into hook processes only, so every skill and CLI
+  command — `doctor`, `status`, `review`, `learn`, `forget` — fell through to a different
+  path. `/my-error:doctor` reported an empty database while the hooks accumulated history
+  elsewhere, and `/my-error:learn` would have written lessons the hooks could never read.
+
+  The injected value is also **not stable**: Claude Code derives the directory from the
+  plugin id, which encodes the *load method* (`my-error@inline` for `--plugin-dir`,
+  `my-error@<marketplace>` when installed). On the machine where this was found it had
+  already produced two directories with the history in one and nothing in the other.
+
+  Storage is now a fixed canonical directory that no load method can perturb, resolved by
+  one function that hooks, skills, CLI and the external watchdog all call. The injected
+  value is used only to *discover* legacy data to adopt. Adoption moves a single populated
+  legacy database; it never merges two, because choosing one silently would discard the
+  other's lessons — that case is reported by `doctor` instead.
+
+- **Concurrent hooks lost captures (~20% of 8-way runs).** `PRAGMA journal_mode=WAL` was
+  issued on every connect. That PRAGMA needs a brief exclusive lock and, unlike ordinary
+  statements, does **not** honour `busy_timeout` — it returns `SQLITE_BUSY` immediately.
+  A hook could therefore lose its entire event to a lock it was never given a chance to
+  wait for. It is now set only when the file is not already in WAL. Separately, the retry
+  helper did not roll back before retrying, so a retry re-entered a still-open failed
+  transaction; it now rolls back and applies jitter. Measured after: 0 losses in 60 runs.
+
+### Added
+
+- `datadir` command exposing the canonical resolution, so the watchdog consumes it instead
+  of reimplementing it.
+- `doctor` now prints the resolved database path, its readability, whether an injected
+  path was present and whether it matched, and any populated legacy database left alone.
+- Regression tests A–F reproducing the defect: hook context, skill context, cross-visible
+  hook writes, cross-visible manual lessons, reads from another project, and proof that no
+  normal operation recreates the old fallback. Plus adoption and refuse-to-merge tests.
+
 ## 0.3.0 — experimental repositioning
 
 Renumbered from 1.2.0 to 0.x on purpose: the automatic guard is on a 30-day probation

@@ -12,6 +12,7 @@ import difflib
 import hashlib
 import json
 import os
+import random
 import re
 import shlex
 import sqlite3
@@ -21,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 SCHEMA_VERSION = 2
 MAX_TEXT = 4000
 AUTO_GUARD_TTL_DAYS = 90
@@ -250,18 +251,160 @@ def project_id(root: str) -> str:
     return hashlib.sha256(project_identity(root).encode("utf-8", "replace")).hexdigest()[:20]
 
 
+# --- canonical storage -------------------------------------------------------
+#
+# THE single resolution of where my-error's database lives. Every consumer --
+# hooks, skills, the CLI, the external watchdog -- must arrive here, or the
+# plugin silently keeps two databases and the one you can read is not the one
+# the hooks write to.
+#
+# Why not ${CLAUDE_PLUGIN_DATA}, the officially injected context:
+#
+#   1. It is injected into hook processes only. A skill runs as a plain Bash
+#      command and never receives it, so every user-facing command resolved
+#      somewhere else -- the defect this replaces.
+#   2. It is not stable. Claude Code derives it as
+#      `plugins/data/<pluginId with non-alphanumerics replaced by ->`, and the
+#      pluginId carries the *load method*: `my-error@inline` for --plugin-dir,
+#      `my-error@<marketplace>` for an installed plugin. On this machine that
+#      produced two directories, `my-error-inline` and `my-error-my-error-local`,
+#      with the learning history in one and nothing in the other.
+#
+# So the injected value is used to *find* legacy data to adopt, never as the
+# place to store it. The canonical directory is a fixed name that no load method
+# can perturb. It cannot collide with a Claude-derived directory, because those
+# always carry a marketplace suffix.
+CANONICAL_DIR_NAME = "my-error"
+
+_DATA_DIR_CACHE: Path | None = None
+
+
+def claude_plugins_root() -> Path:
+    override = os.getenv("CLAUDE_CODE_PLUGIN_CACHE_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / ".claude" / "plugins"
+
+
+def legacy_data_dirs() -> list[Path]:
+    """Directories a previous version may have written to, newest first."""
+    found: list[Path] = []
+    injected = os.getenv("CLAUDE_PLUGIN_DATA")
+    if injected:
+        found.append(Path(injected))
+    base = claude_plugins_root() / "data"
+    try:
+        for child in sorted(base.iterdir()):
+            if child.is_dir() and child.name.startswith("my-error") and child.name != CANONICAL_DIR_NAME:
+                found.append(child)
+    except Exception:
+        pass
+    # The original pre-0.3.1 fallback.
+    found.append(Path.home() / ".claude" / "my-error")
+    seen: set[str] = set()
+    out: list[Path] = []
+    for d in found:
+        try:
+            key = str(d.resolve())
+        except Exception:
+            key = str(d)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+    return out
+
+
+def _db_population(path: Path) -> int:
+    """Rows that represent real user history. Used only to decide adoption."""
+    db_file = path / "my-error.db"
+    if not db_file.exists():
+        return 0
+    try:
+        db = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return 0
+    total = 0
+    try:
+        for table in ("candidates", "lessons", "guard_events"):
+            try:
+                total += int(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            except sqlite3.Error:
+                pass
+    finally:
+        db.close()
+    return total
+
+
+def adopt_legacy(canonical: Path) -> str | None:
+    """Move a single populated legacy database into the canonical location.
+
+    Deliberately refuses to merge. If two legacy databases both hold history,
+    picking one silently would discard the other's lessons, so the situation is
+    reported through `doctor` and left for a human instead.
+    """
+    if (canonical / "my-error.db").exists():
+        return None
+    populated = [(d, _db_population(d)) for d in legacy_data_dirs()]
+    populated = [(d, n) for d, n in populated if n > 0]
+    if len(populated) != 1:
+        return None
+    source = populated[0][0]
+    try:
+        canonical.mkdir(parents=True, exist_ok=True)
+        for name in ("my-error.db", "my-error.db-wal", "my-error.db-shm", "runtime.json"):
+            src = source / name
+            if src.exists():
+                src.replace(canonical / name)
+        return str(source)
+    except Exception:
+        return None
+
+
+def unmerged_legacy() -> list[str]:
+    """Populated legacy directories that were left alone. Reported by doctor."""
+    canonical = data_dir()
+    out = []
+    for d in legacy_data_dirs():
+        try:
+            if d.resolve() == canonical.resolve():
+                continue
+        except Exception:
+            pass
+        if _db_population(d) > 0:
+            out.append(str(d))
+    return out
+
+
 def data_dir() -> Path:
-    raw = os.getenv("MY_ERROR_DATA_DIR") or os.getenv("CLAUDE_PLUGIN_DATA") or str(Path.home() / ".claude" / "my-error")
-    p = Path(raw)
+    """Canonical, cached, identical for hooks, skills, CLI and watchdog."""
+    global _DATA_DIR_CACHE
+    if _DATA_DIR_CACHE is not None:
+        return _DATA_DIR_CACHE
+    override = os.getenv("MY_ERROR_DATA_DIR")
+    if override:
+        p = Path(override)
+        p.mkdir(parents=True, exist_ok=True)
+        _DATA_DIR_CACHE = p
+        return p
+    p = claude_plugins_root() / "data" / CANONICAL_DIR_NAME
     p.mkdir(parents=True, exist_ok=True)
+    adopt_legacy(p)
+    _DATA_DIR_CACHE = p
     return p
 
 
-def with_retry(fn, attempts: int = 6):
+def with_retry(fn, db: sqlite3.Connection | None = None, attempts: int = 8):
     """Retry a write through transient SQLite lock contention.
 
     Hooks fire concurrently (parallel tool calls, subagents), so a lock is
     expected rather than exceptional. Losing a capture is worse than waiting.
+
+    The rollback is essential and its absence was a real data-loss bug: after a
+    BUSY, Python's sqlite3 leaves the failed transaction open, so a retry issued
+    on top of it re-enters a connection that is still holding state and fails
+    again immediately, defeating the retry entirely. Jitter keeps a set of
+    processes that collided once from colliding again in lockstep.
     """
     delay = 0.05
     for attempt in range(attempts):
@@ -270,10 +413,15 @@ def with_retry(fn, attempts: int = 6):
         except sqlite3.OperationalError as exc:
             if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
                 raise
+            if db is not None:
+                try:
+                    db.rollback()
+                except sqlite3.Error:
+                    pass
             if attempt == attempts - 1:
                 raise
-            time.sleep(delay)
-            delay = min(delay * 2, 0.5)
+            time.sleep(delay + random.uniform(0, delay))
+            delay = min(delay * 2, 0.4)
 
 
 def connect() -> sqlite3.Connection:
@@ -284,9 +432,14 @@ def connect() -> sqlite3.Connection:
     # a hook that waits is invisible, a hook that loses a lesson is not.
     db = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_MS / 1000.0)
     db.row_factory = sqlite3.Row
-    # WAL is a persistent property of the file, but set it unconditionally so a
-    # database created by a racing process is not left in rollback-journal mode.
-    db.execute("PRAGMA journal_mode=WAL")
+    # WAL is a persistent property of the file, so set it only when it is not
+    # already set. Issuing this PRAGMA unconditionally was a data-loss bug:
+    # journal_mode requires a brief exclusive lock and, unlike ordinary
+    # statements, does NOT honour busy_timeout -- it returns SQLITE_BUSY at once.
+    # With several hooks connecting at the same instant, one would lose its whole
+    # event to a lock it was never given the chance to wait for.
+    if str(db.execute("PRAGMA journal_mode").fetchone()[0]).lower() != "wal":
+        with_retry(lambda: db.execute("PRAGMA journal_mode=WAL"), db)
     db.execute("PRAGMA synchronous=NORMAL")
     db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     current = int(db.execute("PRAGMA user_version").fetchone()[0])
@@ -354,8 +507,8 @@ def connect() -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_lessons_project ON lessons(project_id, status);
         CREATE INDEX IF NOT EXISTS idx_guards_project ON guards(project_id, active, tool_name);
         PRAGMA user_version=1;
-        """))
-        with_retry(db.commit)
+        """), db)
+        with_retry(db.commit, db)
         current = 1
     migrate(db, current)
     # Only write when it actually changes. An unconditional write here dirties the
@@ -364,8 +517,8 @@ def connect() -> sqlite3.Connection:
     row = db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
     if row is None or str(row[0]) != str(SCHEMA_VERSION):
         with_retry(lambda: db.execute(
-            "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),)))
-        with_retry(db.commit)
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),)), db)
+        with_retry(db.commit, db)
     return db
 
 
@@ -391,9 +544,9 @@ CREATE INDEX IF NOT EXISTS idx_guard_events_session ON guard_events(session_id, 
 def migrate(db: sqlite3.Connection, current: int) -> None:
     """Forward-only migrations. Each step is idempotent and independently retried."""
     if current < 2:
-        with_retry(lambda: db.executescript(SCHEMA_V2))
-        with_retry(lambda: db.execute("PRAGMA user_version=2"))
-        with_retry(db.commit)
+        with_retry(lambda: db.executescript(SCHEMA_V2), db)
+        with_retry(lambda: db.execute("PRAGMA user_version=2"), db)
+        with_retry(db.commit, db)
 
 
 def experiment_started(db: sqlite3.Connection, create: bool = False) -> str | None:
@@ -410,8 +563,8 @@ def experiment_started(db: sqlite3.Connection, create: bool = False) -> str | No
     now = utcnow()
     try:
         with_retry(lambda: db.execute(
-            "INSERT OR IGNORE INTO meta(key,value) VALUES('shadow_started_at',?)", (now,)))
-        with_retry(db.commit)
+            "INSERT OR IGNORE INTO meta(key,value) VALUES('shadow_started_at',?)", (now,)), db)
+        with_retry(db.commit, db)
     except sqlite3.Error:
         return now
     row = db.execute("SELECT value FROM meta WHERE key='shadow_started_at'").fetchone()
@@ -436,8 +589,8 @@ def set_mode(db: sqlite3.Connection, mode: str) -> str:
     mode = mode.strip().upper()
     if mode not in (MODE_SHADOW, MODE_ENFORCE):
         raise ValueError("mode must be SHADOW or ENFORCE")
-    with_retry(lambda: db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('mode',?)", (mode,)))
-    with_retry(db.commit)
+    with_retry(lambda: db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('mode',?)", (mode,)), db)
+    with_retry(db.commit, db)
     return mode
 
 def ensure_project(db: sqlite3.Connection, root: str) -> str:
@@ -464,7 +617,7 @@ def ensure_project(db: sqlite3.Connection, root: str) -> str:
             (pid, root, now, now),
         )
         db.commit()
-    with_retry(write)
+    with_retry(write, db)
     return pid
 
 def json_out(obj: dict[str, Any]) -> None:
@@ -734,7 +887,7 @@ def upsert_candidate(db: sqlite3.Connection, pid: str, event: dict[str, Any]) ->
       VALUES(?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(project_id,tool_name,bad_action,error_fingerprint)
       DO UPDATE SET occurrences=occurrences+1,last_seen=excluded.last_seen,session_id=excluded.session_id,error_excerpt=excluded.error_excerpt
-    """, (pid, session, now, now, tool, action, family, fp, err[:1600], int(eligible))))
+    """, (pid, session, now, now, tool, action, family, fp, err[:1600], int(eligible))), db)
     row = db.execute(
         "SELECT id FROM candidates WHERE project_id=? AND tool_name=? AND bad_action=? AND error_fingerprint=?",
         (pid, tool, action, fp),
@@ -893,7 +1046,7 @@ def run_guard(db: sqlite3.Connection, pid: str, event: dict[str, Any]) -> dict[s
                 (g["id"], g["lesson_id"], pid, session, tool, action, mode, now),
             )
             db.commit()
-        with_retry(record)
+        with_retry(record, db)
 
         if mode == MODE_SHADOW:
             # Deliberately permissive: let it run so the outcome can be observed.
@@ -1204,6 +1357,27 @@ def shadow_verdict(m: dict[str, Any]) -> tuple[str, str]:
     return "EXTEND", f"inconclusive ({confirmed} confirmed, {refuted} refuted); another {SHADOW_EXPERIMENT_DAYS} days"
 
 
+def cmd_datadir(args: argparse.Namespace) -> int:
+    """The resolver, exposed so the watchdog does not reimplement it.
+
+    One implementation, many consumers. A second copy in JavaScript would drift
+    from this one and recreate exactly the split it is meant to fix.
+    """
+    d = data_dir()
+    out = {
+        "data_dir": str(d.resolve()),
+        "database": str((d / "my-error.db").resolve()),
+        "beacon": str((d / "runtime.json").resolve()),
+        "canonical": True,
+        "injected_plugin_data": os.getenv("CLAUDE_PLUGIN_DATA"),
+        "unmerged_legacy": unmerged_legacy(),
+    }
+    print(json.dumps(out, ensure_ascii=False,
+                     separators=(",", ":") if args.compact else None,
+                     indent=None if args.compact else 2))
+    return 0
+
+
 def cmd_metrics(args: argparse.Namespace) -> int:
     db = connect()
     root = canonical_root()
@@ -1316,7 +1490,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     if args.json:
         print(json.dumps({
-            "version": VERSION, "schema_version": schema, "database": str(db_path),
+            "version": VERSION, "schema_version": schema, "database": str(db_path.resolve()),
+            "data_dir": str(data_dir().resolve()),
+            "injected_plugin_data": os.getenv("CLAUDE_PLUGIN_DATA"),
+            "injected_matches_canonical": (
+                Path(os.getenv("CLAUDE_PLUGIN_DATA")).resolve() == data_dir().resolve()
+                if os.getenv("CLAUDE_PLUGIN_DATA") else None),
+            "unmerged_legacy": unmerged_legacy(),
+            "database_readable": os.access(db_path, os.R_OK),
             "database_writable": os.access(data_dir(), os.W_OK), "project_root": root, "project_identity": project_identity(root),
             "project_id": pid, "python": sys.version.split()[0], "locale": loc,
             "locale_recognized": loc_ok, "fallback_active": not loc_ok, "hooks_declared": hooks, "beacon": beacon,
@@ -1355,8 +1536,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     else:
         L.append("  ABSENT - no hook of this plugin has run yet")
     L.append("")
-    L.append(f"Database:           {db_path}")
+    L.append(f"Database:           {db_path.resolve()}")
+    L.append(f"Database readable:  {'yes' if os.access(db_path, os.R_OK) else 'NO'}")
     L.append(f"Database writable:  {'yes' if os.access(data_dir(), os.W_OK) else 'NO'}")
+    injected = os.getenv("CLAUDE_PLUGIN_DATA")
+    if injected:
+        same = Path(injected).resolve() == data_dir().resolve()
+        L.append(f"Injected data dir:  {Path(injected).resolve()}")
+        L.append(f"                    {'matches canonical' if same else 'IGNORED - canonical path wins (see CANONICAL_DIR_NAME)'}")
+    else:
+        L.append("Injected data dir:  not set (skill/CLI context) - canonical path used")
+    stray = unmerged_legacy()
+    if stray:
+        L.append("Legacy databases still holding data (NOT merged automatically):")
+        for d in stray:
+            L.append(f"  {d}")
     L.append(f"Project root:       {root}")
     ident = project_identity(root)
     L.append(f"Project identity:   {ident}")
@@ -1400,6 +1594,7 @@ def build_parser() -> argparse.ArgumentParser:
     f = sub.add_parser("forget"); f.add_argument("lesson_id"); f.set_defaults(func=cmd_forget)
     i = sub.add_parser("ignore"); i.add_argument("candidate_id"); i.set_defaults(func=cmd_ignore)
     d = sub.add_parser("doctor"); d.add_argument("--json", action="store_true"); d.set_defaults(func=cmd_doctor)
+    dd = sub.add_parser("datadir"); dd.add_argument("--compact", action="store_true"); dd.set_defaults(func=cmd_datadir)
     mt = sub.add_parser("metrics"); mt.add_argument("--compact", action="store_true"); mt.set_defaults(func=cmd_metrics)
     md = sub.add_parser("mode"); md.add_argument("--set"); md.set_defaults(func=cmd_mode)
     return p

@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "my-error",
   "displayName": "My Error",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "EXPERIMENTAL. Evidence-gated error learning for Claude Code: captures failures, verifies recoveries, recalls lessons, and \u2014 once out of SHADOW mode \u2014 blocks proven repeated mistakes. The auto-guard is on probation pending measured base-rate data.",
   "license": "MIT",
   "keywords": [

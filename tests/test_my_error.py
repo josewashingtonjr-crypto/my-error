@@ -520,6 +520,116 @@ class MyErrorTest(unittest.TestCase):
         d = json.loads(self.run_cli("doctor", "--json").stdout)
         self.assertIn(d["shadow_verdict"], ("NOT STARTED", "RUNNING"))
 
+    # --- 0.3.1: one plugin, one database ------------------------------------
+
+    def _isolated(self, **extra):
+        """A HOME of our own, so canonical resolution can be exercised for real
+        instead of being short-circuited by MY_ERROR_DATA_DIR."""
+        home = Path(self.tmp.name) / "home"
+        (home / ".claude" / "plugins" / "data").mkdir(parents=True, exist_ok=True)
+        env = {k: v for k, v in self.env.items() if k != "MY_ERROR_DATA_DIR"}
+        env["HOME"] = str(home)
+        env.update(extra)
+        return home, env
+
+    def _run(self, env, *args, event=None, cwd=None):
+        return subprocess.run([sys.executable, str(SCRIPT), *args],
+                              input=(json.dumps(event) if event is not None else None),
+                              text=True, capture_output=True, env=env,
+                              cwd=str(cwd or self.project))
+
+    def test_A_hook_context_resolves_to_canonical(self):
+        """With CLAUDE_PLUGIN_DATA injected, the canonical path still wins."""
+        home, env = self._isolated(CLAUDE_PLUGIN_DATA=str(Path(self.tmp.name) / "injected"))
+        d = json.loads(self._run(env, "datadir").stdout)
+        self.assertEqual(Path(d["data_dir"]),
+                         home / ".claude" / "plugins" / "data" / "my-error")
+        self.assertNotEqual(Path(d["data_dir"]), Path(self.tmp.name) / "injected")
+
+    def test_B_skill_context_resolves_to_the_same_place(self):
+        """Without CLAUDE_PLUGIN_DATA -- the skill/CLI case that was broken."""
+        home, env = self._isolated()
+        hook_env = dict(env, CLAUDE_PLUGIN_DATA=str(Path(self.tmp.name) / "injected"))
+        a = json.loads(self._run(hook_env, "datadir").stdout)["data_dir"]
+        b = json.loads(self._run(env, "datadir").stdout)["data_dir"]
+        self.assertEqual(a, b)
+        for cmd in ("status", "review", "doctor"):
+            self.assertEqual(self._run(env, cmd).returncode, 0)
+
+    def test_C_hook_writes_are_visible_to_status(self):
+        home, env = self._isolated()
+        hook_env = dict(env, CLAUDE_PLUGIN_DATA=str(Path(self.tmp.name) / "injected"),
+                        MY_ERROR_MODE="ENFORCE")
+        ev = {"session_id": "x", "cwd": str(self.project), "tool_name": "Bash",
+              "tool_input": {"command": "cat nope.txt"},
+              "error": "cat: nope.txt: No such file or directory", "is_interrupt": False}
+        self.assertEqual(self._run(hook_env, "hook", "failure", event=ev).returncode, 0)
+        m = json.loads(self._run(env, "metrics").stdout)   # skill context
+        self.assertEqual(m["failures_captured"], 1)
+
+    def test_D_manual_lesson_is_visible_to_the_hook_path(self):
+        home, env = self._isolated()
+        self.assertEqual(self._run(env, "learn", "--title", "T", "--cause", "C",
+                                   "--rule", "Use decimal for money.",
+                                   "--confidence", "verified", "--tags", "money").returncode, 0)
+        hook_env = dict(env, CLAUDE_PLUGIN_DATA=str(Path(self.tmp.name) / "injected"))
+        out = self._run(hook_env, "hook", "prompt",
+                        event={"session_id": "x", "cwd": str(self.project),
+                               "prompt": "invoice payment amounts money"})
+        self.assertIn("Use decimal", out.stdout)
+
+    def test_E_reading_from_another_project_hits_the_same_database(self):
+        home, env = self._isolated()
+        other = Path(self.tmp.name) / "other-project"; other.mkdir()
+        a = json.loads(self._run(env, "datadir").stdout)["data_dir"]
+        b = json.loads(self._run(dict(env, CLAUDE_PROJECT_DIR=str(other)),
+                                 "datadir", cwd=other).stdout)
+        self.assertEqual(a, b["data_dir"])                       # same installation database
+        ma = json.loads(self._run(env, "metrics").stdout)
+        mb = json.loads(self._run(dict(env, CLAUDE_PROJECT_DIR=str(other)),
+                                  "metrics", cwd=other).stdout)
+        self.assertNotEqual(ma["project_id"], mb["project_id"])   # separate namespaces
+
+    def test_F_no_command_recreates_the_phantom_fallback(self):
+        home, env = self._isolated()
+        phantom = home / ".claude" / "my-error"
+        for cmd in (("doctor",), ("status",), ("review",), ("metrics",), ("datadir",)):
+            self._run(env, *cmd)
+        self._run(dict(env, CLAUDE_PLUGIN_DATA=str(Path(self.tmp.name) / "injected")),
+                  "hook", "session-start",
+                  event={"session_id": "x", "cwd": str(self.project)})
+        self.assertFalse(phantom.exists(), f"phantom database reappeared at {phantom}")
+
+    def test_legacy_database_is_adopted_not_duplicated(self):
+        home, env = self._isolated()
+        legacy = home / ".claude" / "plugins" / "data" / "my-error-inline"
+        legacy.mkdir(parents=True)
+        seed = dict(env, MY_ERROR_DATA_DIR=str(legacy), MY_ERROR_MODE="ENFORCE")
+        self._run(seed, "hook", "failure",
+                  event={"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                         "tool_input": {"command": "cat nope.txt"},
+                         "error": "cat: nope.txt: No such file or directory",
+                         "is_interrupt": False})
+        self.assertEqual(json.loads(self._run(seed, "metrics").stdout)["failures_captured"], 1)
+        m = json.loads(self._run(env, "metrics").stdout)          # canonical, first touch
+        self.assertEqual(m["failures_captured"], 1, "legacy history was not adopted")
+        self.assertFalse((legacy / "my-error.db").exists(), "legacy copy left behind")
+
+    def test_two_populated_legacy_dirs_are_reported_not_merged(self):
+        home, env = self._isolated()
+        base = home / ".claude" / "plugins" / "data"
+        for name in ("my-error-inline", "my-error-my-error-local"):
+            d = base / name; d.mkdir(parents=True)
+            self._run(dict(env, MY_ERROR_DATA_DIR=str(d), MY_ERROR_MODE="ENFORCE"),
+                      "hook", "failure",
+                      event={"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                             "tool_input": {"command": f"cat {name}.txt"},
+                             "error": f"cat: {name}.txt: No such file or directory",
+                             "is_interrupt": False})
+        d = json.loads(self._run(env, "datadir").stdout)
+        self.assertEqual(len(d["unmerged_legacy"]), 2)            # both reported
+        self.assertEqual(json.loads(self._run(env, "metrics").stdout)["failures_captured"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
