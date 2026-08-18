@@ -330,11 +330,17 @@ def migrate(db: sqlite3.Connection, current: int) -> None:
         with_retry(db.commit)
 
 
-def experiment_started(db: sqlite3.Connection) -> str:
-    """Stamp the first moment SHADOW ran, so 'day 30' is a fact, not a memory."""
+def experiment_started(db: sqlite3.Connection, create: bool = False) -> str | None:
+    """Stamp the first moment SHADOW ran, so 'day 30' is a fact, not a memory.
+
+    Only hooks may create the stamp. A read-only command that wrote it would be a
+    write, which is exactly the defect this codebase just removed elsewhere.
+    """
     row = db.execute("SELECT value FROM meta WHERE key='shadow_started_at'").fetchone()
     if row:
         return str(row[0])
+    if not create:
+        return None
     now = utcnow()
     try:
         with_retry(lambda: db.execute(
@@ -904,6 +910,8 @@ def _dispatch_hook(args: argparse.Namespace) -> tuple[int, sqlite3.Connection, s
     root = canonical_root(event)
     pid = ensure_project(db, root)
     kind = args.kind
+    if get_mode(db) == MODE_SHADOW:
+        experiment_started(db, create=True)
 
     if kind == "session-start":
         rows = list(db.execute(
@@ -1040,7 +1048,7 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
     try:
         days = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(started)).days
     except Exception:
-        days = 0
+        days = None
     one = lambda q, a=(): db.execute(q, a).fetchone()[0]  # noqa: E731
 
     failures = one("SELECT COUNT(*) FROM candidates WHERE project_id=?", (pid,))
@@ -1067,7 +1075,7 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
 
     return {
         "mode": mode,
-        "shadow_started_at": started,
+        "shadow_started_at": started,   # None until the first hook stamps it
         "shadow_day": days,
         "failures_captured": failures,
         "failure_events": failure_events,
@@ -1211,7 +1219,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     L.append(f"Python:             {sys.version.split()[0]}")
     L.append(f"Mode:               {m['mode']}")
     if m["mode"] == MODE_SHADOW:
-        L.append(f"Shadow experiment:  day {m['shadow_day']} of 30 (started {m['shadow_started_at']})")
+        if m["shadow_started_at"]:
+            L.append(f"Shadow experiment:  day {m['shadow_day']} of 30 (started {m['shadow_started_at']})")
+        else:
+            L.append("Shadow experiment:  not started (no hook has run yet)")
         L.append("                    nothing is blocked; the guard only records what it would have blocked")
     L.append("")
     L.append("Hooks declared by this plugin:")
