@@ -22,8 +22,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "0.3.1"
-SCHEMA_VERSION = 2
+VERSION = "0.3.2"
+SCHEMA_VERSION = 3
 MAX_TEXT = 4000
 AUTO_GUARD_TTL_DAYS = 90
 RECOVERY_WINDOW_MINUTES = 15
@@ -38,6 +38,17 @@ MODE_SHADOW = "SHADOW"
 MODE_ENFORCE = "ENFORCE"
 DEFAULT_MODE = MODE_SHADOW
 LAST_SEEN_REFRESH_SECONDS = 300
+
+# Population tag for the 30-day SHADOW experiment. `controlled_test` is data
+# produced by deliberately provoking a repeat mistake (development, fuzzing,
+# demos); `natural_usage` is everything else. shadow_verdict() reads
+# natural_usage exclusively -- see METRICS.md. Nothing but an explicit,
+# temporary MY_ERROR_EVENT_ORIGIN=controlled_test marks an event controlled;
+# the absence of that marker is itself the natural-usage default, so nobody
+# can contaminate the experiment by forgetting to flag a test.
+ORIGIN_NATURAL = "natural_usage"
+ORIGIN_CONTROLLED = "controlled_test"
+VALID_ORIGINS = {ORIGIN_NATURAL, ORIGIN_CONTROLLED}
 
 # Recall policy. A lesson unused for this long stops being injected automatically;
 # it stays stored, stays queryable via `review`, and returns to the active set the
@@ -187,6 +198,18 @@ AUTO_ELIGIBLE = {
 
 def utcnow() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def event_origin() -> str:
+    """Resolve the origin of the event being captured right now.
+
+    Read fresh at each capture point (candidate creation, guard firing, manual
+    `learn`) rather than cached, so a single hook invocation that forgets to
+    set the marker defaults safely to natural_usage instead of silently
+    inheriting a stale controlled_test from elsewhere in the process.
+    """
+    val = (os.getenv("MY_ERROR_EVENT_ORIGIN") or "").strip().lower()
+    return val if val in VALID_ORIGINS else ORIGIN_NATURAL
 
 
 def redact(text: Any) -> str:
@@ -541,11 +564,54 @@ CREATE INDEX IF NOT EXISTS idx_guard_events_session ON guard_events(session_id, 
 """
 
 
+ORIGIN_TABLES = ("candidates", "lessons", "guards", "guard_events")
+
+
+def _add_origin_columns(db: sqlite3.Connection) -> None:
+    """ALTER ADD COLUMN, guarded against a column that already exists.
+
+    Unlike the CREATE TABLE IF NOT EXISTS statements elsewhere, ALTER TABLE ADD
+    COLUMN has no idempotent form in SQLite -- re-running it against a table
+    that already has the column raises "duplicate column name". That is a real
+    path, not just theoretical: `user_version` can be rolled back (as the v1
+    migration test deliberately does) without the columns themselves being
+    dropped, so this must tolerate being entered more than once.
+    """
+    for table in ORIGIN_TABLES:
+        cols = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        if "origin" not in cols:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN origin TEXT NOT NULL DEFAULT 'natural_usage'")
+
+
 def migrate(db: sqlite3.Connection, current: int) -> None:
     """Forward-only migrations. Each step is idempotent and independently retried."""
     if current < 2:
         with_retry(lambda: db.executescript(SCHEMA_V2), db)
         with_retry(lambda: db.execute("PRAGMA user_version=2"), db)
+        with_retry(db.commit, db)
+    if current < 3:
+        with_retry(lambda: _add_origin_columns(db), db)
+        # Explicit, auditable backfill -- not a counter reset. Every row that
+        # existed before this plugin tracked origin was produced while
+        # developing and testing my-error itself, never by unprompted agent
+        # use, so it is data for the pipeline's functional proof, not for the
+        # natural-usage SHADOW verdict. Stamping it controlled_test here keeps
+        # those rows (they are never deleted) while starting the natural
+        # population at a true, auditable zero. The timestamp in `meta` is the
+        # audit trail: exactly when this reclassification happened and why.
+        backfilled_at = utcnow()
+        with_retry(lambda: db.execute(
+            "UPDATE candidates SET origin=? WHERE origin=?", (ORIGIN_CONTROLLED, ORIGIN_NATURAL)), db)
+        with_retry(lambda: db.execute(
+            "UPDATE lessons SET origin=? WHERE origin=?", (ORIGIN_CONTROLLED, ORIGIN_NATURAL)), db)
+        with_retry(lambda: db.execute(
+            "UPDATE guards SET origin=? WHERE origin=?", (ORIGIN_CONTROLLED, ORIGIN_NATURAL)), db)
+        with_retry(lambda: db.execute(
+            "UPDATE guard_events SET origin=? WHERE origin=?", (ORIGIN_CONTROLLED, ORIGIN_NATURAL)), db)
+        with_retry(lambda: db.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('origin_migration_backfilled_at',?)",
+            (backfilled_at,)), db)
+        with_retry(lambda: db.execute("PRAGMA user_version=3"), db)
         with_retry(db.commit, db)
 
 
@@ -882,12 +948,16 @@ def upsert_candidate(db: sqlite3.Connection, pid: str, event: dict[str, Any]) ->
     fp = fingerprint(err)
     now = utcnow()
     session = str(event.get("session_id", ""))
+    # Origin is captured only on first sighting and never touched by the
+    # ON CONFLICT branch: a candidate's classification is decided the moment
+    # it is first observed and does not flip on a later repeat.
+    origin = event_origin()
     with_retry(lambda: db.execute("""
-      INSERT INTO candidates(project_id,session_id,created_at,last_seen,tool_name,bad_action,error_family,error_fingerprint,error_excerpt,auto_eligible)
-      VALUES(?,?,?,?,?,?,?,?,?,?)
+      INSERT INTO candidates(project_id,session_id,created_at,last_seen,tool_name,bad_action,error_family,error_fingerprint,error_excerpt,auto_eligible,origin)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(project_id,tool_name,bad_action,error_fingerprint)
       DO UPDATE SET occurrences=occurrences+1,last_seen=excluded.last_seen,session_id=excluded.session_id,error_excerpt=excluded.error_excerpt
-    """, (pid, session, now, now, tool, action, family, fp, err[:1600], int(eligible))), db)
+    """, (pid, session, now, now, tool, action, family, fp, err[:1600], int(eligible), origin)), db)
     row = db.execute(
         "SELECT id FROM candidates WHERE project_id=? AND tool_name=? AND bad_action=? AND error_fingerprint=?",
         (pid, tool, action, fp),
@@ -934,6 +1004,11 @@ def narrow_command_correction(bad: str, good: str) -> bool:
 
 def make_auto_lesson(db: sqlite3.Connection, pid: str, candidate: sqlite3.Row, good_action: str) -> int:
     now = utcnow()
+    # Inherited from the candidate that caused it, not re-read from the current
+    # environment: the lesson and its guard are the direct, same-transaction
+    # consequence of that one candidate, so they carry its classification
+    # rather than risk drifting from it.
+    origin = candidate["origin"]
     title = f"Correct {candidate['error_family']} command"
     cause = (
         f"The exact command `{candidate['bad_action']}` produced a deterministic {candidate['error_family']} failure; "
@@ -941,16 +1016,16 @@ def make_auto_lesson(db: sqlite3.Connection, pid: str, candidate: sqlite3.Row, g
     )
     rule = f"For this project, do not retry `{candidate['bad_action']}` for this operation; use `{good_action}` instead."
     cur = db.execute("""
-      INSERT INTO lessons(project_id,scope,created_at,updated_at,title,cause,rule_text,confidence,status,source,source_candidate_id,tags)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (pid, "project", now, now, title, cause, rule, 0.95, "active", sorted(AUTO_LESSON_SOURCES)[0], candidate["id"], candidate["error_family"]))
+      INSERT INTO lessons(project_id,scope,created_at,updated_at,title,cause,rule_text,confidence,status,source,source_candidate_id,tags,origin)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (pid, "project", now, now, title, cause, rule, 0.95, "active", sorted(AUTO_LESSON_SOURCES)[0], candidate["id"], candidate["error_family"], origin))
     lesson_id = int(cur.lastrowid)
     expires = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=AUTO_GUARD_TTL_DAYS)).isoformat(timespec="seconds")
     db.execute("""
-      INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at)
-      VALUES(?,?,?,?,?,?,?,?,1,?,?)
+      INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at,origin)
+      VALUES(?,?,?,?,?,?,?,?,1,?,?,?)
     """, (lesson_id, pid, "Bash", "command", "exact", candidate["bad_action"], good_action,
-          f"my-error learned this exact command already failed; use `{good_action}` instead.", now, expires))
+          f"my-error learned this exact command already failed; use `{good_action}` instead.", now, expires, origin))
     db.execute("UPDATE candidates SET status='learned',recovery_action=?,recovery_evidence=recovery_evidence+1,lesson_id=? WHERE id=?",
                (good_action, lesson_id, candidate["id"]))
     db.commit()
@@ -1037,13 +1112,18 @@ def run_guard(db: sqlite3.Connection, pid: str, event: dict[str, Any]) -> dict[s
             continue
         now = utcnow()
         action = redact(raw)
+        # Read fresh here, not inherited from the guard: a guard learned during
+        # a controlled test can still fire on genuine natural use later, and
+        # that firing must be judged as natural evidence, not attributed
+        # forever to how the guard first came to exist.
+        origin = event_origin()
 
         def record() -> None:
             db.execute("UPDATE guards SET hit_count=hit_count+1,last_hit=? WHERE id=?", (now, g["id"]))
             db.execute(
-                "INSERT INTO guard_events(guard_id,lesson_id,project_id,session_id,tool_name,action,mode,created_at)"
-                " VALUES(?,?,?,?,?,?,?,?)",
-                (g["id"], g["lesson_id"], pid, session, tool, action, mode, now),
+                "INSERT INTO guard_events(guard_id,lesson_id,project_id,session_id,tool_name,action,mode,created_at,origin)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                (g["id"], g["lesson_id"], pid, session, tool, action, mode, now, origin),
             )
             db.commit()
         with_retry(record, db)
@@ -1243,17 +1323,28 @@ def cmd_learn(args: argparse.Namespace) -> int:
     scope = args.scope
     now = utcnow()
     source_candidate = args.candidate_id
+    cand = None
     if source_candidate:
         cand = db.execute("SELECT * FROM candidates WHERE id=? AND project_id=?", (source_candidate, pid)).fetchone()
         if not cand:
             print(f"Candidate {source_candidate} not found in this project", file=sys.stderr)
             return 2
     conf = confidence_value(args.confidence)
+    # --origin is the explicit, temporary override for manual testing; absent
+    # that, a lesson born from a candidate inherits its origin (same reasoning
+    # as make_auto_lesson), and a lesson with no candidate falls back to
+    # whatever MY_ERROR_EVENT_ORIGIN says right now (natural_usage by default).
+    if args.origin in VALID_ORIGINS:
+        origin = args.origin
+    elif cand is not None:
+        origin = cand["origin"]
+    else:
+        origin = event_origin()
     cur = db.execute("""
-      INSERT INTO lessons(project_id,scope,created_at,updated_at,title,cause,rule_text,confidence,status,source,source_candidate_id,tags)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+      INSERT INTO lessons(project_id,scope,created_at,updated_at,title,cause,rule_text,confidence,status,source,source_candidate_id,tags,origin)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (None if scope == "global" else pid, scope, now, now, args.title, args.cause, args.rule, conf,
-          "active", "manual-verified", source_candidate, args.tags or ""))
+          "active", "manual-verified", source_candidate, args.tags or "", origin))
     lid = int(cur.lastrowid)
     if source_candidate:
         db.execute("UPDATE candidates SET status='learned',lesson_id=? WHERE id=?", (lid, source_candidate))
@@ -1266,10 +1357,10 @@ def cmd_learn(args: argparse.Namespace) -> int:
         if args.guard_ttl_days > 0:
             expires = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=args.guard_ttl_days)).isoformat(timespec="seconds")
         db.execute("""
-          INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at)
-          VALUES(?,?,?,?,?,?,?,?,1,?,?)
+          INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at,origin)
+          VALUES(?,?,?,?,?,?,?,?,1,?,?,?)
         """, (lid, None if scope == "global" else pid, args.guard_tool, args.guard_field, args.guard_match,
-              args.guard_pattern, args.replacement, args.guard_reason or args.rule, now, expires))
+              args.guard_pattern, args.replacement, args.guard_reason or args.rule, now, expires, origin))
     db.commit()
     print(f"Learned ERR-{lid:04d} confidence={conf:.2f} scope={scope}" + (" with guard" if args.guard_tool else ""))
     return 0
@@ -1308,9 +1399,23 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
         f"SELECT COUNT(*) FROM guard_events WHERE project_id=? {where}", (pid,) + a)
     would_block = ev("AND mode='SHADOW'")
     actual_blocks = ev("AND mode='ENFORCE'")
-    confirmed = ev("AND outcome='true_positive'")
-    refuted = ev("AND outcome='false_positive'")
-    pending = ev("AND outcome='pending'")
+    confirmed_total = ev("AND outcome='true_positive'")
+    refuted_total = ev("AND outcome='false_positive'")
+    pending_total = ev("AND outcome='pending'")
+
+    # The SHADOW experiment's population split. `shadow_verdict_*` is what the
+    # 30-day pre-committed rule reads -- natural_usage only, never
+    # controlled_test. `controlled_*` exists purely for the auditable "the
+    # pipeline works" record; it must never feed the verdict. See METRICS.md.
+    natural_would_block = ev("AND mode='SHADOW' AND origin=?", (ORIGIN_NATURAL,))
+    natural_confirmed = ev("AND outcome='true_positive' AND origin=?", (ORIGIN_NATURAL,))
+    natural_refuted = ev("AND outcome='false_positive' AND origin=?", (ORIGIN_NATURAL,))
+    natural_pending = ev("AND outcome='pending' AND origin=?", (ORIGIN_NATURAL,))
+
+    controlled_would_block = ev("AND mode='SHADOW' AND origin=?", (ORIGIN_CONTROLLED,))
+    controlled_confirmed = ev("AND outcome='true_positive' AND origin=?", (ORIGIN_CONTROLLED,))
+    controlled_refuted = ev("AND outcome='false_positive' AND origin=?", (ORIGIN_CONTROLLED,))
+    controlled_pending = ev("AND outcome='pending' AND origin=?", (ORIGIN_CONTROLLED,))
 
     return {
         "mode": mode,
@@ -1325,9 +1430,21 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
         "guard_matches_total": would_block + actual_blocks,
         "would_block_shadow": would_block,
         "actual_blocks_enforce": actual_blocks,
-        "predictions_confirmed": confirmed,
-        "predictions_refuted": refuted,
-        "predictions_pending": pending,
+        # Totals across BOTH populations. May include controlled_test; never
+        # use these for the shadow verdict -- use shadow_verdict_* below.
+        "predictions_confirmed_total": confirmed_total,
+        "predictions_refuted_total": refuted_total,
+        "predictions_pending_total": pending_total,
+        # natural_usage only. This is what shadow_verdict() consumes.
+        "natural_would_block": natural_would_block,
+        "shadow_verdict_confirmed": natural_confirmed,
+        "shadow_verdict_refuted": natural_refuted,
+        "shadow_verdict_pending": natural_pending,
+        # controlled_test only. Proof the pipeline works; never a decision input.
+        "controlled_would_block": controlled_would_block,
+        "controlled_confirmed": controlled_confirmed,
+        "controlled_refuted": controlled_refuted,
+        "controlled_pending": controlled_pending,
     }
 
 
@@ -1340,9 +1457,14 @@ def shadow_verdict(m: dict[str, Any]) -> tuple[str, str]:
       refuted > confirmed                 -> REMOVE
       confirmed >= 3 and refuted == 0     -> PROMOTE to ENFORCE
       anything else                       -> EXTEND another 30 days
+
+    Reads shadow_verdict_confirmed / shadow_verdict_refuted -- natural_usage
+    only. controlled_test data (deliberately provoked repeats used to prove
+    the pipeline works) never reaches this function's inputs; see
+    docs/METRICS.md for why mixing the two would invalidate the experiment.
     """
-    confirmed = m.get("predictions_confirmed", 0)
-    refuted = m.get("predictions_refuted", 0)
+    confirmed = m.get("shadow_verdict_confirmed", 0)
+    refuted = m.get("shadow_verdict_refuted", 0)
     day = m.get("shadow_day")
     if day is None:
         return "NOT STARTED", "no hook has run yet"
@@ -1488,6 +1610,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception:
         beacon = None
 
+    origin_backfilled_row = db.execute(
+        "SELECT value FROM meta WHERE key='origin_migration_backfilled_at'").fetchone()
+    origin_backfilled_at = str(origin_backfilled_row[0]) if origin_backfilled_row else None
+
     if args.json:
         print(json.dumps({
             "version": VERSION, "schema_version": schema, "database": str(db_path.resolve()),
@@ -1502,7 +1628,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "project_id": pid, "python": sys.version.split()[0], "locale": loc,
             "locale_recognized": loc_ok, "fallback_active": not loc_ok, "hooks_declared": hooks, "beacon": beacon,
             "families_supported": sorted(AUTO_ELIGIBLE),
-            "shadow_verdict": shadow_verdict(m)[0], "shadow_verdict_reason": shadow_verdict(m)[1], **m,
+            "shadow_verdict": shadow_verdict(m)[0], "shadow_verdict_reason": shadow_verdict(m)[1],
+            "verdict_dataset": "NATURAL USAGE ONLY",
+            "origin_migration_backfilled_at": origin_backfilled_at, **m,
         }, indent=2, ensure_ascii=False))
         return 0
 
@@ -1569,10 +1697,25 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     L.append(f"  guard matches total:    {m['guard_matches_total']}")
     L.append(f"    would-block (SHADOW): {m['would_block_shadow']}")
     L.append(f"    actual blocks:        {m['actual_blocks_enforce']}")
-    L.append("  Shadow scoring (what the guard predicted vs what happened):")
-    L.append(f"    predictions confirmed: {m['predictions_confirmed']} (ran anyway, failed again)")
-    L.append(f"    predictions refuted:   {m['predictions_refuted']} (ran anyway, SUCCEEDED = false positive)")
-    L.append(f"    still pending:         {m['predictions_pending']}")
+    L.append("")
+    L.append("Shadow experiment")
+    L.append("")
+    L.append("Natural usage:")
+    L.append(f"  would_block: {m['natural_would_block']}")
+    L.append(f"  confirmed: {m['shadow_verdict_confirmed']}")
+    L.append(f"  refuted: {m['shadow_verdict_refuted']}")
+    L.append(f"  pending: {m['shadow_verdict_pending']}")
+    L.append("")
+    L.append("Controlled tests:")
+    L.append(f"  would_block: {m['controlled_would_block']}")
+    L.append(f"  confirmed: {m['controlled_confirmed']}")
+    L.append(f"  refuted: {m['controlled_refuted']}")
+    L.append("")
+    L.append("Verdict dataset:")
+    L.append("  NATURAL USAGE ONLY")
+    if origin_backfilled_at:
+        L.append("")
+        L.append(f"Origin migration:   pre-existing rows backfilled as controlled_test at {origin_backfilled_at}")
     print("\n".join(L))
     return 0 if os.access(data_dir(), os.W_OK) else 1
 
@@ -1588,6 +1731,9 @@ def build_parser() -> argparse.ArgumentParser:
     l.add_argument("--guard-tool", choices=["Bash","Write","Edit"]); l.add_argument("--guard-field")
     l.add_argument("--guard-match", choices=["exact","contains","regex"], default="exact"); l.add_argument("--guard-pattern")
     l.add_argument("--replacement"); l.add_argument("--guard-reason"); l.add_argument("--guard-ttl-days", type=int, default=0)
+    l.add_argument("--origin", choices=sorted(VALID_ORIGINS),
+                    help="Explicit, temporary override for the SHADOW experiment population. "
+                         "Defaults to the source candidate's origin, or MY_ERROR_EVENT_ORIGIN, or natural_usage.")
     l.set_defaults(func=cmd_learn)
     s = sub.add_parser("status"); s.set_defaults(func=cmd_status)
     r = sub.add_parser("review"); r.add_argument("--limit", type=int, default=20); r.set_defaults(func=cmd_review)

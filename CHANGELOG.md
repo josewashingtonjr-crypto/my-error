@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.3.2 — separate controlled_test from natural_usage (methodology fix)
+
+A methodology correction, not a feature. The 6 `predictions_confirmed` on record so far were
+produced by deliberately triggering `error → correction → repeat` to prove the pipeline
+works — valid as a functional test, invalid as evidence for the 30-day SHADOW decision, which
+asks a different question: *in unprompted use, how often does Claude try to repeat an
+already-learned mistake?* Mixing the two would have let a hand-run test decide an experiment
+about spontaneous behaviour.
+
+### Added
+
+- **`origin` column** on `candidates`, `lessons`, `guards`, `guard_events`: `natural_usage`
+  (default) or `controlled_test`. See [METRICS.md](docs/METRICS.md#origin-controlled_test-vs-natural_usage)
+  for exactly how it is set and propagated.
+- **`MY_ERROR_EVENT_ORIGIN=controlled_test`** — the explicit, temporary marker for a
+  deliberate test. Without it, every new event is `natural_usage`; nobody has to remember to
+  flag ordinary use, only the rare intentional test. `learn --origin` overrides it manually.
+- **`shadow_verdict_confirmed` / `shadow_verdict_refuted` / `shadow_verdict_pending` /
+  `natural_would_block`** — `natural_usage`-only counters. `shadow_verdict()` now reads
+  exactly these three (confirmed/refuted/day), never the combined totals. The pre-committed
+  rule itself — threshold 3, 30 days, REMOVE/PROMOTE/EXTEND conditions, start date, decision
+  date — is unchanged.
+- **`controlled_confirmed` / `controlled_refuted` / `controlled_pending` /
+  `controlled_would_block`** — `controlled_test`-only counters, kept as the auditable record
+  that the pipeline works. Never read by `shadow_verdict()`.
+- `/my-error:doctor` now prints a "Shadow experiment" section with `Natural usage:`,
+  `Controlled tests:` and `Verdict dataset: NATURAL USAGE ONLY` shown separately, plus the
+  origin-migration backfill timestamp when one occurred.
+
+### Changed
+
+- **Schema v3.** `predictions_confirmed` / `predictions_refuted` / `predictions_pending` were
+  renamed `predictions_confirmed_total` / `predictions_refuted_total` /
+  `predictions_pending_total` — they still mean "both populations combined" but the old names
+  invited exactly the misreading this release exists to prevent.
+- **Migration backfill.** Every `candidates` / `lessons` / `guards` / `guard_events` row that
+  existed before schema v3 is stamped `origin='controlled_test'` in one explicit, auditable
+  statement (timestamped in `meta.origin_migration_backfilled_at`) — not deleted, not reset.
+  That data was produced while developing and testing my-error itself, so the natural-usage
+  experiment now starts at a true, measured zero instead of an inherited six.
+
+### Not changed
+
+Threshold (3), experiment length (30 days), start date, decision date, the REMOVE / PROMOTE /
+EXTEND classification rules, failure families, locale handling, and every other frozen
+experiment parameter. This release only separates the population the rule is applied to.
+
 ## 0.3.1 — split-brain database (bugfix)
 
 Two defects found by using the plugin, not by reading it. No experiment parameter,

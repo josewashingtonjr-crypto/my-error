@@ -34,7 +34,7 @@ class MyErrorTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_cli(self, *args, event=None, project=None, mode=None, locale=None):
+    def run_cli(self, *args, event=None, project=None, mode=None, locale=None, origin=None):
         env = self.env.copy()
         if locale is not None:
             env["LC_ALL"] = locale; env["LANG"] = locale; env.pop("LC_MESSAGES", None)
@@ -42,6 +42,8 @@ class MyErrorTest(unittest.TestCase):
             env["CLAUDE_PROJECT_DIR"] = str(project)
         if mode is not None:
             env["MY_ERROR_MODE"] = mode
+        if origin is not None:
+            env["MY_ERROR_EVENT_ORIGIN"] = origin
         p = subprocess.run(
             [sys.executable, str(SCRIPT), *args],
             input=(json.dumps(event) if event is not None else None),
@@ -49,8 +51,8 @@ class MyErrorTest(unittest.TestCase):
         )
         return p
 
-    def hook(self, kind, event, project=None, mode=None, locale=None):
-        p = self.run_cli("hook", kind, event=event, project=project, mode=mode, locale=locale)
+    def hook(self, kind, event, project=None, mode=None, locale=None, origin=None):
+        p = self.run_cli("hook", kind, event=event, project=project, mode=mode, locale=locale, origin=origin)
         self.assertEqual(p.returncode, 0, p.stderr)
         return json.loads(p.stdout) if p.stdout.strip() else None
 
@@ -64,7 +66,7 @@ class MyErrorTest(unittest.TestCase):
         try: return db.execute("select count(*) from lessons where status='active'").fetchone()[0]
         finally: db.close()
 
-    def train_pair(self, bad, error, good, sid="s1", locale=None):
+    def train_pair(self, bad, error, good, sid="s1", locale=None, origin=None):
         fail = {
             "session_id": sid, "cwd": str(self.project), "hook_event_name": "PostToolUseFailure",
             "tool_name": "Bash", "tool_input": {"command": bad}, "error": error, "is_interrupt": False
@@ -74,9 +76,21 @@ class MyErrorTest(unittest.TestCase):
             "tool_name": "Bash", "tool_input": {"command": good},
             "tool_response": {"stdout": "ok", "stderr": "", "interrupted": False, "isImage": False}
         }
-        out1 = self.hook("failure", fail, locale=locale)
-        out2 = self.hook("success", success, locale=locale)
+        out1 = self.hook("failure", fail, locale=locale, origin=origin)
+        out2 = self.hook("success", success, locale=locale, origin=origin)
         return out1, out2
+
+    def confirm_prediction(self, bad, sid, origin=None, mode="SHADOW"):
+        """Guard fires, then the same command fails again: a confirmed prediction."""
+        repeat = {"session_id": sid, "cwd": str(self.project), "tool_name": "Bash", "tool_input": {"command": bad}}
+        self.hook("guard", repeat, mode=mode, origin=origin)
+        self.hook("failure", {**repeat, "error": "same failure again", "is_interrupt": False}, mode=mode, origin=origin)
+
+    def refute_prediction(self, bad, sid, origin=None, mode="SHADOW"):
+        """Guard fires, then the same command succeeds: a refuted (false-positive) prediction."""
+        repeat = {"session_id": sid, "cwd": str(self.project), "tool_name": "Bash", "tool_input": {"command": bad}}
+        self.hook("guard", repeat, mode=mode, origin=origin)
+        self.hook("success", {**repeat, "tool_response": {"stdout": "ok"}}, mode=mode, origin=origin)
 
     def test_marketplace_shape(self):
         marketplace = json.loads((ROOT / ".claude-plugin" / "marketplace.json").read_text())
@@ -361,8 +375,8 @@ class MyErrorTest(unittest.TestCase):
 
     # --- v0.3 watchdog / shadow-mode regressions ----------------------------
 
-    def metrics(self, mode=None):
-        p = self.run_cli("metrics", mode=mode)
+    def metrics(self, mode=None, origin=None):
+        p = self.run_cli("metrics", mode=mode, origin=origin)
         self.assertEqual(p.returncode, 0, p.stderr)
         return json.loads(p.stdout)
 
@@ -390,8 +404,10 @@ class MyErrorTest(unittest.TestCase):
         self.hook("failure", {**repeat, "error": "git: 'sttaus' is not a git command.",
                               "is_interrupt": False}, mode="SHADOW")
         m = self.metrics()
-        self.assertEqual(m["predictions_confirmed"], 1)
-        self.assertEqual(m["predictions_refuted"], 0)
+        self.assertEqual(m["predictions_confirmed_total"], 1)
+        self.assertEqual(m["predictions_refuted_total"], 0)
+        self.assertEqual(m["shadow_verdict_confirmed"], 1)   # natural_usage by default
+        self.assertEqual(m["shadow_verdict_refuted"], 0)
 
     def test_shadow_measures_a_false_positive(self):
         """The point of SHADOW: a guard that lets a command run and sees it
@@ -402,8 +418,10 @@ class MyErrorTest(unittest.TestCase):
         self.hook("guard", repeat, mode="SHADOW")
         self.hook("success", {**repeat, "tool_response": {"stdout": "ok"}}, mode="SHADOW")
         m = self.metrics()
-        self.assertEqual(m["predictions_refuted"], 1)
-        self.assertEqual(m["predictions_confirmed"], 0)
+        self.assertEqual(m["predictions_refuted_total"], 1)
+        self.assertEqual(m["predictions_confirmed_total"], 0)
+        self.assertEqual(m["shadow_verdict_refuted"], 1)     # natural_usage by default
+        self.assertEqual(m["shadow_verdict_confirmed"], 0)
 
     def test_enforce_blocks_and_is_counted_separately(self):
         self.train_pair("git sttaus", "git: 'sttaus' is not a git command.", "git status")
@@ -440,11 +458,15 @@ class MyErrorTest(unittest.TestCase):
         db.execute("DROP TABLE guard_events")
         db.execute("PRAGMA user_version=1")
         db.commit(); db.close()
-        m = self.metrics()          # reopening must migrate
+        m = self.metrics()          # reopening must migrate all the way to current
         self.assertEqual(m["lessons_active"], 1)
         db = sqlite3.connect(self.data / "my-error.db")
         try:
-            self.assertEqual(int(db.execute("PRAGMA user_version").fetchone()[0]), 2)
+            self.assertEqual(int(db.execute("PRAGMA user_version").fetchone()[0]), 3)
+            # Data present before the origin column existed is backfilled
+            # controlled_test, never natural_usage, so it can't leak into the verdict.
+            origin = db.execute("SELECT origin FROM lessons LIMIT 1").fetchone()[0]
+            self.assertEqual(origin, "controlled_test")
         finally:
             db.close()
 
@@ -629,6 +651,115 @@ class MyErrorTest(unittest.TestCase):
         d = json.loads(self._run(env, "datadir").stdout)
         self.assertEqual(len(d["unmerged_legacy"]), 2)            # both reported
         self.assertEqual(json.loads(self._run(env, "metrics").stdout)["failures_captured"], 0)
+
+    # --- 0.3.2: controlled_test vs natural_usage separation -----------------
+
+    def test_A_controlled_predictions_do_not_count_toward_natural_verdict(self):
+        for i in range(5):
+            sid = f"orig-a{i}"
+            self.train_pair(f"git sttaus{i}", f"git: 'sttaus{i}' is not a git command.",
+                             f"git status{i}", sid=sid, origin="controlled_test")
+            self.confirm_prediction(f"git sttaus{i}", sid=sid, origin="controlled_test")
+        m = self.metrics()
+        self.assertEqual(m["shadow_verdict_confirmed"], 0)
+        self.assertEqual(m["controlled_confirmed"], 5)
+        self.assertEqual(m["predictions_confirmed_total"], 5)
+
+    def test_B_natural_prediction_counts(self):
+        self.train_pair("git sttaus", "git: 'sttaus' is not a git command.", "git status", sid="orig-b0")
+        self.confirm_prediction("git sttaus", sid="orig-b0")  # no marker => natural_usage
+        m = self.metrics()
+        self.assertEqual(m["shadow_verdict_confirmed"], 1)
+        self.assertEqual(m["controlled_confirmed"], 0)
+
+    def test_C_mixed_population_verdict_sees_natural_only(self):
+        for i in range(6):
+            sid = f"orig-c{i}"
+            self.train_pair(f"git sttaus{i}", f"git: 'sttaus{i}' is not a git command.",
+                             f"git status{i}", sid=sid, origin="controlled_test")
+            self.confirm_prediction(f"git sttaus{i}", sid=sid, origin="controlled_test")
+        for i in range(2):
+            sid = f"orig-cn{i}"
+            self.train_pair(f"npm run buil{i}", f"Exit code 1\nnpm ERR! Missing script: buil{i}",
+                             f"npm run build{i}", sid=sid)
+            self.confirm_prediction(f"npm run buil{i}", sid=sid)
+        m = self.metrics()
+        self.assertEqual(m["shadow_verdict_confirmed"], 2)         # not 8
+        self.assertEqual(m["controlled_confirmed"], 6)
+        self.assertEqual(m["predictions_confirmed_total"], 8)
+
+    def test_D_controlled_refuted_does_not_contaminate_natural_population(self):
+        for i in range(10):
+            sid = f"orig-d{i}"
+            self.train_pair(f"git sttaus{i}", f"git: 'sttaus{i}' is not a git command.",
+                             f"git status{i}", sid=sid, origin="controlled_test")
+            self.refute_prediction(f"git sttaus{i}", sid=sid, origin="controlled_test")
+        m = self.metrics()
+        # The 10 controlled false positives are real and recorded...
+        self.assertEqual(m["controlled_refuted"], 10)
+        self.assertEqual(m["predictions_refuted_total"], 10)
+        # ...but the natural population -- what REMOVE (refuted > confirmed)
+        # actually reads -- stays exactly empty. Controlled data cannot trip
+        # that rule for a population it never touched.
+        self.assertEqual(m["shadow_verdict_refuted"], 0)
+        self.assertEqual(m["shadow_verdict_confirmed"], 0)
+
+    def test_E_propagation_controlled_candidate_flows_to_guard_and_prediction(self):
+        self.train_pair("git sttaus", "git: 'sttaus' is not a git command.", "git status",
+                         sid="orig-e0", origin="controlled_test")
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            cand_origin = db.execute("SELECT origin FROM candidates").fetchone()[0]
+            lesson_origin = db.execute("SELECT origin FROM lessons").fetchone()[0]
+            guard_origin = db.execute("SELECT origin FROM guards").fetchone()[0]
+        finally:
+            db.close()
+        self.assertEqual(cand_origin, "controlled_test")
+        self.assertEqual(lesson_origin, "controlled_test")
+        self.assertEqual(guard_origin, "controlled_test")
+        self.confirm_prediction("git sttaus", sid="orig-e0", origin="controlled_test")
+        m = self.metrics()
+        self.assertEqual(m["controlled_confirmed"], 1)
+        self.assertEqual(m["shadow_verdict_confirmed"], 0)
+
+    def test_F_default_without_marker_is_natural_usage(self):
+        self.train_pair("npm run buil", "Exit code 1\nnpm ERR! Missing script: buil", "npm run build",
+                         sid="orig-f0")
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            cand_origin = db.execute("SELECT origin FROM candidates").fetchone()[0]
+            lesson_origin = db.execute("SELECT origin FROM lessons").fetchone()[0]
+            guard_origin = db.execute("SELECT origin FROM guards").fetchone()[0]
+        finally:
+            db.close()
+        self.assertEqual(cand_origin, "natural_usage")
+        self.assertEqual(lesson_origin, "natural_usage")
+        self.assertEqual(guard_origin, "natural_usage")
+        self.confirm_prediction("npm run buil", sid="orig-f0")
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            event_origin = db.execute(
+                "SELECT origin FROM guard_events ORDER BY id DESC LIMIT 1").fetchone()[0]
+        finally:
+            db.close()
+        self.assertEqual(event_origin, "natural_usage")
+
+    def test_learn_origin_flag_overrides_inherited_origin(self):
+        p = self.run_cli("learn", "--title", "T", "--cause", "C", "--rule", "Use decimal for money.",
+                         "--confidence", "verified", "--tags", "money", "--origin", "controlled_test")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            origin = db.execute("SELECT origin FROM lessons").fetchone()[0]
+        finally:
+            db.close()
+        self.assertEqual(origin, "controlled_test")
+
+    def test_doctor_reports_verdict_dataset_is_natural_only(self):
+        d = json.loads(self.run_cli("doctor", "--json").stdout)
+        self.assertEqual(d["verdict_dataset"], "NATURAL USAGE ONLY")
+        self.assertIn("shadow_verdict_confirmed", d)
+        self.assertIn("controlled_confirmed", d)
 
 
 if __name__ == "__main__":

@@ -182,9 +182,15 @@ function statusLine(health, live) {
   const f = m.failures_captured;
   const v = m.verified_corrections;
   const pct = f > 0 ? ` (${Math.round((v / f) * 100)}%)` : '';
+  // Older beacons/metrics (pre-0.3.2) won't carry the natural/controlled
+  // split yet -- fall back to the pre-existing single-population line rather
+  // than printing "undefined".
+  const hasOriginSplit = m.shadow_verdict_confirmed !== undefined;
   const rep = m.mode === 'ENFORCE'
     ? `bloqueios: ${m.actual_blocks_enforce}`
-    : `repetições detectadas: ${m.would_block_shadow}`;
+    : hasOriginSplit
+      ? `natural: ${m.shadow_verdict_confirmed} confirmações / ${m.shadow_verdict_refuted} refutações | teste: ${m.controlled_confirmed} confirmações`
+      : `repetições detectadas: ${m.would_block_shadow}`;
   return `${P} ✅ ATIVO GLOBAL | falhas: ${f} | corrigidas: ${v}/${f}${pct} | lições: ${m.lessons_active} | ${rep} | modo: ${m.mode}`;
 }
 
