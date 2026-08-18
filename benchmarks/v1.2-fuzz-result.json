@@ -1,0 +1,315 @@
+{
+  "benchmark": "my-error v1.2 generated typo fuzz A/B",
+  "plugin_version": "1.2.0",
+  "generated_pairs": 30,
+  "valid_pairs": 30,
+  "baseline_repeat_failures": 30,
+  "learned": 30,
+  "blocked": 30,
+  "prevention_rate": 1.0,
+  "false_blocks": 0,
+  "pass_100": true,
+  "details": [
+    {
+      "bad": "python3 sccript.py",
+      "good": "python3 script.py",
+      "valid": true,
+      "family": "path_not_found",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "python3 wogker.py",
+      "good": "python3 worker.py",
+      "valid": true,
+      "family": "path_not_found",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "node server.jjs",
+      "good": "node server.js",
+      "valid": true,
+      "family": "dependency_or_import",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "node worker.jx",
+      "good": "node worker.js",
+      "valid": true,
+      "family": "dependency_or_import",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "bash build.ssh",
+      "good": "bash build.sh",
+      "valid": true,
+      "family": "path_not_found",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "cat config.jso",
+      "good": "cat config.json",
+      "valid": true,
+      "family": "path_not_found",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "git checkout devvelop",
+      "good": "git checkout develop",
+      "valid": true,
+      "family": "git_pathspec",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "git checkout faeture",
+      "good": "git checkout feature",
+      "valid": true,
+      "family": "git_pathspec",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "python3 --verssion",
+      "good": "python3 --version",
+      "valid": true,
+      "family": "unknown_option",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "node --versino",
+      "good": "node --version",
+      "valid": true,
+      "family": "unknown_option",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "git --versiof",
+      "good": "git --version",
+      "valid": true,
+      "family": "unknown_option",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "ls --colxr=never",
+      "good": "ls --color=never",
+      "valid": true,
+      "family": "unknown_option",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "grep --linu-number ok config.json",
+      "good": "grep --line-number ok config.json",
+      "valid": true,
+      "family": "unknown_option",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "git checwout main",
+      "good": "git checkout main",
+      "valid": true,
+      "family": "unknown_subcommand",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "git sttaus",
+      "good": "git status",
+      "valid": true,
+      "family": "unknown_subcommand",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "git sow HEAD",
+      "good": "git show HEAD",
+      "valid": true,
+      "family": "unknown_subcommand",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "python3 -m jsn.tool config.json",
+      "good": "python3 -m json.tool config.json",
+      "valid": true,
+      "family": "dependency_or_import",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "pkthon3 --version",
+      "good": "python3 --version",
+      "valid": true,
+      "family": "shell_command_not_found",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "noe --version",
+      "good": "node --version",
+      "valid": true,
+      "family": "shell_command_not_found",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "gitt --version",
+      "good": "git --version",
+      "valid": true,
+      "family": "shell_command_not_found",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "python3 scriptt.py",
+      "good": "python3 script.py",
+      "valid": true,
+      "family": "path_not_found",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "python3 worke.rpy",
+      "good": "python3 worker.py",
+      "valid": true,
+      "family": "path_not_found",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "node server.sj",
+      "good": "node server.js",
+      "valid": true,
+      "family": "dependency_or_import",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "node wrker.js",
+      "good": "node worker.js",
+      "valid": true,
+      "family": "dependency_or_import",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "bash buili.sh",
+      "good": "bash build.sh",
+      "valid": true,
+      "family": "path_not_found",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "cat config.jon",
+      "good": "cat config.json",
+      "valid": true,
+      "family": "path_not_found",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "git checkout develoa",
+      "good": "git checkout develop",
+      "valid": true,
+      "family": "git_pathspec",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "git checkout feeature",
+      "good": "git checkout feature",
+      "valid": true,
+      "family": "git_pathspec",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "python3 --vesrion",
+      "good": "python3 --version",
+      "valid": true,
+      "family": "unknown_option",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    },
+    {
+      "bad": "node --versionn",
+      "good": "node --version",
+      "valid": true,
+      "family": "unknown_option",
+      "eligible": true,
+      "baseline_repeat_failed": true,
+      "learned": true,
+      "blocked": true
+    }
+  ],
+  "false_block_commands": []
+}

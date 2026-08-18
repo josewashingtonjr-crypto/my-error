@@ -1,0 +1,119 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "timeout": 5,
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/my_error.py",
+              "hook",
+              "session-start"
+            ]
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "timeout": 5,
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/my_error.py",
+              "hook",
+              "prompt"
+            ]
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "timeout": 5,
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/my_error.py",
+              "hook",
+              "guard"
+            ]
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash|Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "timeout": 10,
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/my_error.py",
+              "hook",
+              "failure"
+            ]
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "timeout": 10,
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/my_error.py",
+              "hook",
+              "success"
+            ]
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "timeout": 10,
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/my_error.py",
+              "hook",
+              "cleanup"
+            ]
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "timeout": 10,
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/my_error.py",
+              "hook",
+              "stop"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,410 @@
+{
+  "benchmark": "my-error v1.2 independent live held-out A/B",
+  "plugin_version": "1.2.0",
+  "attempted_pairs": 36,
+  "valid_pairs": 33,
+  "skipped": [
+    {
+      "bad": "pytest test/test_alpha.py -q",
+      "good": "pytest tests/test_alpha.py -q",
+      "reason": "good command failed",
+      "output": "/bin/sh: 1: pytest: not found"
+    },
+    {
+      "bad": "pytest tests/test_btea.py -q",
+      "good": "pytest tests/test_beta.py -q",
+      "reason": "good command failed",
+      "output": "/bin/sh: 1: pytest: not found"
+    },
+    {
+      "bad": "pytest --versoin",
+      "good": "pytest --version",
+      "reason": "good command failed",
+      "output": "/bin/sh: 1: pytest: not found"
+    }
+  ],
+  "baseline": {
+    "repeat_failures": 33,
+    "mistakes_prevented": 0,
+    "prevention_rate": 0.0
+  },
+  "with_my_error": {
+    "trained_pairs": 33,
+    "repeat_mistakes_prevented": 33,
+    "prevention_rate": 1.0,
+    "semantic_recall_hits": 10,
+    "semantic_recall_total": 10,
+    "semantic_recall_rate": 1.0,
+    "false_blocks": 0,
+    "control_commands": 32,
+    "anti_superstition_false_lessons": 0
+  },
+  "improvement": {
+    "repeat_prevention_percentage_points": 100.0,
+    "semantic_recall_percentage_points": 100.0
+  },
+  "pass_100": true,
+  "details": [
+    {
+      "bad": "python3 sript.py",
+      "good": "python3 script.py",
+      "family": "path_not_found",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "python3 workre.py",
+      "good": "python3 worker.py",
+      "family": "path_not_found",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "node sever.js",
+      "good": "node server.js",
+      "family": "dependency_or_import",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "node wroker.js",
+      "good": "node worker.js",
+      "family": "dependency_or_import",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "bash biuld.sh",
+      "good": "bash build.sh",
+      "family": "path_not_found",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "cat confi.json",
+      "good": "cat config.json",
+      "family": "path_not_found",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "npm run biuld",
+      "good": "npm run build",
+      "family": "npm_missing_script",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "npm run tets",
+      "good": "npm run test",
+      "family": "npm_missing_script",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "npm run lnit",
+      "good": "npm run lint",
+      "family": "npm_missing_script",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "git checkout mian",
+      "good": "git checkout main",
+      "family": "git_pathspec",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "git checkout develpo",
+      "good": "git checkout develop",
+      "family": "git_pathspec",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "git checkout featuer",
+      "good": "git checkout feature",
+      "family": "git_pathspec",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "git show HEADD",
+      "good": "git show HEAD",
+      "family": "git_pathspec",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "python3 --versoin",
+      "good": "python3 --version",
+      "family": "unknown_option",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "git --verison",
+      "good": "git --version",
+      "family": "unknown_option",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "node --versoin",
+      "good": "node --version",
+      "family": "unknown_option",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "ls --alll",
+      "good": "ls --all",
+      "family": "unknown_option",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "mkdir --parentss tmp/a",
+      "good": "mkdir --parents tmp/a",
+      "family": "unknown_option",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "grep --line-nubmer ok config.json",
+      "good": "grep --line-number ok config.json",
+      "family": "unknown_option",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "git chekout main",
+      "good": "git checkout main",
+      "family": "unknown_subcommand",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "npm rn build",
+      "good": "npm run build",
+      "family": "unknown_subcommand",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "git sttaus",
+      "good": "git status",
+      "family": "unknown_subcommand",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "git shwo HEAD",
+      "good": "git show HEAD",
+      "family": "unknown_subcommand",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "npm lss",
+      "good": "npm ls",
+      "family": "unknown_subcommand",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "python3 -m unitest discover -s tests",
+      "good": "python3 -m unittest discover -s tests",
+      "family": "dependency_or_import",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "python3 -m json.toool config.json",
+      "good": "python3 -m json.tool config.json",
+      "family": "dependency_or_import",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "node --chekc server.js",
+      "good": "node --check server.js",
+      "family": "unknown_option",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "grep --colro=never ok config.json",
+      "good": "grep --color=never ok config.json",
+      "family": "unknown_option",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "ls --colro=never",
+      "good": "ls --color=never",
+      "family": "unknown_option",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "pythno3 --version",
+      "good": "python3 --version",
+      "family": "shell_command_not_found",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "ndoe --version",
+      "good": "node --version",
+      "family": "shell_command_not_found",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "npmm --version",
+      "good": "npm --version",
+      "family": "shell_command_not_found",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    },
+    {
+      "bad": "giit --version",
+      "good": "git --version",
+      "family": "shell_command_not_found",
+      "auto_eligible": true,
+      "baseline_retry_failed": true,
+      "learned": true,
+      "blocked_after": true
+    }
+  ],
+  "semantic_details": [
+    {
+      "prompt": "Compute invoice totals and payment amounts",
+      "expected_top_lesson": "Money precision",
+      "top_lesson": "Money precision",
+      "hit": true
+    },
+    {
+      "prompt": "Reference a newly added SQL field safely",
+      "expected_top_lesson": "Migration before use",
+      "top_lesson": "Migration before use",
+      "hit": true
+    },
+    {
+      "prompt": "Modify codegen output after changing its schema",
+      "expected_top_lesson": "Generated source",
+      "top_lesson": "Generated source",
+      "hit": true
+    },
+    {
+      "prompt": "Print API credentials into diagnostic logs",
+      "expected_top_lesson": "Secret logging",
+      "top_lesson": "Secret logging",
+      "hit": true
+    },
+    {
+      "prompt": "Make several DB updates all-or-nothing",
+      "expected_top_lesson": "Atomic database writes",
+      "top_lesson": "Atomic database writes",
+      "hit": true
+    },
+    {
+      "prompt": "Protect an admin endpoint with the right permissions",
+      "expected_top_lesson": "Authorization",
+      "top_lesson": "Authorization",
+      "hit": true
+    },
+    {
+      "prompt": "Prevent a race during concurrent shared-state writes",
+      "expected_top_lesson": "Concurrent state",
+      "top_lesson": "Concurrent state",
+      "hit": true
+    },
+    {
+      "prompt": "Refresh stale cached data after an update",
+      "expected_top_lesson": "Cache invalidation",
+      "top_lesson": "Cache invalidation",
+      "hit": true
+    },
+    {
+      "prompt": "Store dates correctly across multiple timezones",
+      "expected_top_lesson": "UTC timestamps",
+      "top_lesson": "UTC timestamps",
+      "hit": true
+    },
+    {
+      "prompt": "Check an endpoint payload returned over HTTP",
+      "expected_top_lesson": "API response contract",
+      "top_lesson": "API response contract",
+      "hit": true
+    }
+  ],
+  "false_block_commands": [],
+  "temp_project": "/tmp/my-error-v11-heldout-9u90kjog/project"
+}

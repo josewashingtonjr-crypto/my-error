@@ -1,0 +1,23 @@
+{
+  "benchmark": "my-error deterministic A/B",
+  "training_examples": 8,
+  "semantic_lessons": 4,
+  "baseline": {
+    "known_mistakes_prevented": 0,
+    "known_mistake_prevention_rate": 0.0,
+    "semantic_recall_hits": 0,
+    "semantic_recall_rate": 0.0
+  },
+  "with_my_error": {
+    "known_mistakes_prevented": 8,
+    "known_mistake_prevention_rate": 1.0,
+    "semantic_recall_hits": 4,
+    "semantic_recall_rate": 1.0,
+    "false_blocks": 0,
+    "transient_failure_ignored": true,
+    "active_lessons": 12,
+    "active_guards": 8,
+    "guard_hot_path_p95_ms": 0.065
+  },
+  "pass": true
+}
