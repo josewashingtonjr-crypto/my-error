@@ -454,6 +454,72 @@ class MyErrorTest(unittest.TestCase):
         self.assertIn("mode", d)
         self.assertTrue(d["hooks_declared"]["PostToolUseFailure"])
 
+    # --- Q9-Q12 policy regressions -----------------------------------------
+
+    def test_auto_lessons_are_excluded_from_prompt_recall(self):
+        """Auto lessons feed the guard, not the context window."""
+        self.train_pair("git sttaus", "git: 'sttaus' is not a git command.", "git status")
+        self.assertEqual(self.lesson_count(), 1)
+        out = self.hook("prompt", {"session_id": "r", "cwd": str(self.project),
+                                   "prompt": "run git sttaus status for me"})
+        self.assertIsNone(out)
+
+    def test_auto_lesson_source_matches_the_recall_filter(self):
+        """Guards the one coupling that would silently break Q10: creation and
+        filtering must agree on what 'automatic' means."""
+        self.train_pair("git sttaus", "git: 'sttaus' is not a git command.", "git status")
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            src = db.execute("SELECT source FROM lessons").fetchone()[0]
+        finally:
+            db.close()
+        out = self.run_cli("doctor", "--json")
+        self.assertEqual(src, "auto-verified-recovery")
+
+    def test_manual_lessons_are_still_recalled(self):
+        self.run_cli("learn", "--title", "Money precision", "--cause", "float corrupted money",
+                     "--rule", "Use decimal for money.", "--confidence", "verified", "--tags", "money")
+        out = self.hook("prompt", {"session_id": "r", "cwd": str(self.project),
+                                   "prompt": "compute invoice payment amounts"})
+        self.assertIn("Use decimal", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_dormant_lessons_leave_recall_but_stay_stored(self):
+        self.run_cli("learn", "--title", "Old rule", "--cause", "c", "--rule",
+                     "Use decimal for money.", "--confidence", "verified", "--tags", "money")
+        db = sqlite3.connect(self.data / "my-error.db")
+        db.execute("UPDATE lessons SET updated_at='2020-01-01T00:00:00+00:00',"
+                   " last_used='2020-01-01T00:00:00+00:00'")
+        db.commit(); db.close()
+        self.assertIsNone(self.hook("prompt", {"session_id": "r", "cwd": str(self.project),
+                                               "prompt": "invoice payment amounts money"}))
+        self.assertEqual(self.lesson_count(), 1)                     # stored
+        self.assertIn("Old rule", self.run_cli("review").stdout)     # still auditable
+
+    def test_worktrees_of_one_repo_share_a_namespace(self):
+        import subprocess as sp
+        repo = self.project / "repo"; repo.mkdir()
+        run = lambda *a, cwd=repo: sp.run(a, cwd=str(cwd), capture_output=True, text=True)
+        if run("git", "init", "-q").returncode != 0:
+            self.skipTest("git unavailable")
+        run("git", "config", "user.email", "t@t.invalid"); run("git", "config", "user.name", "T")
+        (repo / "a.txt").write_text("x")
+        run("git", "add", "-A"); run("git", "commit", "-qm", "init")
+        wt = self.project / "wt"
+        if run("git", "worktree", "add", "-q", str(wt), "-b", "feat").returncode != 0:
+            self.skipTest("git worktree unavailable")
+        a = json.loads(self.run_cli("metrics", project=repo).stdout)
+        b = json.loads(self.run_cli("metrics", project=wt).stdout)
+        self.assertEqual(a["project_id"], b["project_id"])       # same repository
+        self.assertNotEqual(a["project_root"], b["project_root"])  # different directories
+
+    def test_non_git_directory_falls_back_to_path_identity(self):
+        m = json.loads(self.run_cli("metrics").stdout)
+        self.assertEqual(m["project_identity"], m["project_root"])
+
+    def test_shadow_verdict_is_precommitted_and_time_gated(self):
+        d = json.loads(self.run_cli("doctor", "--json").stdout)
+        self.assertIn(d["shadow_verdict"], ("NOT STARTED", "RUNNING"))
+
 
 if __name__ == "__main__":
     unittest.main()

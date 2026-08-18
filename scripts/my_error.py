@@ -15,6 +15,7 @@ import os
 import re
 import shlex
 import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -36,6 +37,26 @@ MODE_SHADOW = "SHADOW"
 MODE_ENFORCE = "ENFORCE"
 DEFAULT_MODE = MODE_SHADOW
 LAST_SEEN_REFRESH_SECONDS = 300
+
+# Recall policy. A lesson unused for this long stops being injected automatically;
+# it stays stored, stays queryable via `review`, and returns to the active set the
+# moment it is used again. Age alone never deletes anything.
+# Pre-committed decision rule for the SHADOW experiment, fixed 2026-08-18, BEFORE
+# any data existed. It lives in code precisely so that day-30 cannot be argued
+# from the numbers: whatever they turn out to be, the verdict was already written.
+SHADOW_EXPERIMENT_DAYS = 30
+SHADOW_PROMOTE_THRESHOLD = 3
+
+# The one source string produced without human causal review. Creation and the
+# recall filter both reference this constant so the two cannot drift apart; a
+# future automatic path must be added here, and the test suite asserts that an
+# auto-created lesson actually carries it.
+AUTO_LESSON_SOURCES = {"auto-verified-recovery"}
+
+RECALL_DORMANT_DAYS = 90
+# Technical ceiling only. It is a guard against a pathological table, never the
+# selection policy -- selection is status + source + confidence + recency below.
+RECALL_SCAN_CEILING = 2000
 
 STOPWORDS = {
     "the","a","an","and","or","to","of","in","on","for","with","from","this","that","is","are","be","as","at","by",
@@ -180,8 +201,43 @@ def canonical_root(event: dict[str, Any] | None = None) -> str:
         return str(root)
 
 
+def git_common_dir(root: str) -> str | None:
+    """The shared Git directory, which is the identity that survives worktrees.
+
+    `--show-toplevel` is the *worktree* root and differs for every linked
+    worktree, so hashing it would split one repository's lessons across every
+    branch checked out beside it. `--git-common-dir` resolves to the same shared
+    area from the main worktree and every linked one.
+
+    Known limit: moving or renaming the whole repository still changes this path
+    and orphans its lessons. Surviving that needs a marker stored inside the
+    repository, which is a larger change than identity resolution.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=root, capture_output=True, text=True, timeout=2,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    raw = out.stdout.strip()
+    if not raw:
+        return None
+    try:
+        return str((Path(root) / raw).resolve() if not Path(raw).is_absolute() else Path(raw).resolve())
+    except Exception:
+        return None
+
+
+def project_identity(root: str) -> str:
+    """Prefer the repository over the directory; fall back to the path outside Git."""
+    return git_common_dir(root) or root
+
+
 def project_id(root: str) -> str:
-    return hashlib.sha256(root.encode("utf-8", "replace")).hexdigest()[:20]
+    return hashlib.sha256(project_identity(root).encode("utf-8", "replace")).hexdigest()[:20]
 
 
 def data_dir() -> Path:
@@ -583,10 +639,33 @@ def auto_eligible_for_failure(family: str, base_eligible: bool, error: str, acti
 
 
 def lesson_rows(db: sqlite3.Connection, pid: str) -> list[sqlite3.Row]:
+    """Candidates for prompt recall, selected explicitly.
+
+    Two filters that are policy, not optimisation:
+
+    - automatically learned lessons are excluded. One reads "do not run
+      `git sttaus`, run `git status`" -- useless as context, and already covered
+      by its guard. Auto lessons are fuel for prediction; reviewed lessons are
+      fuel for context. Mixing them spends tokens on every prompt to degrade the
+      half that matters. The filter keys off AUTO_LESSON_SOURCES rather than an
+      allow-list, so a lesson written by any human-reviewed path still recalls.
+    - dormant lessons are excluded. Unused for RECALL_DORMANT_DAYS means it stops
+      being injected, not that it is gone: `review` still lists it and a single
+      use makes it current again.
+
+    The LIMIT is a ceiling against a pathological table, applied *after* ordering,
+    never the selection rule itself.
+    """
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=RECALL_DORMANT_DAYS)).isoformat(timespec="seconds")
     return list(db.execute(
-        "SELECT * FROM lessons WHERE status='active' AND (scope='global' OR project_id=?) "
-        "ORDER BY confidence DESC, updated_at DESC LIMIT 500",
-        (pid,),
+        "SELECT * FROM lessons "
+        " WHERE status='active' "
+        f"   AND source NOT IN ({','.join('?' * len(AUTO_LESSON_SOURCES))}) "
+        "   AND (scope='global' OR project_id=?) "
+        "   AND COALESCE(last_used, updated_at) >= ? "
+        " ORDER BY confidence DESC, COALESCE(last_used, updated_at) DESC "
+        " LIMIT ?",
+        (*sorted(AUTO_LESSON_SOURCES), pid, cutoff, RECALL_SCAN_CEILING),
     ))
 
 
@@ -701,7 +780,7 @@ def make_auto_lesson(db: sqlite3.Connection, pid: str, candidate: sqlite3.Row, g
     cur = db.execute("""
       INSERT INTO lessons(project_id,scope,created_at,updated_at,title,cause,rule_text,confidence,status,source,source_candidate_id,tags)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (pid, "project", now, now, title, cause, rule, 0.95, "active", "auto-verified-recovery", candidate["id"], candidate["error_family"]))
+    """, (pid, "project", now, now, title, cause, rule, 0.95, "active", sorted(AUTO_LESSON_SOURCES)[0], candidate["id"], candidate["error_family"]))
     lesson_id = int(cur.lastrowid)
     expires = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=AUTO_GUARD_TTL_DAYS)).isoformat(timespec="seconds")
     db.execute("""
@@ -914,10 +993,7 @@ def _dispatch_hook(args: argparse.Namespace) -> tuple[int, sqlite3.Connection, s
         experiment_started(db, create=True)
 
     if kind == "session-start":
-        rows = list(db.execute(
-            "SELECT * FROM lessons WHERE status='active' AND (scope='global' OR project_id=?) AND confidence>=0.90 ORDER BY updated_at DESC LIMIT 3",
-            (pid,),
-        ))
+        rows = [r for r in lesson_rows(db, pid) if r["confidence"] >= 0.90][:3]
         if rows:
             json_out(hook_context("SessionStart", format_lessons(rows, "high-confidence memory loaded at session start")))
         return 0, db, pid, event
@@ -1092,11 +1168,38 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
     }
 
 
+
+def shadow_verdict(m: dict[str, Any]) -> tuple[str, str]:
+    """Apply the pre-committed rule. Returns (verdict, rationale).
+
+    Chosen before the first measurement:
+      confirmed == 0                      -> REMOVE the auto-guard from the code
+      refuted > confirmed                 -> REMOVE
+      confirmed >= 3 and refuted == 0     -> PROMOTE to ENFORCE
+      anything else                       -> EXTEND another 30 days
+    """
+    confirmed = m.get("predictions_confirmed", 0)
+    refuted = m.get("predictions_refuted", 0)
+    day = m.get("shadow_day")
+    if day is None:
+        return "NOT STARTED", "no hook has run yet"
+    if day < SHADOW_EXPERIMENT_DAYS:
+        return "RUNNING", f"day {day} of {SHADOW_EXPERIMENT_DAYS}; verdict is not due yet"
+    if confirmed == 0:
+        return "REMOVE", "the guard never once correctly predicted a repeat; the mechanism has no measured base rate"
+    if refuted > confirmed:
+        return "REMOVE", f"wrong more often than right ({refuted} refuted vs {confirmed} confirmed)"
+    if confirmed >= SHADOW_PROMOTE_THRESHOLD and refuted == 0:
+        return "PROMOTE", f"{confirmed} correct predictions, no false positives"
+    return "EXTEND", f"inconclusive ({confirmed} confirmed, {refuted} refuted); another {SHADOW_EXPERIMENT_DAYS} days"
+
+
 def cmd_metrics(args: argparse.Namespace) -> int:
     db = connect()
     root = canonical_root()
     pid = ensure_project(db, root)
-    out = {"version": VERSION, "project_root": root, "project_id": pid, **collect_metrics(db, pid)}
+    out = {"version": VERSION, "project_root": root, "project_identity": project_identity(root),
+           "project_id": pid, **collect_metrics(db, pid)}
     print(json.dumps(out, ensure_ascii=False, separators=(",", ":") if args.compact else None,
                      indent=None if args.compact else 2))
     return 0
@@ -1204,10 +1307,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps({
             "version": VERSION, "schema_version": schema, "database": str(db_path),
-            "database_writable": os.access(data_dir(), os.W_OK), "project_root": root,
+            "database_writable": os.access(data_dir(), os.W_OK), "project_root": root, "project_identity": project_identity(root),
             "project_id": pid, "python": sys.version.split()[0], "locale": loc,
             "locale_recognized": loc_ok, "fallback_active": not loc_ok, "hooks_declared": hooks, "beacon": beacon,
-            "families_supported": sorted(AUTO_ELIGIBLE), **m,
+            "families_supported": sorted(AUTO_ELIGIBLE),
+            "shadow_verdict": shadow_verdict(m)[0], "shadow_verdict_reason": shadow_verdict(m)[1], **m,
         }, indent=2, ensure_ascii=False))
         return 0
 
@@ -1220,7 +1324,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     L.append(f"Mode:               {m['mode']}")
     if m["mode"] == MODE_SHADOW:
         if m["shadow_started_at"]:
-            L.append(f"Shadow experiment:  day {m['shadow_day']} of 30 (started {m['shadow_started_at']})")
+            L.append(f"Shadow experiment:  day {m['shadow_day']} of {SHADOW_EXPERIMENT_DAYS} "
+                     f"(started {m['shadow_started_at']})")
+            v, why = shadow_verdict(m)
+            L.append(f"Pre-committed verdict: {v} - {why}")
         else:
             L.append("Shadow experiment:  not started (no hook has run yet)")
         L.append("                    nothing is blocked; the guard only records what it would have blocked")
@@ -1241,6 +1348,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     L.append(f"Database:           {db_path}")
     L.append(f"Database writable:  {'yes' if os.access(data_dir(), os.W_OK) else 'NO'}")
     L.append(f"Project root:       {root}")
+    ident = project_identity(root)
+    L.append(f"Project identity:   {ident}")
+    L.append(f"                    ({'git common dir' if ident != root else 'filesystem path (not a Git repository)'})")
     L.append(f"Project namespace:  {pid}")
     L.append(f"Locale:             {loc}")
     L.append(f"Locale recognized:  {'yes' if loc_ok else 'no'}")

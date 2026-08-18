@@ -57,7 +57,7 @@ def insert_lesson(db, pid, title, cause, rule, tags):
     db.execute("""
       INSERT INTO lessons(project_id,scope,created_at,updated_at,title,cause,rule_text,confidence,status,source,tags)
       VALUES(?,?,?,?,?,?,?,?,?,?,?)
-    """, (pid, "project", now, now, title, cause, rule, 0.98, "active", "heldout-verified", tags))
+    """, (pid, "project", now, now, title, cause, rule, 0.98, "active", "manual-verified", tags))
     db.commit()
 
 

@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.3.0 — experimental repositioning
+
+Renumbered from 1.2.0 to 0.x on purpose: the automatic guard is on a 30-day probation
+and may be removed, so a 1.x stability promise would be false.
+
+### Added
+
+- **SHADOW mode, now the default.** Guards record what they would have blocked and let the
+  command run, emitting nothing to the model — an instrument that warns changes the
+  behaviour it measures. Shadow then scores its own prediction against the real outcome:
+  `predictions_confirmed` (failed again) vs `predictions_refuted` (**succeeded** — a
+  measured false positive). An enforcing guard cannot produce this evidence.
+- **Pre-committed decision rule in code**, fixed before any data existed:
+  `confirmed == 0` or `refuted > confirmed` → remove the auto-guard; `confirmed >= 3` with
+  no false positives → promote to ENFORCE; otherwise extend. `doctor` computes the verdict
+  and refuses to state one before day 30.
+- **External liveness beacon** so a watchdog outside the plugin can judge whether it is
+  running. A plugin that monitors itself reports silence when it fails.
+- `metrics`, `mode`, and a full `doctor` report (`--json` for machines).
+
+### Changed
+
+- **Heuristic fallback gated to unrecognized locales.** In the six covered languages the
+  explicit patterns already reach 100% on both live benchmarks, so the heuristic there was
+  false-positive surface for no measurable gain. Elsewhere it is the difference between
+  learning and doing nothing. `doctor` reports `Fallback active` either way, so it never
+  degrades silently.
+- **Project identity is the Git common directory**, not the filesystem path.
+  `--show-toplevel` is the *worktree* root and differs per linked worktree, which would
+  split one repository's lessons across every branch checked out beside it.
+  `--git-common-dir` resolves to the same shared area from every worktree. Outside a
+  repository the absolute path is still used. Known limit: moving the whole repository
+  still orphans its lessons.
+- **Prompt recall excludes automatically learned lessons.** "Do not run `git sttaus`" is
+  useless as context and already covered by its guard. Auto lessons feed prediction;
+  reviewed lessons feed context.
+- **Recall selection is explicit** — status, source, confidence, recency — and the row
+  limit is a ceiling against a pathological table, not the retention policy it had
+  silently become. Lessons unused for 90 days leave automatic recall but stay stored,
+  stay listed by `review`, and return on first use. `use_count`/`last_used` were written
+  and never read; now they decide.
+
+### Fixed
+
+- Every read-only command was a write: `schema_version`, `last_seen`, and the experiment
+  stamp were rewritten on each open. This amplified lock contention and made a real
+  mutation indistinguishable from a routine open.
+- Benchmarks inserted lessons with invented `source` values, exercising a path the product
+  does not have.
+
 ## Unreleased — observability + SHADOW mode
 
 Positioning change: this is now an **experimental** plugin whose auto-guard is on a
