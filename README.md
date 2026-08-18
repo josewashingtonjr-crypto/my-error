@@ -1,148 +1,190 @@
-# my-error for Claude Code
+# my-error
 
-> **EXPERIMENTAL — v0.3.0.** Ships in **SHADOW mode**: the guard records what it *would*
-> have blocked and blocks nothing. The automatic guard is on a 30-day probation while its
-> base rate is measured, and may be removed in a later version if the data does not justify
-> it. Interfaces may change; `0.x` is deliberate.
+Persistent, evidence-gated error memory for [Claude Code](https://claude.com/claude-code).
 
-`my-error` is an evidence-gated learning plugin for Claude Code. It captures failures, recognizes a narrow set of deterministic command corrections automatically, recalls relevant prior lessons on future prompts, and blocks exact actions that were proven wrong.
+When Claude runs a command that fails and then runs a corrected one that works, `my-error`
+records the pair — but only when the correction is verifiable. It keeps that history in a
+local SQLite database, recalls reviewed lessons on later prompts, and can block an exact
+action that was already proven wrong.
+
+> ### ⚠️ EXPERIMENTAL — v0.3.1
+>
+> Ships in **SHADOW mode**: the guard records what it *would* have blocked and **blocks
+> nothing**. The automatic guard is on a 30-day probation while its real base rate is
+> measured, and it may be **removed** if the data does not justify it. `0.x` is deliberate —
+> interfaces may change. See [The experiment](#the-experiment).
+
+## The core rule
+
+**A failure is not a lesson. A failure with a diagnosed cause and a verified correction
+can become a lesson.**
+
+Everything else follows from that. A test that fails and later passes is not proof of
+anything. A network timeout is not a lesson. A command that happened to succeed nearby is
+not the correction for the one that failed.
+
+## Install
+
+Requires Claude Code, `python3`, and `git`. No third-party Python packages.
+
+```bash
+claude plugin marketplace add josewashingtonjr-crypto/my-error
+```
+
+```bash
+claude plugin install my-error@my-error-local --scope user
+```
+
+`--scope user` makes it available in every project, with history kept separately per
+project. Restart Claude Code, then run `/my-error:doctor`.
+
+To update later:
+
+```bash
+claude plugin marketplace update my-error-local && claude plugin install my-error@my-error-local --scope user
+```
+
+## Try it in two minutes
+
+In any project, ask Claude to run a command with a typo in it, let it fail, then let the
+corrected one succeed:
+
+```
+git sttaus     →  fails
+git status     →  succeeds
+git sttaus     →  runs again (SHADOW blocks nothing) and fails again
+```
+
+Then run `/my-error:doctor`. You should see `failures captured: 1`,
+`verified corrections: 1`, `would-block (SHADOW): 1`, `predictions confirmed: 1`.
+
+That last number is the point: the guard predicted a repeat, shadow let it run, and the
+prediction was borne out. For the full protocol, including the anti-superstition check,
+see [docs/TESTING.md](docs/TESTING.md).
+
+## Commands
+
+| Skill | What it does |
+|---|---|
+| `/my-error:doctor` | Full health report: paths, hooks, locale, mode, metrics |
+| `/my-error:status` | One-line counts for the current project |
+| `/my-error:review` | Pending candidates and active lessons, changing nothing |
+| `/my-error:learn` | Promote a reviewed candidate to a lesson (requires a stated cause) |
+| `/my-error:forget` | Supersede a lesson and disable its guards |
+| `/my-error:workflow` | The evidence-gated procedure Claude follows before promoting anything |
+
+The same operations exist on the CLI — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Modes
 
 | Mode | Behaviour |
 |---|---|
-| `SHADOW` (default) | A matching guard is recorded as `would_block` and the command **runs**. Nothing is blocked and nothing is injected into the model's context — an instrument that warns changes the behaviour it is measuring. |
-| `ENFORCE` | A matching guard denies the tool call, as originally designed. |
+| **`SHADOW`** (default) | A matching guard is recorded and the command **runs**. Nothing is blocked, and nothing is injected into the model's context. |
+| `ENFORCE` | A matching guard denies the tool call. |
+
+Switching mode is a CLI operation. `MY_ERROR` below is the installed script — the path is
+printed by `/my-error:doctor`:
 
 ```bash
-python3 scripts/my_error.py mode            # show
-python3 scripts/my_error.py mode --set ENFORCE
+MY_ERROR=$(ls -d ~/.claude/plugins/cache/*/my-error/*/scripts/my_error.py | tail -1)
 ```
-
-Shadow is not merely "off". When it lets a command through it scores its own prediction:
-the command failed again (`predictions_confirmed`) or it succeeded
-(`predictions_refuted` — a **measured** false positive). That is the evidence the guard is
-being judged on, and an enforcing guard cannot produce it, because blocking destroys the
-counterfactual.
-
-## Core rule
-
-**A failure is not a lesson. A failure with a diagnosed cause and verified correction can become a lesson.**
-
-## What it does automatically
-
-- Captures `Bash`, `Write`, and `Edit` failures through `PostToolUseFailure`.
-- Ignores common transient/network failures and interrupts.
-- Redacts common credentials before persistent storage.
-- Detects a closely related successful Bash command after deterministic failures such as command typos, missing npm scripts, wrong paths, Node/Python entrypoint-module typos, invalid options, and Git/npm subcommand mistakes.
-- Promotes that verified exact correction to a project lesson and a 90-day exact-command guard.
-- Injects relevant learned rules through `UserPromptSubmit` and prior high-confidence rules at `SessionStart`, with lightweight dependency-free concept expansion for common software-engineering terms.
-- Blocks an active learned guard through `PreToolUse` before the repeated action executes.
-- When a previously failing semantic/test command later succeeds, a `Stop` hook asks Claude once to review the recovery and invoke `/my-error:learn`; the model must still justify root cause before promotion.
-- Keeps data in `${CLAUDE_PLUGIN_DATA}`, separated by project.
-- Recognizes failure messages in English, Portuguese, Spanish, French, German, and Italian, and
-  falls back to a locale-independent check for any other language.
-
-## What requires judgment
-
-Semantic code mistakes are captured as candidates but are **not** automatically promoted. After Claude fixes and verifies the problem, use `/my-error:learn <candidate-id>` or `/my-error` to record the causal lesson. This prevents test flakes, environmental failures, or misunderstood root causes from becoming bad memory.
-
-## Local development / install
-
-### Fast local test
-
-Claude Code can load a plugin directly from either this directory or the release ZIP:
 
 ```bash
-claude --plugin-dir /absolute/path/to/my-error-plugin
-# or
-claude --plugin-dir /absolute/path/to/my-error-plugin-v1.1.0.zip
+python3 "$MY_ERROR" mode --set ENFORCE
 ```
 
-Inside Claude Code, useful skills are namespaced by the plugin:
+Shadow is not "off". When it lets a command through, it scores its own prediction against
+what actually happened: the command failed again (`predictions_confirmed`) or it
+**succeeded** (`predictions_refuted` — a false positive *measured*, not estimated).
 
-```text
-/my-error:status
-/my-error:review
-/my-error:learn 12
-/my-error:forget ERR-0012
+An enforcing guard cannot produce that evidence, because blocking destroys the
+counterfactual. Nor does shadow warn the model: an instrument that announces itself changes
+the behaviour it is measuring.
+
+## The experiment
+
+The automatic guard is on probation. The decision rule was fixed **before any data
+existed**, and lives in the code as a constant marked `DO NOT EDIT BEFORE 2026-09-17`:
+
+| Outcome | Verdict |
+|---|---|
+| `predictions_confirmed == 0` | **REMOVE** the auto-guard from the codebase |
+| `refuted > confirmed` | **REMOVE** |
+| `confirmed >= 3` and `refuted == 0` | **PROMOTE** to ENFORCE |
+| anything else | **EXTEND** another 30 days |
+
+`doctor` computes the verdict itself and refuses to state one before day 30. The rule is
+written down in advance precisely so that the numbers cannot be argued with after the fact.
+
+## What it does without asking
+
+- Captures `Bash`, `Write` and `Edit` failures via `PostToolUseFailure`.
+- Ignores transient/network failures and user interrupts.
+- Redacts API keys, bearer tokens and passwords before anything is stored.
+- After a **deterministic** failure — unknown subcommand, unknown option, path not found,
+  missing npm script, git pathspec — if a closely related command succeeds next, promotes
+  that exact correction to a lesson and a 90-day guard.
+- Recalls reviewed lessons on `UserPromptSubmit`, and high-confidence ones at
+  `SessionStart`.
+- Recognizes failure messages in English, Portuguese, Spanish, French, German and Italian.
+
+"Closely related" is strict: exactly one shell token may differ, and that token must itself
+be similar. An unrelated nearby success is rejected.
+
+## What it will not do without you
+
+Semantic and logic failures are captured as *candidates* and never promoted automatically.
+When a previously failing command later succeeds, a `Stop` hook asks Claude once to review
+it via `/my-error:learn` — and the model still has to state a root cause. This is what keeps
+flaky tests and misunderstood failures out of memory.
+
+## Observability (optional)
+
+`my-error` cannot credibly monitor itself: if it stops loading, its own hooks stop too and
+its silence is indistinguishable from health. So it emits a liveness beacon, and a separate
+watchdog judges it, printing one line before every response:
+
+```
+🧠 my-error: ✅ ATIVO GLOBAL | falhas: 7 | corrigidas: 6/7 (86%) | lições: 6 | repetições detectadas: 6 | modo: SHADOW
 ```
 
-### Permanent user install
+It reports degradation honestly — `DB INDISPONÍVEL`, `HOOKS INATIVOS`, `MÉTRICAS DEFASADAS`
+— and never substitutes zeros for a failure. Install with `watchdog/install-watchdog.sh`;
+it prints the settings snippet rather than editing your `settings.json` for you.
 
-Keep the extracted plugin directory in a stable location, then run:
+## Documentation
+
+| | |
+|---|---|
+| [docs/TESTING.md](docs/TESTING.md) | Reproduce the controlled test, including the anti-superstition check |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Hooks, pipeline, storage, watchdog, CLI |
+| [docs/METRICS.md](docs/METRICS.md) | Exact meaning of every counter — read before quoting one |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Real failure modes and how to diagnose them |
+| [docs/TEST_REPORT.md](docs/TEST_REPORT.md) | Benchmark results and their limits |
+| [CHANGELOG.md](CHANGELOG.md) | What changed and why |
+
+## Verify the claims yourself
 
 ```bash
-./install-user.sh
+git clone https://github.com/josewashingtonjr-crypto/my-error && cd my-error
 ```
-
-The installer validates the plugin, adds its bundled local marketplace, and installs `my-error@my-error-local` at user scope. Equivalent manual commands are:
 
 ```bash
-claude plugin validate /absolute/path/to/my-error-plugin --strict
-claude plugin marketplace add /absolute/path/to/my-error-plugin --scope user
-claude plugin install my-error@my-error-local --scope user
+python3 -m unittest discover -s tests -v && python3 benchmarks/ab_benchmark.py && python3 benchmarks/heldout_live_benchmark.py && python3 benchmarks/fuzz_live_benchmark.py
 ```
 
-## Validation
-
-```bash
-claude plugin validate /absolute/path/to/my-error-plugin --strict
-python3 -m unittest discover -s tests -v
-python3 benchmarks/ab_benchmark.py
-python3 benchmarks/heldout_live_benchmark.py
-python3 benchmarks/fuzz_live_benchmark.py
-```
-
-The test suite has no third-party Python dependencies (27 tests). On this machine v1.2.0 reached
-33/33 recurrence prevention on the independent live held-out benchmark and 30/30 on generated typo
-fuzz, with zero false blocks — under both `pt_BR.UTF-8` and `LC_ALL=C`. See `TEST_REPORT.md` for
-interpretation and limits.
-
-## Storage
-
-One plugin, one database. It lives at `~/.claude/plugins/data/my-error/my-error.db`, a fixed
-path that hooks, skills, the CLI and the external watchdog all resolve through the same
-function (`scripts/my_error.py datadir`).
-
-The officially injected `${CLAUDE_PLUGIN_DATA}` is deliberately **not** used as the storage
-location. It reaches hook processes only — a skill runs as a plain command and never sees
-it — and its value encodes the *load method*, so `--plugin-dir` and a marketplace install
-resolve to different directories. Both facts together produced a plugin whose readable
-database was not the one its hooks wrote to. The injected value is still consulted, but
-only to discover a legacy database to adopt. Two populated legacy databases are reported by
-`doctor` rather than merged, because silently picking one would discard the other's lessons.
-
-Note: updating the plugin while a session is running does not move that session's hooks.
-They resolved `${CLAUDE_PLUGIN_ROOT}` at session start and keep executing the previous
-version until the session restarts.
-
-## Storage and safety
-
-The SQLite database is stored under `CLAUDE_PLUGIN_DATA`; the plugin root is treated as read-only/ephemeral. Project roots are hashed for database keys. Stored command/error text is capped and common API keys, bearer tokens, passwords, and secrets are redacted.
-
-Automatic blocking is intentionally conservative: only exact Bash commands that were followed by a closely related successful correction are auto-guarded. Generalized or regex guards require explicit learning.
-
-## Locale
-
-Shell and tool error messages follow the machine locale. Family recognition covers en/pt/es/fr/de/it
-directly; for any other locale the plugin falls back to a language-independent signal — the failure
-output naming the exact shell token that the verified correction changed. Run
-`python3 scripts/my_error.py doctor` to see the locale it detected.
+53 tests, no third-party dependencies. The benchmarks run real commands in a temporary
+project. Numbers and their limits are in [docs/TEST_REPORT.md](docs/TEST_REPORT.md).
 
 ## Limits
 
-This plugin does not retrain Claude's model weights. It improves future behavior through persistent external memory, contextual retrieval, and deterministic guards. A live model A/B test requires a Claude Code installation with an authenticated Claude account; the included benchmark validates the plugin's learning/recall/guard mechanics independently of model variance.
+This does not retrain anything. It is external memory plus deterministic guards, and its
+value is bounded by how often the same exact mistake actually recurs — which is precisely
+the open question the shadow experiment exists to answer.
 
-## Live acceptance test
+No model-level A/B test has been run. The benchmarks validate the learning, recall and
+guard mechanics, not that Claude makes fewer mistakes overall.
 
-After installing into Claude Code, use a disposable test repository and run:
+## License
 
-1. `/my-error:status`.
-2. Ask Claude to run an intentionally invalid but harmless command such as `npm run buil` in a package that has a working `build` script.
-3. Let the invalid command fail, then let `npm run build` succeed.
-4. Ask Claude to run `npm run buil` again. `my-error` should deny it in `PreToolUse` and surface the learned correction.
-5. Start a fresh Claude Code session in the same project and ask a related task. The stored lesson should be recalled.
-6. Run an unrelated valid command and confirm it is not blocked.
-
-Use only disposable, harmless examples for acceptance testing. Do not deliberately introduce destructive shell commands or production failures.
+MIT. See [LICENSE](LICENSE).

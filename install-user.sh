@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Installs from THIS directory - for local development, or if you cloned the repo.
+# To install the published version instead:
+#   claude plugin marketplace add josewashingtonjr-crypto/my-error
+#   claude plugin install my-error@my-error-local --scope user
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,5 +21,9 @@ claude plugin validate "$ROOT" --strict
 claude plugin marketplace add "$ROOT" --scope user
 claude plugin install my-error@my-error-local --scope user
 
-echo "my-error installed for the current user."
-echo "Start/restart Claude Code, then run /my-error:status."
+echo
+echo "my-error installed for the current user (all projects)."
+echo "Restart Claude Code, then run /my-error:doctor."
+echo
+echo "It starts in SHADOW mode: guards record what they would have blocked and"
+echo "block nothing. See README.md before changing that."
