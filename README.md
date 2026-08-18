@@ -99,6 +99,24 @@ The test suite has no third-party Python dependencies (27 tests). On this machin
 fuzz, with zero false blocks — under both `pt_BR.UTF-8` and `LC_ALL=C`. See `TEST_REPORT.md` for
 interpretation and limits.
 
+## Storage
+
+One plugin, one database. It lives at `~/.claude/plugins/data/my-error/my-error.db`, a fixed
+path that hooks, skills, the CLI and the external watchdog all resolve through the same
+function (`scripts/my_error.py datadir`).
+
+The officially injected `${CLAUDE_PLUGIN_DATA}` is deliberately **not** used as the storage
+location. It reaches hook processes only — a skill runs as a plain command and never sees
+it — and its value encodes the *load method*, so `--plugin-dir` and a marketplace install
+resolve to different directories. Both facts together produced a plugin whose readable
+database was not the one its hooks wrote to. The injected value is still consulted, but
+only to discover a legacy database to adopt. Two populated legacy databases are reported by
+`doctor` rather than merged, because silently picking one would discard the other's lessons.
+
+Note: updating the plugin while a session is running does not move that session's hooks.
+They resolved `${CLAUDE_PLUGIN_ROOT}` at session start and keep executing the previous
+version until the session restarts.
+
 ## Storage and safety
 
 The SQLite database is stored under `CLAUDE_PLUGIN_DATA`; the plugin root is treated as read-only/ephemeral. Project roots are hashed for database keys. Stored command/error text is capped and common API keys, bearer tokens, passwords, and secrets are redacted.
