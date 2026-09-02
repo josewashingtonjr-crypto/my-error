@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.1 — a CLI-recorded lesson names its repository
+
+`learn` runs without a hook payload, and identity resolution still let
+`CLAUDE_PROJECT_DIR` win in that branch — so a lesson written while working inside a
+repository recorded the *workspace* as its origin. The same defect 0.4.0 fixed for the hook
+path, one level down, landing on exactly the field that makes "learned in one project, used
+in another" answerable. Found by running the real cross-project proof, not by review.
+
+A version bump is required to reach the installed plugin at all: `claude plugin update` is
+gated on the version string, so a same-version code change never leaves the repository.
+
 ## 0.4.0 — knowledge that travels between projects
 
 `0.4.0` rather than `0.3.4`: `learn --scope` is now **required**, which breaks every existing
