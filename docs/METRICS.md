@@ -1,3 +1,5 @@
+> **Generations:** the verdict population is now scoped to SHADOW **v2** (natural usage on or after `meta.shadow_v2_started_at`). v1 is closed as `INCONCLUSIVE_DUE_TO_MATERIAL_SYSTEM_CHANGES`, preserved in full, and excluded from the verdict. See [SHADOW-V2.md](SHADOW-V2.md).
+
 # Metrics
 
 Every counter here is a count of rows that exist in the database. Nothing is estimated,

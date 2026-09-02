@@ -20,7 +20,7 @@ def me_version() -> str:
 
 
 # Bumped with SCHEMA_VERSION in my_error.py; named so a schema bump touches one line.
-SCHEMA_VERSION_EXPECTED = 4
+SCHEMA_VERSION_EXPECTED = 5
 
 
 class MyErrorTest(unittest.TestCase):
@@ -1121,7 +1121,7 @@ class MyErrorTest(unittest.TestCase):
 
     def test_doctor_reports_verdict_dataset_is_natural_only(self):
         d = json.loads(self.run_cli("doctor", "--json").stdout)
-        self.assertEqual(d["verdict_dataset"], "NATURAL USAGE ONLY")
+        self.assertEqual(d["verdict_dataset"], "V2 NATURAL USAGE ONLY")
         self.assertIn("shadow_verdict_confirmed", d)
         self.assertIn("controlled_confirmed", d)
 
@@ -1439,3 +1439,265 @@ class ObservabilityWrapperTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShadowGenerationTest(unittest.TestCase):
+    """SHADOW v2: the verdict window, and the guarantee that v1 survives it.
+
+    Every test here builds guard_events directly. Provoking real failures to
+    move these counters would be manufacturing the very data the experiment is
+    supposed to observe, which is why the suite writes rows instead.
+    """
+
+    # Fixture only -- deliberately not inheriting MyErrorTest, which would
+    # re-run its entire suite under this class's name for no added coverage.
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self.tmp.name) / "project"
+        self.data = Path(self.tmp.name) / "data"
+        self.project.mkdir(); self.data.mkdir()
+        self.env = os.environ.copy()
+        self.env["MY_ERROR_DATA_DIR"] = str(self.data)
+        self.env["CLAUDE_PROJECT_DIR"] = str(self.project)
+        self.env["MY_ERROR_MODE"] = "SHADOW"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *args],
+            text=True, capture_output=True, env=self.env, cwd=str(self.project))
+
+    def _bootstrap(self):
+        """Create the schema through the product's own path, then read state."""
+        p = self.run_cli("doctor", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return json.loads(p.stdout)
+
+    def _db(self):
+        return sqlite3.connect(self.data / "my-error.db")
+
+    def _meta(self, key):
+        db = self._db()
+        try:
+            r = db.execute("select value from meta where key=?", (key,)).fetchone()
+            return r[0] if r else None
+        finally:
+            db.close()
+
+    def _set_meta(self, key, value):
+        db = self._db()
+        try:
+            db.execute("insert or replace into meta(key,value) values(?,?)", (key, value))
+            db.commit()
+        finally:
+            db.close()
+
+    def _event(self, created_at, origin, outcome, mode="SHADOW"):
+        """Insert one guard_event with an explicit timestamp and provenance."""
+        db = self._db()
+        try:
+            pid = db.execute("select id from projects limit 1").fetchone()
+            if not pid:
+                db.execute("insert into projects(id,root,created_at,last_seen,kind) "
+                           "values('p1',?,?,?,'path')",
+                           (str(self.project), created_at, created_at))
+                pid = ("p1",)
+            db.execute(
+                "insert into guard_events(guard_id,lesson_id,project_id,session_id,tool_name,"
+                "action,mode,created_at,outcome,origin) values(1,1,?,'s','Bash','cmd',?,?,?,?)",
+                (pid[0], mode, created_at, outcome, origin))
+            db.commit()
+            return pid[0]
+        finally:
+            db.close()
+
+    def _doctor(self):
+        p = self.run_cli("doctor", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return json.loads(p.stdout)
+
+    def _open_v2(self, at="2026-09-02T00:00:00+00:00"):
+        """Force a known v2 boundary so the window is deterministic."""
+        self._set_meta("shadow_v2_started_at", at)
+        return at
+
+    # --- A ---------------------------------------------------------------
+    def test_A_v1_data_never_enters_the_v2_verdict(self):
+        self._bootstrap()
+        v2 = self._open_v2()
+        # natural v1 rows: real natural usage, but from the previous generation
+        self._event("2026-08-20T10:00:00+00:00", "natural_usage", "true_positive")
+        self._event("2026-08-21T10:00:00+00:00", "natural_usage", "false_positive")
+        d = self._doctor()
+        self.assertEqual(d["shadow_verdict_confirmed"], 0,
+                         "a v1 true_positive leaked into the v2 verdict")
+        self.assertEqual(d["shadow_verdict_refuted"], 0,
+                         "a v1 false_positive leaked into the v2 verdict")
+        self.assertEqual(d["shadow_v2_started_at"], v2)
+
+    # --- B ---------------------------------------------------------------
+    def test_B_controlled_tests_in_the_v2_window_are_excluded(self):
+        self._bootstrap()
+        self._open_v2()
+        self._event("2026-09-05T10:00:00+00:00", "controlled_test", "true_positive")
+        self._event("2026-09-06T10:00:00+00:00", "controlled_test", "true_positive")
+        d = self._doctor()
+        self.assertEqual(d["shadow_verdict_confirmed"], 0,
+                         "controlled_test reached the verdict")
+        # ...but they are reported, not hidden: exclusion must be auditable.
+        self.assertEqual(d["controlled_confirmed"], 2)
+
+    # --- C ---------------------------------------------------------------
+    def test_C_natural_usage_before_v2_start_is_excluded(self):
+        self._bootstrap()
+        self._open_v2("2026-09-02T12:00:00+00:00")
+        # one second before the boundary
+        self._event("2026-09-02T11:59:59+00:00", "natural_usage", "true_positive")
+        d = self._doctor()
+        self.assertEqual(d["shadow_verdict_confirmed"], 0)
+        self.assertEqual(d["v1_natural_confirmed"], 1, "the row must still be counted under v1")
+
+    # --- D ---------------------------------------------------------------
+    def test_D_natural_usage_after_v2_start_is_counted(self):
+        self._bootstrap()
+        self._open_v2("2026-09-02T12:00:00+00:00")
+        self._event("2026-09-02T12:00:00+00:00", "natural_usage", "true_positive")  # inclusive
+        self._event("2026-09-03T09:00:00+00:00", "natural_usage", "true_positive")
+        self._event("2026-09-04T09:00:00+00:00", "natural_usage", "false_positive")
+        d = self._doctor()
+        self.assertEqual(d["shadow_verdict_confirmed"], 2)
+        self.assertEqual(d["shadow_verdict_refuted"], 1)
+
+    # --- E ---------------------------------------------------------------
+    def test_E_doctor_reports_v1_and_v2_separately(self):
+        self._bootstrap()
+        self._set_meta("shadow_started_at", "2026-08-18T14:24:26+00:00")
+        self._set_meta("shadow_v1_started_at", "2026-08-18T14:24:26+00:00")
+        self._set_meta("shadow_v1_ended_at", "2026-09-02T00:00:00+00:00")
+        self._set_meta("shadow_v1_status", "INCONCLUSIVE_DUE_TO_MATERIAL_SYSTEM_CHANGES")
+        self._open_v2()
+        self._event("2026-08-20T10:00:00+00:00", "natural_usage", "true_positive")
+        self._event("2026-09-05T10:00:00+00:00", "natural_usage", "true_positive")
+        d = self._doctor()
+        self.assertEqual(d["v1_natural_confirmed"], 1)
+        self.assertEqual(d["shadow_verdict_confirmed"], 1)
+        self.assertEqual(d["shadow_v1_status"], "INCONCLUSIVE_DUE_TO_MATERIAL_SYSTEM_CHANGES")
+        p = self.run_cli("doctor")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        out = p.stdout
+        self.assertIn("SHADOW v1 -- CLOSED, PRESERVED, NOT A VERDICT", out)
+        self.assertIn("SHADOW v2 -- ACTIVE", out)
+        self.assertIn("V2 NATURAL USAGE ONLY", out)
+        # the scope of the verdict must be stated, not implied
+        self.assertIn("does not judge the value of my-error as a whole", out)
+        # v1 must be labelled neither success nor failure
+        self.assertNotIn("v1: SUCCESS", out)
+        self.assertNotIn("v1: FAILURE", out)
+
+    # --- F ---------------------------------------------------------------
+    def test_F_precommitted_rule_is_byte_identical(self):
+        """The rule may not drift while the population it reads is redefined."""
+        src = (ROOT / "scripts" / "my_error.py").read_text(encoding="utf-8")
+        self.assertIn("SHADOW_EXPERIMENT_DAYS = 30", src)
+        self.assertIn("SHADOW_PROMOTE_THRESHOLD = 3", src)
+        sys.path.insert(0, str(ROOT / "scripts"))
+        try:
+            import importlib
+            me = importlib.import_module("my_error")
+            importlib.reload(me)
+            self.assertEqual(me.SHADOW_EXPERIMENT_DAYS, 30)
+            self.assertEqual(me.SHADOW_PROMOTE_THRESHOLD, 3)
+            day = me.SHADOW_EXPERIMENT_DAYS
+            v = lambda c, r: me.shadow_verdict(  # noqa: E731
+                {"shadow_verdict_confirmed": c, "shadow_verdict_refuted": r, "shadow_day": day})[0]
+            self.assertEqual(v(0, 0), "REMOVE")
+            self.assertEqual(v(0, 5), "REMOVE")
+            self.assertEqual(v(2, 3), "REMOVE")
+            self.assertEqual(v(3, 0), "PROMOTE")
+            self.assertEqual(v(2, 0), "EXTEND")
+            self.assertEqual(v(5, 1), "EXTEND")
+            self.assertEqual(
+                me.shadow_verdict({"shadow_verdict_confirmed": 9, "shadow_verdict_refuted": 0,
+                                   "shadow_day": day - 1})[0], "RUNNING")
+        finally:
+            sys.path.remove(str(ROOT / "scripts"))
+
+    # --- G ---------------------------------------------------------------
+    def test_G_history_survives_the_generation_change(self):
+        """The migration must be metadata only: no row deleted or rewritten."""
+        self._bootstrap()
+        for i, (ts, origin, outcome) in enumerate([
+            ("2026-08-20T10:00:00+00:00", "natural_usage", "true_positive"),
+            ("2026-08-21T10:00:00+00:00", "controlled_test", "true_positive"),
+            ("2026-08-22T10:00:00+00:00", "natural_usage", "false_positive"),
+        ]):
+            self._event(ts, origin, outcome)
+        db = self._db()
+        try:
+            before = db.execute(
+                "select id,created_at,origin,outcome from guard_events order by id").fetchall()
+            db.execute("PRAGMA user_version=4")   # pretend we are pre-migration
+            db.commit()
+        finally:
+            db.close()
+        self._doctor()   # triggers ensure_schema -> migrate to 5
+        db = self._db()
+        try:
+            after = db.execute(
+                "select id,created_at,origin,outcome from guard_events order by id").fetchall()
+            self.assertEqual(int(db.execute("PRAGMA user_version").fetchone()[0]), 5)
+        finally:
+            db.close()
+        self.assertEqual(before, after, "the generation migration rewrote or dropped history")
+
+    def test_absent_v2_stamp_admits_nothing_rather_than_everything(self):
+        """A missing boundary must fail closed.
+
+        If an unstamped v2 fell back to an unbounded window, every historical
+        row would silently become verdict evidence -- the exact failure the
+        generation split exists to prevent.
+        """
+        self._bootstrap()
+        self._set_meta("shadow_v2_started_at", "")
+        db = self._db()
+        try:
+            db.execute("delete from meta where key='shadow_v2_started_at'")
+            db.commit()
+        finally:
+            db.close()
+        self._event("2026-08-20T10:00:00+00:00", "natural_usage", "true_positive")
+        d = self._doctor()
+        self.assertEqual(d["shadow_verdict_confirmed"], 0)
+        self.assertIsNone(d["shadow_v2_started_at"])
+
+    def test_migration_stamps_v1_closure_and_v2_start(self):
+        self._bootstrap()
+        db = self._db()
+        try:
+            db.execute("insert or replace into meta(key,value) "
+                       "values('shadow_started_at','2026-08-18T14:24:26+00:00')")
+            db.execute("delete from meta where key like 'shadow_v%'")
+            db.execute("PRAGMA user_version=4")
+            db.commit()
+        finally:
+            db.close()
+        self._doctor()
+        self.assertEqual(self._meta("shadow_v1_started_at"), "2026-08-18T14:24:26+00:00")
+        self.assertEqual(self._meta("shadow_v1_status"),
+                         "INCONCLUSIVE_DUE_TO_MATERIAL_SYSTEM_CHANGES")
+        self.assertIsNotNone(self._meta("shadow_v2_started_at"))
+        self.assertEqual(self._meta("shadow_v2_baseline_version"), "0.4.4")
+        snap = json.loads(self._meta("shadow_v2_baseline_snapshot"))
+        self.assertEqual(snap["baseline_version"], "0.4.4")
+        self.assertEqual(snap["schema_version"], 5)
+        self.assertIn("cross_project_recalls", snap)
+
+    def test_fresh_database_has_no_v1_to_close(self):
+        """A new install starts at v2 without inventing a v1 that never ran."""
+        self._bootstrap()
+        self.assertIsNone(self._meta("shadow_v1_status"))
+        p = self.run_cli("doctor")
+        self.assertNotIn("SHADOW v1 --", p.stdout)
+        self.assertIn("SHADOW v2 -- ACTIVE", p.stdout)

@@ -22,8 +22,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "0.4.4"
-SCHEMA_VERSION = 4
+VERSION = "0.4.5"
+SCHEMA_VERSION = 5
 MAX_TEXT = 4000
 AUTO_GUARD_TTL_DAYS = 90
 RECOVERY_WINDOW_MINUTES = 15
@@ -68,6 +68,31 @@ VALID_ORIGINS = {ORIGIN_NATURAL, ORIGIN_CONTROLLED}
 # Experiment start: 2026-08-18T14:24:26Z   Decision due: 2026-09-17
 SHADOW_EXPERIMENT_DAYS = 30
 SHADOW_PROMOTE_THRESHOLD = 3
+
+# --- experiment generations -------------------------------------------------
+# The rule above is frozen. The *population* it reads is not the same set of
+# rows forever: v1 ran 2026-08-18 -> 2026-09-02 while the system underneath it
+# changed materially (canonical database, the SQLite concurrency fix, project
+# identity, scope, provenance, cross-project recall, the controlled/natural
+# split, learning doctrine, instrumentation, runtime verification). Judging a
+# 30-day window whose first half measured a different system would be a
+# category error, so v1 is closed as INCONCLUSIVE -- explicitly neither success
+# nor failure -- and v2 starts from a known baseline.
+#
+# Nothing is deleted. v1's rows stay queryable; they are excluded from v2's
+# verdict by timestamp, not by removal.
+SHADOW_GENERATION = 2
+SHADOW_V1_STATUS = "INCONCLUSIVE_DUE_TO_MATERIAL_SYSTEM_CHANGES"
+SHADOW_V2_BASELINE_VERSION = "0.4.4"
+
+# What the verdict does and does not judge. Printed by the doctor verbatim so
+# the scope cannot quietly widen between the code and the report.
+VERDICT_SCOPE_NOTE = (
+    "judges ONLY the deterministic auto-guard for operational recurrence. "
+    "It does not judge the value of my-error as a whole, semantic lessons, "
+    "recall, cross-project transfer, or prevention of engineering mistakes "
+    "between projects -- those are measured separately and never feed it."
+)
 
 # The one source string produced without human causal review. Creation and the
 # recall filter both reference this constant so the two cannot drift apart; a
@@ -805,6 +830,87 @@ def migrate(db: sqlite3.Connection, current: int) -> None:
         db.execute("UPDATE lessons SET origin_project_id=project_id "
                    "WHERE origin_project_id IS NULL AND project_id IS NOT NULL")
         db.execute("PRAGMA user_version=4")
+    if current < 5:
+        # Close SHADOW v1 and open v2. Pure metadata: not one row is deleted,
+        # rewritten or reclassified. v1's events remain exactly as recorded and
+        # are excluded from v2's verdict by their timestamp alone.
+        #
+        # Only stamped when v1 actually ran. On a fresh database there is no v1
+        # to close, and the first hook stamps v2 directly.
+        row = db.execute("SELECT value FROM meta WHERE key='shadow_started_at'").fetchone()
+        if row:
+            now = utcnow()
+            db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('shadow_v1_started_at',?)", (str(row[0]),))
+            db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('shadow_v1_ended_at',?)", (now,))
+            db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('shadow_v1_status',?)", (SHADOW_V1_STATUS,))
+            db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('shadow_v2_started_at',?)", (now,))
+            db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('shadow_v2_baseline_version',?)",
+                       (SHADOW_V2_BASELINE_VERSION,))
+            # The DB-derived half of the auditable baseline, captured inside the
+            # same transaction that opens v2 -- so it is the state at the exact
+            # boundary instant, not a reading taken afterwards. The repo commit
+            # and the live runtime version live in docs/SHADOW-V2.md, because a
+            # process cannot honestly attest to either from inside itself.
+            db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('shadow_v2_baseline_snapshot',?)",
+                       (json.dumps(_baseline_snapshot(db, now), ensure_ascii=False, sort_keys=True),))
+        db.execute("PRAGMA user_version=5")
+
+
+def _baseline_snapshot(db: sqlite3.Connection, at: str) -> dict[str, Any]:
+    """Whole-database counts at the instant v2 opens, for later comparison.
+
+    Deliberately project-independent: the boundary is a property of the
+    database, not of whichever directory happened to trigger the migration.
+    """
+    one = lambda q, a=(): db.execute(q, a).fetchone()[0]  # noqa: E731
+    ge = lambda w, a=(): one(f"SELECT COUNT(*) FROM guard_events WHERE 1=1 {w}", a)  # noqa: E731
+    return {
+        "at": at,
+        "code_version": VERSION,
+        "baseline_version": SHADOW_V2_BASELINE_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "candidates": one("SELECT COUNT(*) FROM candidates"),
+        "lessons_active": one("SELECT COUNT(*) FROM lessons WHERE status='active'"),
+        "lessons_global_active": one("SELECT COUNT(*) FROM lessons WHERE status='active' AND scope='global'"),
+        "lessons_project_active": one("SELECT COUNT(*) FROM lessons WHERE status='active' AND scope='project'"),
+        "guards_active": one("SELECT COUNT(*) FROM guards WHERE active=1"),
+        "guard_events": ge(""),
+        "recall_events": one("SELECT COUNT(*) FROM recall_events"),
+        "cross_project_recalls": one("SELECT COUNT(*) FROM recall_events WHERE cross_project=1"),
+        "v1_natural_confirmed": ge("AND outcome='true_positive' AND origin=?", (ORIGIN_NATURAL,)),
+        "v1_natural_refuted": ge("AND outcome='false_positive' AND origin=?", (ORIGIN_NATURAL,)),
+        "v1_natural_would_block": ge("AND mode='SHADOW' AND origin=?", (ORIGIN_NATURAL,)),
+        "v1_controlled_confirmed": ge("AND outcome='true_positive' AND origin=?", (ORIGIN_CONTROLLED,)),
+        "v1_controlled_refuted": ge("AND outcome='false_positive' AND origin=?", (ORIGIN_CONTROLLED,)),
+        "dropped_events": (lambda r: int(r[0]) if r else 0)(
+            db.execute("SELECT value FROM meta WHERE key='dropped_events'").fetchone()),
+    }
+
+
+def meta_get(db: sqlite3.Connection, key: str) -> str | None:
+    row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return str(row[0]) if row else None
+
+
+def active_experiment_started(db: sqlite3.Connection, create: bool = False) -> str | None:
+    """Start of the experiment generation currently being judged (v2).
+
+    `experiment_started` is kept as the v1 stamp and is never rewritten -- it is
+    the historical record. This is the clock the pre-committed rule runs on.
+    """
+    val = meta_get(db, "shadow_v2_started_at")
+    if val:
+        return val
+    if not create:
+        return None
+    now = utcnow()
+    try:
+        with_retry(lambda: db.execute(
+            "INSERT OR IGNORE INTO meta(key,value) VALUES('shadow_v2_started_at',?)", (now,)), db)
+        with_retry(db.commit, db)
+    except sqlite3.Error:
+        return now
+    return meta_get(db, "shadow_v2_started_at") or now
 
 
 def experiment_started(db: sqlite3.Connection, create: bool = False) -> str | None:
@@ -1442,7 +1548,7 @@ def _dispatch_hook(args: argparse.Namespace) -> tuple[int, sqlite3.Connection, s
     pid = ensure_project(db, root)
     kind = args.kind
     if get_mode(db) == MODE_SHADOW:
-        experiment_started(db, create=True)
+        active_experiment_started(db, create=True)
 
     if kind == "session-start":
         rows = [r for r in lesson_rows(db, pid) if r["confidence"] >= 0.90][:3]
@@ -1709,7 +1815,12 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
     metric that cannot be computed is absent rather than zero.
     """
     mode = get_mode(db)
-    started = experiment_started(db)
+    # The clock the pre-committed rule runs on is the ACTIVE generation's start
+    # (v2). v1's stamp is kept untouched as history and reported separately.
+    started = active_experiment_started(db)
+    v1_started = meta_get(db, "shadow_v1_started_at") or experiment_started(db)
+    v1_ended = meta_get(db, "shadow_v1_ended_at")
+    v1_status = meta_get(db, "shadow_v1_status")
     try:
         days = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(started)).days
     except Exception:
@@ -1771,19 +1882,55 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
     # 30-day pre-committed rule reads -- natural_usage only, never
     # controlled_test. `controlled_*` exists purely for the auditable "the
     # pipeline works" record; it must never feed the verdict. See METRICS.md.
-    natural_would_block = ev("AND mode='SHADOW' AND origin=?", (ORIGIN_NATURAL,))
-    natural_confirmed = ev("AND outcome='true_positive' AND origin=?", (ORIGIN_NATURAL,))
-    natural_refuted = ev("AND outcome='false_positive' AND origin=?", (ORIGIN_NATURAL,))
-    natural_pending = ev("AND outcome='pending' AND origin=?", (ORIGIN_NATURAL,))
+    # Two independent filters, both required for a row to reach the verdict:
+    #   origin = natural_usage   (never a controlled test)
+    #   created_at >= v2 start   (never a v1 row)
+    # `created_at` is a UTC ISO-8601 string in a single fixed format, so the
+    # lexicographic comparison SQLite performs is a chronological one. Rows
+    # outside the window are still counted -- under v1_* -- never dropped.
+    #
+    # When v2 has no start stamp yet (fresh database, no hook has run), the
+    # window is empty rather than unbounded: an absent boundary must not
+    # silently admit every historical row into the verdict.
+    if started:
+        win, wa = "AND created_at>=?", (started,)
+        v1win, v1a = "AND created_at<?", (started,)
+    else:
+        win, wa = "AND 1=0", ()
+        v1win, v1a = "", ()
 
-    controlled_would_block = ev("AND mode='SHADOW' AND origin=?", (ORIGIN_CONTROLLED,))
-    controlled_confirmed = ev("AND outcome='true_positive' AND origin=?", (ORIGIN_CONTROLLED,))
-    controlled_refuted = ev("AND outcome='false_positive' AND origin=?", (ORIGIN_CONTROLLED,))
-    controlled_pending = ev("AND outcome='pending' AND origin=?", (ORIGIN_CONTROLLED,))
+    natural_would_block = ev(f"AND mode='SHADOW' AND origin=? {win}", (ORIGIN_NATURAL,) + wa)
+    natural_confirmed = ev(f"AND outcome='true_positive' AND origin=? {win}", (ORIGIN_NATURAL,) + wa)
+    natural_refuted = ev(f"AND outcome='false_positive' AND origin=? {win}", (ORIGIN_NATURAL,) + wa)
+    natural_pending = ev(f"AND outcome='pending' AND origin=? {win}", (ORIGIN_NATURAL,) + wa)
+
+    # Controlled tests inside the v2 window. Reported so the exclusion is
+    # visible and auditable, never summed into the verdict.
+    controlled_would_block = ev(f"AND mode='SHADOW' AND origin=? {win}", (ORIGIN_CONTROLLED,) + wa)
+    controlled_confirmed = ev(f"AND outcome='true_positive' AND origin=? {win}", (ORIGIN_CONTROLLED,) + wa)
+    controlled_refuted = ev(f"AND outcome='false_positive' AND origin=? {win}", (ORIGIN_CONTROLLED,) + wa)
+    controlled_pending = ev(f"AND outcome='pending' AND origin=? {win}", (ORIGIN_CONTROLLED,) + wa)
+
+    # SHADOW v1, preserved and queryable. Closed as INCONCLUSIVE: the system
+    # underneath it changed materially mid-window, so these numbers judge
+    # neither the guard nor the plugin. They exist for audit only.
+    v1_natural_would_block = ev(f"AND mode='SHADOW' AND origin=? {v1win}", (ORIGIN_NATURAL,) + v1a)
+    v1_natural_confirmed = ev(f"AND outcome='true_positive' AND origin=? {v1win}", (ORIGIN_NATURAL,) + v1a)
+    v1_natural_refuted = ev(f"AND outcome='false_positive' AND origin=? {v1win}", (ORIGIN_NATURAL,) + v1a)
+    v1_controlled_would_block = ev(f"AND mode='SHADOW' AND origin=? {v1win}", (ORIGIN_CONTROLLED,) + v1a)
+    v1_controlled_confirmed = ev(f"AND outcome='true_positive' AND origin=? {v1win}", (ORIGIN_CONTROLLED,) + v1a)
+    v1_controlled_refuted = ev(f"AND outcome='false_positive' AND origin=? {v1win}", (ORIGIN_CONTROLLED,) + v1a)
 
     return {
         "mode": mode,
-        "shadow_started_at": started,   # None until the first hook stamps it
+        "shadow_generation": SHADOW_GENERATION,
+        "shadow_started_at": started,   # v2 start; None until the first hook stamps it
+        "shadow_v2_started_at": started,
+        "shadow_v2_baseline_version": meta_get(db, "shadow_v2_baseline_version") or SHADOW_V2_BASELINE_VERSION,
+        "shadow_v1_started_at": v1_started,
+        "shadow_v1_ended_at": v1_ended,
+        "shadow_v1_status": v1_status,
+        "verdict_scope": VERDICT_SCOPE_NOTE,
         "shadow_day": days,
         "failures_captured": failures,
         "failure_events": failure_events,
@@ -1809,6 +1956,14 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
         "controlled_confirmed": controlled_confirmed,
         "controlled_refuted": controlled_refuted,
         "controlled_pending": controlled_pending,
+        # --- SHADOW v1: preserved, excluded from the verdict, judged neither
+        # a success nor a failure -------------------------------------------
+        "v1_natural_would_block": v1_natural_would_block,
+        "v1_natural_confirmed": v1_natural_confirmed,
+        "v1_natural_refuted": v1_natural_refuted,
+        "v1_controlled_would_block": v1_controlled_would_block,
+        "v1_controlled_confirmed": v1_controlled_confirmed,
+        "v1_controlled_refuted": v1_controlled_refuted,
         # --- knowledge transfer: independent of the SHADOW experiment --------
         # Reported apart from every guard number above, because the 30-day
         # verdict judges the deterministic guard and nothing else. Mixing the
@@ -2008,7 +2163,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "runtime_version": (beacon or {}).get("version"),
             "runtime_matches_installed": (
                 (beacon or {}).get("version") == VERSION if beacon and beacon.get("version") else None),
-            "verdict_dataset": "NATURAL USAGE ONLY",
+            "verdict_dataset": f"V{SHADOW_GENERATION} NATURAL USAGE ONLY",
+            "verdict_scope": VERDICT_SCOPE_NOTE,
+            "shadow_v2_baseline_snapshot": (lambda r: json.loads(r) if r else None)(
+                meta_get(db, "shadow_v2_baseline_snapshot")),
             "origin_migration_backfilled_at": origin_backfilled_at,
             "dropped_events": dropped_events(db)[0], "dropped_events_last": dropped_events(db)[1],
             "capture_reliability_fix": CAPTURE_FIX_NOTE, **m,
@@ -2024,8 +2182,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     L.append(f"Mode:               {m['mode']}")
     if m["mode"] == MODE_SHADOW:
         if m["shadow_started_at"]:
-            L.append(f"Shadow experiment:  day {m['shadow_day']} of {SHADOW_EXPERIMENT_DAYS} "
-                     f"(started {m['shadow_started_at']})")
+            L.append(f"Shadow experiment:  v{SHADOW_GENERATION}, day {m['shadow_day']} of {SHADOW_EXPERIMENT_DAYS} "
+                     f"(started {m['shadow_started_at']}, baseline my-error {m['shadow_v2_baseline_version']})")
             v, why = shadow_verdict(m)
             L.append(f"Pre-committed verdict: {v} - {why}")
         else:
@@ -2116,20 +2274,40 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     L.append("  'recalled' means placed in front of the agent. It is not a claim that it helped.")
     L.append("")
     L.append("Shadow experiment (judges the auto-guard only, not the plugin)")
+    L.append(f"  SCOPE: the verdict {VERDICT_SCOPE_NOTE}")
     L.append("")
-    L.append("Natural usage:")
-    L.append(f"  would_block: {m['natural_would_block']}")
-    L.append(f"  confirmed: {m['shadow_verdict_confirmed']}")
-    L.append(f"  refuted: {m['shadow_verdict_refuted']}")
-    L.append(f"  pending: {m['shadow_verdict_pending']}")
+    if m["shadow_v1_status"]:
+        L.append("SHADOW v1 -- CLOSED, PRESERVED, NOT A VERDICT")
+        L.append(f"  window:    {m['shadow_v1_started_at']} -> {m['shadow_v1_ended_at']}")
+        L.append(f"  status:    {m['shadow_v1_status']}")
+        L.append("             neither success nor failure: the system changed materially")
+        L.append("             mid-window, so these rows cannot judge the current guard")
+        L.append(f"  natural:   would_block {m['v1_natural_would_block']}, "
+                 f"confirmed {m['v1_natural_confirmed']}, refuted {m['v1_natural_refuted']}")
+        L.append(f"  controlled would_block {m['v1_controlled_would_block']}, "
+                 f"confirmed {m['v1_controlled_confirmed']}, refuted {m['v1_controlled_refuted']}")
+        L.append("  every one of these rows is still in the database and still queryable")
+        L.append("")
+    L.append(f"SHADOW v{SHADOW_GENERATION} -- ACTIVE")
+    L.append(f"  baseline version: my-error {m['shadow_v2_baseline_version']}")
+    L.append(f"  start:            {m['shadow_v2_started_at'] or '(not stamped yet)'}")
+    L.append(f"  day:              {m['shadow_day']} of {SHADOW_EXPERIMENT_DAYS}"
+             if m["shadow_day"] is not None else "  day:              (not started)")
     L.append("")
-    L.append("Controlled tests:")
-    L.append(f"  would_block: {m['controlled_would_block']}")
-    L.append(f"  confirmed: {m['controlled_confirmed']}")
-    L.append(f"  refuted: {m['controlled_refuted']}")
+    L.append("  Natural usage (THE verdict dataset):")
+    L.append(f"    would_block: {m['natural_would_block']}")
+    L.append(f"    confirmed: {m['shadow_verdict_confirmed']}")
+    L.append(f"    refuted: {m['shadow_verdict_refuted']}")
+    L.append(f"    pending: {m['shadow_verdict_pending']}")
+    L.append("")
+    L.append("  Controlled tests in this window (EXCLUDED from the verdict):")
+    L.append(f"    would_block: {m['controlled_would_block']}")
+    L.append(f"    confirmed: {m['controlled_confirmed']}")
+    L.append(f"    refuted: {m['controlled_refuted']}")
     L.append("")
     L.append("Verdict dataset:")
-    L.append("  NATURAL USAGE ONLY")
+    L.append(f"  V{SHADOW_GENERATION} NATURAL USAGE ONLY")
+    L.append("  excluded: controlled_test, v1 natural usage, anything before the baseline")
     if origin_backfilled_at:
         L.append("")
         L.append(f"Origin migration:   pre-existing rows backfilled as controlled_test at {origin_backfilled_at}")

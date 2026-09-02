@@ -1,3 +1,40 @@
+# 0.4.5 — SHADOW v2: the experiment restarts from a known baseline
+
+SHADOW v1 (2026-08-18 -> 2026-09-02) is closed as
+`INCONCLUSIVE_DUE_TO_MATERIAL_SYSTEM_CHANGES`. Not a success, not a failure:
+the system underneath it changed materially mid-window (canonical database,
+the SQLite concurrency fix, project identity, scope, provenance, cross-project
+recall, controlled/natural split, learning doctrine, instrumentation,
+watchdog/doctor, runtime verification, storage and metrics). A 30-day verdict
+computed across two different systems would have looked exactly as legitimate
+as a real one.
+
+**v2** starts 2026-09-02, decides 2026-10-02, baseline my-error 0.4.4.
+
+The verdict population now needs BOTH filters: `origin = natural_usage` AND
+`created_at >= meta.shadow_v2_started_at`. An absent v2 stamp admits nothing
+rather than everything — failing open there would silently promote every
+historical row into the verdict.
+
+**The pre-committed rule is untouched.** Threshold 3, 30 days, same four
+branches. A test asserts its behaviour is byte-identical. What changed is the
+population it reads, never the rule.
+
+The doctor now reports v1 and v2 as separate sections, prints controlled tests
+inside the v2 window so the exclusion is auditable, and states the verdict's
+scope verbatim: it judges ONLY the deterministic auto-guard for operational
+recurrence — not the plugin, semantic lessons, recall or cross-project
+transfer.
+
+Schema 5 is metadata only. No row of any table is deleted, rewritten or
+reclassified; a test snapshots `guard_events` before and after the migration
+and asserts byte equality. The migration also stores an auditable baseline
+snapshot in `meta.shadow_v2_baseline_snapshot`, captured inside the same
+transaction that opens v2. A fresh database has no v1 to close and starts at
+v2 directly.
+
+108 tests. See docs/SHADOW-V2.md.
+
 # Changelog
 
 ## 0.4.4 — a published version is frozen
