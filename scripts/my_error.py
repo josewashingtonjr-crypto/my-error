@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 SCHEMA_VERSION = 4
 MAX_TEXT = 4000
 AUTO_GUARD_TTL_DAYS = 90

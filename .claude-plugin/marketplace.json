@@ -9,7 +9,7 @@
       "name": "my-error",
       "source": ".",
       "description": "EXPERIMENTAL \u2014 evidence-gated learning and deterministic guards for repeated Claude Code mistakes. Ships in SHADOW mode: records, does not block.",
-      "version": "0.4.1"
+      "version": "0.4.2"
     }
   ]
 }

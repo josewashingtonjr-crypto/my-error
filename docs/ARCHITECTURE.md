@@ -23,9 +23,14 @@ database, observed by a separate watchdog process.
                     └──────────────────┬───────────────────┘
                                        │ reads, never writes
                     ┌──────────────────▼───────────────────┐
-                    │ watchdog/my-error-watchdog.cjs       │
-                    │ judges health, prints the status line│
-                    └──────────────────────────────────────┘
+                    │ watchdog/my-error-state.cjs          │
+                    │ one reader: health, freshness, paths │
+                    └────────┬────────────────────┬────────┘
+                             │                    │
+              ┌──────────────▼───────┐  ┌─────────▼──────────────┐
+              │ my-error-watchdog.cjs│  │ my-error-statusline.cjs│
+              │ systemMessage, long  │  │ status bar, 4 tokens   │
+              └──────────────────────┘  └────────────────────────┘
 ```
 
 ## The pipeline
@@ -127,6 +132,47 @@ recorded mtime against the real one, reporting **stale metrics** rather than tru
 An unreadable database reports unavailable; it never degrades to zeros.
 
 Cost is roughly 37 ms per prompt.
+
+## The status line segment
+
+`systemMessage` is not a persistent surface in every build of Claude Code, and observability
+that is only shown once is not observability. The status bar is the surface the user keeps
+looking at, so `watchdog/my-error-statusline.cjs` puts four tokens there.
+
+It is a **wrapper**, not a replacement, because Claude Code runs exactly one `statusLine`
+command and that command usually already belongs to something else — often a file its own
+framework regenerates, where an edit survives until the next `init` and then vanishes with no
+error. The existing command is run as a child with the same stdin, its stdout is taken
+verbatim, and the segment is appended (on its own line if that output is multi-line, so a
+long bar is not pushed past the terminal width).
+
+**Survival is the design constraint.** Every combination was tested: both healthy, plugin
+broken, wrapped bar broken, shared module missing, malformed stdin, empty stdin. The wrapped
+bar's output is never withheld because of anything that happens in the segment, and a
+failing bar that still wrote something has that partial output shown rather than discarded.
+
+**It never spawns a process.** A status line redraws constantly, so it asks the shared module
+for the no-spawn answer: the watchdog's cached data directory if there is one, otherwise the
+canonical path — flagged as a guess so the segment can report degraded rather than assert a
+location it did not verify. Measured cost: p50 0.19 ms, p95 0.38 ms in process.
+
+**Responsibilities do not mix.** `statusLine` is persistent information for the *user*;
+`additionalContext` is information for *Claude*; `systemMessage` is complementary, shown if
+the surface chooses to. The long watchdog line stays where it was.
+
+### The invocation beacon
+
+Running the script by hand proves nothing about an editor that is already running — the
+mistake recorded as ERR-0016. So each run stamps `~/.claude/watchdogs/.my-error-statusline.json`
+(throttled to one write per five seconds) with the pid, the session, the segment, the runtime
+and installed versions, and the measured cost. That file is the only evidence that the live
+bar — not a shell — is executing this code.
+
+### Hook timeouts are seconds
+
+`"timeout": 10` means ten seconds. `10000` means nearly three hours, which is indistinguishable
+from a hook that never returns. The installer once printed the millisecond form; two tests now
+fail if either the manifest or the snippet drifts back into it.
 
 ## CLI
 

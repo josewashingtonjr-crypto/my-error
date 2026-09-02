@@ -12,7 +12,7 @@ verifiable. That path is the *cheapest* source of evidence, not the definition o
 A logic defect, a wrong assumption, a badly sized task or an unsafe judgment produces no
 failing command and is recorded deliberately, through the same verification bar.
 
-> ### ⚠️ EXPERIMENTAL — v0.4.1
+> ### ⚠️ EXPERIMENTAL — v0.4.2
 >
 > Ships in **SHADOW mode**: the guard records what it *would* have blocked and **blocks
 > nothing**. The automatic guard is on a 30-day probation while its real base rate is
@@ -149,16 +149,40 @@ flaky tests and misunderstood failures out of memory.
 ## Observability (optional)
 
 `my-error` cannot credibly monitor itself: if it stops loading, its own hooks stop too and
-its silence is indistinguishable from health. So it emits a liveness beacon, and a separate
-watchdog judges it, printing one line before every response:
+its silence is indistinguishable from health. So it emits a liveness beacon, and separate
+processes judge it. Both read the same shared module, so they cannot disagree about whether
+the plugin is healthy.
+
+**In the status bar**, permanently — health, runtime version, mode, active lessons,
+cross-project recalls:
+
+```
+▊ sua barra atual  │  🧠 ME ✅ 0.4.2 · SHADOW · L8 · X2
+```
+
+Claude Code runs exactly one `statusLine` command, so if you already have a bar this
+**wraps** it rather than replacing it: put your existing command in
+`MY_ERROR_STATUSLINE_WRAP` and it runs as a child, its output printed verbatim before the
+segment. Neither half can take the other down — if my-error breaks you keep your bar plus a
+`⚠️`, and if your bar breaks you keep the segment. Three states only (`✅` healthy, `⚠️`
+present but not trustworthy, `❌` not there); anything finer belongs in `/my-error:doctor`.
+The segment costs ~0.2 ms to compute.
+
+**Before every response**, the watchdog prints the long form as a `systemMessage`:
 
 ```
 🧠 my-error: ✅ ATIVO GLOBAL | falhas: 7 | corrigidas: 6/7 (86%) | lições: 6 | repetições detectadas: 6 | modo: SHADOW
 ```
 
-It reports degradation honestly — `DB INDISPONÍVEL`, `HOOKS INATIVOS`, `MÉTRICAS DEFASADAS`
-— and never substitutes zeros for a failure. Install with `watchdog/install-watchdog.sh`;
-it prints the settings snippet rather than editing your `settings.json` for you.
+Not every Claude Code surface renders `systemMessage`, which is why the status line exists;
+where it does render, it is complementary, never the thing you rely on.
+
+Both report degradation honestly — `DB INDISPONÍVEL`, `HOOKS INATIVOS`, `MÉTRICAS DEFASADAS`
+— and never substitute zeros for a failure. Install with `watchdog/install-watchdog.sh`; it
+prints the settings snippets rather than editing your `settings.json` for you.
+
+After restarting, `~/.claude/watchdogs/.my-error-statusline.json` records that the *live*
+bar ran the code. Running the script in a shell proves only that the shell can.
 
 ## Documentation
 

@@ -2,6 +2,7 @@ import json
 import re
 import os
 import sqlite3
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1049,6 +1050,183 @@ class MyErrorTest(unittest.TestCase):
         self.assertEqual(d["verdict_dataset"], "NATURAL USAGE ONLY")
         self.assertIn("shadow_verdict_confirmed", d)
         self.assertIn("controlled_confirmed", d)
+
+
+class ObservabilityWrapperTest(unittest.TestCase):
+    """The watchdog and the status line segment.
+
+    They run outside the plugin, in node, so nothing else in this suite would
+    notice if they broke. Two classes of regression are worth a test: the units
+    of a hook timeout, which are silent when wrong, and the survival rules of
+    the status line, which are only visible when something else has already
+    failed.
+    """
+
+    WATCHDOG_DIR = ROOT / "watchdog"
+    STATUSLINE = WATCHDOG_DIR / "my-error-statusline.cjs"
+
+    def setUp(self):
+        if not shutil.which("node"):
+            self.skipTest("node não encontrado")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data = Path(self.tmp.name) / "data"
+        self.data.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_statusline(self, stdin="{}", script=None, **env_extra):
+        env = os.environ.copy()
+        env.update({k: v for k, v in env_extra.items() if v is not None})
+        for k, v in env_extra.items():
+            if v is None:
+                env.pop(k, None)
+        p = subprocess.run(["node", str(script or self.STATUSLINE)],
+                           input=stdin, capture_output=True, text=True, env=env, timeout=30)
+        return p
+
+    # --- units -------------------------------------------------------------
+
+    def test_hook_timeouts_are_seconds_not_milliseconds(self):
+        """A hook timeout is in seconds. 10000 is not a long timeout, it is a
+        units bug that hides a wedged hook for almost three hours."""
+        hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text())
+        found = 0
+        for event, groups in hooks["hooks"].items():
+            for group in groups:
+                for hook in group["hooks"]:
+                    if "timeout" not in hook:
+                        continue
+                    found += 1
+                    self.assertLessEqual(
+                        hook["timeout"], 60,
+                        f"{event}: timeout={hook['timeout']} — segundos, não milissegundos")
+                    self.assertGreaterEqual(hook["timeout"], 1, f"{event}: timeout inutilizável")
+        self.assertGreater(found, 0, "nenhum timeout declarado — o teste deixou de cobrir algo")
+
+    def test_installer_snippet_uses_seconds(self):
+        """The snippet the installer prints is copied verbatim into settings.json,
+        so a wrong unit there becomes a wrong unit in every installation."""
+        text = (self.WATCHDOG_DIR / "install-watchdog.sh").read_text()
+        for value in re.findall(r'"timeout"\s*:\s*(\d+)', text):
+            self.assertLessEqual(int(value), 60, f"snippet do instalador com timeout={value}")
+
+    # --- one implementation ------------------------------------------------
+
+    def test_health_logic_is_not_duplicated(self):
+        """Health, freshness and the data directory are decided once, in the
+        shared module. A second definition is how two observers start disagreeing
+        about whether the plugin is healthy."""
+        shared = (self.WATCHDOG_DIR / "my-error-state.cjs").read_text()
+        for fn in ("function structuralHealth", "function liveState", "function resolveDataDir"):
+            self.assertIn(fn, shared)
+        for name in ("my-error-watchdog.cjs", "my-error-statusline.cjs"):
+            src = (self.WATCHDOG_DIR / name).read_text()
+            self.assertIn("my-error-state.cjs", src, f"{name} não usa o módulo compartilhado")
+            for fn in ("structuralHealth", "liveState", "resolveDataDir"):
+                # \b so liveStateDeep, a genuinely different (expensive) query
+                # that belongs to the watchdog, is not mistaken for a copy.
+                self.assertIsNone(re.search(rf"function {fn}\b", src), f"{name} redefine {fn}")
+
+    def test_installer_ships_every_file_the_wrapper_needs(self):
+        installer = (self.WATCHDOG_DIR / "install-watchdog.sh").read_text()
+        for name in ("my-error-state.cjs", "my-error-watchdog.cjs", "my-error-statusline.cjs"):
+            self.assertIn(name, installer)
+
+    # --- survival ----------------------------------------------------------
+
+    def test_segment_alone_reports_healthy_installation(self):
+        p = self.run_statusline('{"session_id":"t"}', MY_ERROR_STATUSLINE_WRAP=None)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("ME", p.stdout)
+        self.assertRegex(p.stdout, r"ME (✅|⚠️|❌)")
+
+    def test_wrapped_bar_survives_a_broken_segment(self):
+        """The whole point of the wrapper: my-error failing must cost the user
+        their metrics, never their status line."""
+        p = self.run_statusline('{"session_id":"t"}',
+                                MY_ERROR_STATUSLINE_WRAP="printf 'BARRA-EXISTENTE'",
+                                MY_ERROR_DATA_DIR=str(self.data / "inexistente"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("BARRA-EXISTENTE", p.stdout)
+        self.assertIn("ME", p.stdout)
+        self.assertNotIn("✅", p.stdout)
+
+    def test_segment_survives_a_broken_bar(self):
+        p = self.run_statusline('{"session_id":"t"}', MY_ERROR_STATUSLINE_WRAP="exit 7")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("ME", p.stdout)
+        self.assertIn("⚠️", p.stdout)
+
+    def test_partial_output_from_a_failing_bar_is_still_shown(self):
+        p = self.run_statusline('{"session_id":"t"}',
+                                MY_ERROR_STATUSLINE_WRAP="printf 'METADE'; exit 1")
+        self.assertIn("METADE", p.stdout)
+        self.assertIn("ME", p.stdout)
+
+    def test_invalid_stdin_does_not_break_anything(self):
+        p = self.run_statusline("isto-nao-e-json{{{",
+                                MY_ERROR_STATUSLINE_WRAP="printf 'BARRA'")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("BARRA", p.stdout)
+        self.assertIn("ME", p.stdout)
+
+    def test_empty_stdin_does_not_break_anything(self):
+        p = self.run_statusline("", MY_ERROR_STATUSLINE_WRAP="printf 'BARRA'")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("BARRA", p.stdout)
+
+    def test_missing_shared_module_degrades_instead_of_crashing(self):
+        """Someone copies one file instead of three. The bar must still work."""
+        solo = Path(self.tmp.name) / "solo"
+        solo.mkdir()
+        shutil.copy(self.STATUSLINE, solo / "my-error-statusline.cjs")
+        p = self.run_statusline('{"session_id":"t"}', script=solo / "my-error-statusline.cjs",
+                                MY_ERROR_STATUSLINE_WRAP="printf 'BARRA'")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("BARRA", p.stdout)
+        self.assertIn("❌", p.stdout)
+
+    def test_a_multi_line_bar_keeps_the_segment_on_its_own_line(self):
+        p = self.run_statusline('{"session_id":"t"}',
+                                MY_ERROR_STATUSLINE_WRAP="printf 'L1\\nL2'")
+        lines = p.stdout.split("\n")
+        self.assertEqual(lines[0], "L1")
+        self.assertEqual(lines[1], "L2")
+        self.assertIn("ME", lines[2])
+
+    def test_a_single_line_bar_stays_on_one_line(self):
+        p = self.run_statusline('{"session_id":"t"}', MY_ERROR_STATUSLINE_WRAP="printf 'UMA'")
+        self.assertNotIn("\n", p.stdout.strip())
+        self.assertIn("UMA", p.stdout)
+
+    def test_run_leaves_evidence_that_it_ran(self):
+        """A manual run proves nothing about the live editor (ERR-0016), so the
+        wrapper stamps who invoked it. Without this file there is no way to tell
+        a status bar that is running this code from one that is not."""
+        home = Path(self.tmp.name) / "home"
+        (home / ".claude" / "watchdogs").mkdir(parents=True)
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+        env.pop("MY_ERROR_STATUSLINE_WRAP", None)
+        subprocess.run(["node", str(self.STATUSLINE)], input='{"session_id":"prova","cwd":"/tmp"}',
+                       capture_output=True, text=True, env=env, timeout=30)
+        trace = home / ".claude" / "watchdogs" / ".my-error-statusline.json"
+        self.assertTrue(trace.exists(), "sem beacon de invocação")
+        rec = json.loads(trace.read_text())
+        self.assertEqual(rec["session_id"], "prova")
+        self.assertIn("segment", rec)
+        self.assertIn("ms", rec)
+
+    def test_watchdog_probe_answers(self):
+        """--probe is what the installer tells people to run; it must exist."""
+        p = subprocess.run(["node", str(self.WATCHDOG_DIR / "my-error-watchdog.cjs"), "--probe"],
+                           input='{"session_id":"probe","cwd":"/tmp"}',
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        out = json.loads(p.stdout)
+        self.assertIn("health", out)
+        self.assertIn("line", out)
 
 
 if __name__ == "__main__":

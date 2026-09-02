@@ -28,138 +28,39 @@
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 const { spawnSync } = require('child_process');
 
-const HOME = os.homedir();
-const CLAUDE = path.join(HOME, '.claude');
-const CACHE = path.join(CLAUDE, 'watchdogs', '.my-error-health.json');
-const CACHE_TTL_MS = 5 * 60 * 1000;
-const PROBE_TIMEOUT_MS = 2500;
-
-const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } };
-const mtime = (p) => { try { return fs.statSync(p).mtimeMs; } catch { return 0; } };
-
-/** Facts that only change when configuration changes — safe to cache. */
-function structuralHealth() {
-  const installedPath = path.join(CLAUDE, 'plugins', 'installed_plugins.json');
-  const settingsPath = path.join(CLAUDE, 'settings.json');
-  const stamp = `${mtime(installedPath)}:${mtime(settingsPath)}`;
-
-  const cached = readJson(CACHE);
-  if (cached && cached.stamp === stamp && Date.now() - cached.at < CACHE_TTL_MS) return cached.health;
-
-  const health = {
-    installation: false, scope: null, enabled: false,
-    install_path: null, hooks_registered: false, hooks: {}, data_dir: null,
-  };
-
-  const installed = readJson(installedPath);
-  if (installed && installed.plugins) {
-    for (const [key, entries] of Object.entries(installed.plugins)) {
-      if (!key.startsWith('my-error@')) continue;
-      const entry = (entries || []).find((e) => e && e.installPath) || null;
-      if (!entry) continue;
-      health.installation = fs.existsSync(path.join(entry.installPath, 'scripts', 'my_error.py'));
-      health.scope = entry.scope || null;
-      health.install_path = entry.installPath;
-      health.plugin_key = key;
-      health.version = entry.version || null;
-      break;
-    }
-  }
-
-  const settings = readJson(settingsPath) || {};
-  const enabledMap = settings.enabledPlugins || {};
-  health.enabled = health.plugin_key ? enabledMap[health.plugin_key] !== false : false;
-
-  if (health.install_path) {
-    const manifest = readJson(path.join(health.install_path, 'hooks', 'hooks.json'));
-    const events = manifest && manifest.hooks ? Object.keys(manifest.hooks) : [];
-    // The events that carry the plugin's actual function. Missing any of these
-    // means it is installed but structurally incapable of doing its job.
-    const required = ['PreToolUse', 'PostToolUseFailure', 'PostToolUse', 'SessionStart'];
-    health.hooks = Object.fromEntries(required.map((e) => [e, events.includes(e)]));
-    health.hooks_registered = required.every((e) => events.includes(e));
-  }
-
-  health.data_dir = resolveDataDir(health.install_path);
-
-  try {
-    fs.mkdirSync(path.dirname(CACHE), { recursive: true });
-    fs.writeFileSync(CACHE, JSON.stringify({ stamp, at: Date.now(), health }));
-  } catch { /* cache is an optimisation, never a requirement */ }
-  return health;
-}
-
-/** Ask the plugin where its data lives. There is exactly one implementation of
- *  that resolution, in scripts/my_error.py, and this calls it rather than
- *  reproducing it. A second copy here would drift and recreate the split-brain
- *  database this replaces. The answer is cached with the structural health,
- *  which is invalidated whenever the installation changes. */
-function resolveDataDir(installPath) {
-  if (!installPath) return null;
-  const res = spawnSync('python3', [path.join(installPath, 'scripts', 'my_error.py'), 'datadir', '--compact'], {
-    encoding: 'utf8', timeout: PROBE_TIMEOUT_MS,
-  });
-  if (res.status !== 0 || !res.stdout) return null;
-  try { return JSON.parse(res.stdout).data_dir || null; } catch { return null; }
-}
-
-/** Never cached: liveness and freshness are exactly what must not go stale.
- *
- *  Metrics come from the beacon rather than a fresh query, because only the
- *  plugin's own hooks can mutate the database — a beacon written after the last
- *  mutation is current, not cached. Freshness is proven, never assumed: the
- *  beacon carries the database mtime it observed, and if the real file has moved
- *  on, the metrics are declared stale instead of being believed. The expensive
- *  live query is kept for `--probe` and for doctor. */
-function liveState(health, sessionId, cwd) {
-  const state = {
-    plugin_loaded: false, database_readable: false, status_query: false,
-    metrics: null, beacon: null, stale: false, data_dir: health.data_dir,
-  };
-  if (!state.data_dir) return state;
-
-  const db = path.join(state.data_dir, 'my-error.db');
-  let dbMtime = 0;
-  try {
-    fs.accessSync(db, fs.constants.R_OK);
-    dbMtime = fs.statSync(db).mtimeMs;
-    state.database_readable = true;
-  } catch { return state; }   // unreadable database short-circuits: no metrics, no pretending
-
-  const beacon = readJson(path.join(state.data_dir, 'runtime.json'));
-  state.beacon = beacon;
-  if (!beacon) return state;
-  // Loaded == a hook of this plugin ran in THIS session. A beacon from an older
-  // session proves the plugin used to work, not that it works now.
-  if (sessionId && beacon.session_id === sessionId) state.plugin_loaded = true;
-
-  const projects = beacon.projects || {};
-  const key = Object.keys(projects)[0];
-  if (key) {
-    state.metrics = projects[key];
-    // 1s of slack absorbs WAL checkpoints that touch the file without changing rows.
-    state.stale = typeof beacon.db_mtime === 'number' && dbMtime - beacon.db_mtime * 1000 > 1000;
-    state.status_query = !state.stale;
-  }
-  return state;
-}
+// Health, freshness and data-directory resolution are shared with the status
+// line segment and live in one file, so the two observers cannot drift into
+// disagreeing about whether my-error is healthy. This module only *judges and
+// phrases*; it does not re-derive.
+const state = require('./my-error-state.cjs');
+const { structuralHealth, liveState, PROBE_TIMEOUT_MS } = state;
 
 /** The full live query. Deliberately off the per-prompt path. */
 function liveStateDeep(health, sessionId, cwd) {
-  const state = liveState(health, sessionId, cwd);
-  if (!health.install_path || !state.data_dir) return state;
+  const deep = liveState(health, sessionId);
+  if (!health.install_path || !deep.data_dir) return deep;
   const res = spawnSync('python3', [path.join(health.install_path, 'scripts', 'my_error.py'), 'metrics', '--compact'], {
     encoding: 'utf8', timeout: PROBE_TIMEOUT_MS,
     env: { ...process.env, CLAUDE_PROJECT_DIR: cwd || process.cwd() },
   });
-  state.status_query = false;
+  deep.status_query = false;
   if (res.status === 0 && res.stdout) {
-    try { state.metrics = JSON.parse(res.stdout); state.status_query = true; state.stale = false; } catch { /* malformed */ }
+    try { deep.metrics = JSON.parse(res.stdout); deep.status_query = true; deep.stale = false; } catch { /* malformed */ }
   }
-  return state;
+  return deep;
+}
+
+/** `--probe`: the one-shot manual verification the installer points at.
+ *
+ *  It exists so that "is this wired up correctly" can be answered without
+ *  waiting for a prompt, and it is the only path allowed to pay for the deep
+ *  query — which is why it is not what the per-prompt hook runs. */
+function probe(event) {
+  const health = structuralHealth();
+  const live = liveStateDeep(health, event && event.session_id, event && event.cwd);
+  return { health, live, line: statusLine(health, live) };
 }
 
 function statusLine(health, live) {
@@ -228,7 +129,7 @@ function main() {
   try { event = JSON.parse(raw); } catch { /* tolerate */ }
 
   const health = structuralHealth();
-  const live = liveState(health, event.session_id, event.cwd);
+  const live = liveState(health, event.session_id);
   const line = statusLine(health, live);
   const routing = runWrappedCommand(raw, event.cwd);
 

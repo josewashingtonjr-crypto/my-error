@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.4.2 — the status bar tells you it is alive
+
+`systemMessage` turned out not to be a persistent surface in this build of Claude Code: the
+watchdog's one-line report was written on every prompt and shown nowhere the user could keep
+looking at. The information was correct and invisible, which for an observability tool is the
+same as absent.
+
+The fix is a status line segment, and the interesting part is that it had to be a *wrapper*.
+Claude Code runs exactly one `statusLine` command, and the bar in a typical installation
+already belongs to something else — here, a framework that regenerates its own helper on
+setup, so editing that file would have worked until the next `init` and then failed silently.
+So `my-error-statusline.cjs` runs the existing command as a child, takes its stdout verbatim,
+and appends four tokens. If my-error breaks, the original bar still prints. If the original
+bar breaks, the segment still prints and says so. Neither can take the other down, and both
+were tested that way.
+
+### Added
+
+- **`watchdog/my-error-statusline.cjs`.** A status line segment, roughly
+  `🧠 ME ✅ 0.4.2 · SHADOW · L8 · X2` — health, runtime version, mode, active lessons,
+  cross-project recalls. Three health states only (`✅` healthy, `⚠️` present but not
+  trustworthy, `❌` not there); anything finer belongs in `/my-error:doctor`. Wrap an existing
+  bar with `MY_ERROR_STATUSLINE_WRAP`.
+- **`watchdog/my-error-state.cjs`.** Health, freshness and data-directory resolution, extracted
+  from the watchdog so the two observers cannot drift into disagreeing about whether the
+  plugin is healthy. The watchdog now requires it rather than owning it.
+- **An invocation beacon**, `~/.claude/watchdogs/.my-error-statusline.json`, throttled to one
+  write every five seconds. Running the script by hand proves nothing about the editor that
+  is already running (ERR-0016); this file is how the live bar declares that it executed this
+  code, and it carries the runtime version, the segment, and the measured cost.
+- **`benchmarks/statusline_benchmark.js`.** Reports the segment's own cost separately from the
+  wrapper process, because on a bar that redraws constantly the only interesting number is
+  what this plugin *adds*. Measured here: p50 0.19 ms, p95 0.38 ms in process; ~41 ms p50 end
+  to end, which is one extra `node` startup — the price of not editing the other tool's file.
+
+### Fixed
+
+- **`--probe` never worked.** `my-error-watchdog.cjs --probe` called a `probe()` that was
+  never defined, so the one verification step the installer tells you to run raised a
+  `ReferenceError`. It now exists and is the only path allowed to pay for the deep query.
+- **`MY_ERROR_DATA_DIR` was ignored on a cache hit.** The shared health cache is written by
+  whichever observer ran last, and a cached `data_dir` outranked an explicit override for up
+  to five minutes. The override is now applied on the way out of every path, and an overridden
+  answer is never written back to the shared cache.
+- **The installer printed `"timeout": 10000`.** Hook timeouts are in *seconds*: that snippet
+  asked for a hook that could hang for nearly three hours before Claude Code gave up. It now
+  prints `10`, and two tests fail if either the manifest or the snippet ever drifts back into
+  milliseconds.
+- **The installer copied one file.** It now copies all three; a partial copy produced a
+  wrapper that reported `❌` instead of metrics.
+
+### Unchanged
+
+Deliberately: `systemMessage` still carries the watchdog's long report, because a surface that
+does not render it today may render it tomorrow and the payload costs nothing. The division is
+now explicit — `statusLine` is what the *user* keeps looking at, `additionalContext` is what
+*Claude* reads, `systemMessage` is complementary. Nothing in the SHADOW experiment moved: no
+threshold, no verdict, no guard, no ranking.
+
 ## 0.4.1 — a CLI-recorded lesson names its repository
 
 `learn` runs without a hook payload, and identity resolution still let
