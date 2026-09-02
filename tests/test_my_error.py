@@ -1218,6 +1218,53 @@ class ObservabilityWrapperTest(unittest.TestCase):
         self.assertIn("segment", rec)
         self.assertIn("ms", rec)
 
+    def _fake_install(self, lessons=8, cross=2, db_ahead=False):
+        """A data directory shaped like a real one, so the segment can be driven
+        through states that are hard to produce on demand in a live install."""
+        db = self.data / "my-error.db"
+        db.write_bytes(b"SQLite format 3\x00")
+        beacon = {
+            "version": me_version(), "mode": "SHADOW", "session_id": "s",
+            "db_mtime": os.path.getmtime(db),
+            "projects": {"p": {"mode": "SHADOW", "lessons_active": lessons,
+                               "cross_project_recalls": cross}},
+        }
+        if db_ahead:
+            beacon["db_mtime"] = os.path.getmtime(db) - 3600
+        (self.data / "runtime.json").write_text(json.dumps(beacon))
+
+    def test_segment_reports_the_metrics_the_beacon_carries(self):
+        self._fake_install(lessons=42, cross=7)
+        p = self.run_statusline('{"session_id":"t"}', MY_ERROR_DATA_DIR=str(self.data),
+                                MY_ERROR_STATUSLINE_WRAP=None)
+        self.assertIn("L42", p.stdout)
+        self.assertIn("X7", p.stdout)
+        self.assertIn("SHADOW", p.stdout)
+
+    def test_a_beacon_older_than_its_database_is_reported_stale(self):
+        """The one branch that must never be optimistic: only the plugin writes
+        that database, so a beacon predating the last write is not merely old —
+        the numbers in it describe a state that no longer exists."""
+        self._fake_install(db_ahead=True)
+        p = self.run_statusline('{"session_id":"t"}', MY_ERROR_DATA_DIR=str(self.data),
+                                MY_ERROR_STATUSLINE_WRAP=None)
+        self.assertIn("⚠️", p.stdout)
+        self.assertIn("defasado", p.stdout)
+        self.assertNotIn("✅", p.stdout)
+
+    def test_a_runtime_version_that_differs_from_the_installed_one_is_flagged(self):
+        """ERR-0016 in the bar: code on disk is not code in use. A restart is
+        what closes the gap, and until then the segment must say so."""
+        self._fake_install()
+        beacon = json.loads((self.data / "runtime.json").read_text())
+        beacon["version"] = "0.0.1-antiga"
+        (self.data / "runtime.json").write_text(json.dumps(beacon))
+        p = self.run_statusline('{"session_id":"t"}', MY_ERROR_DATA_DIR=str(self.data),
+                                MY_ERROR_STATUSLINE_WRAP=None)
+        self.assertIn("0.0.1-antiga", p.stdout)
+        self.assertIn("inst", p.stdout)
+        self.assertIn("⚠️", p.stdout)
+
     def test_watchdog_probe_answers(self):
         """--probe is what the installer tells people to run; it must exist."""
         p = subprocess.run(["node", str(self.WATCHDOG_DIR / "my-error-watchdog.cjs"), "--probe"],
