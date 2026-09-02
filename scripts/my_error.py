@@ -250,9 +250,18 @@ def canonical_root(event: dict[str, Any] | None = None) -> str:
     root = None
     if event:
         root = event.get("cwd")
+    # For a CLI invocation there is no event, and the process's own directory is
+    # the same class of evidence the hook payload gives: it is where the work is
+    # happening. Letting CLAUDE_PROJECT_DIR win here would reintroduce the bug
+    # one level down -- a lesson recorded by an agent working inside a
+    # repository would be attributed to the session's launch directory, so
+    # `origin_project_id` would name the workspace instead of the repository
+    # that paid for the lesson. Observed doing exactly that before this line
+    # moved. The env var stays as the last resort for a context that has
+    # neither.
     if not root:
-        root = os.getenv("CLAUDE_PROJECT_DIR")
-    root = root or os.getcwd()
+        root = os.getcwd()
+    root = root or os.getenv("CLAUDE_PROJECT_DIR")
     try:
         return str(Path(root).resolve())
     except Exception:

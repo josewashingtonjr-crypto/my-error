@@ -398,6 +398,28 @@ class MyErrorTest(unittest.TestCase):
         self.assertIn(rows[str(plain)][1], ("directory", "workspace"))
         self.assertNotEqual(rows[str(plain)][1], "git")
 
+    def test_cli_lesson_is_attributed_to_the_repo_it_was_written_in(self):
+        """Provenance must name the repository that paid for the lesson.
+
+        `learn` runs as a CLI call with no hook payload, so if the session's
+        launch directory won here, a lesson written while working inside a
+        repository would record the workspace as its origin — the same defect
+        as the hook path, one level down. Caught by running the real
+        cross-project proof, not by review.
+        """
+        repo = self._mkrepo("fidren")
+        self.env["CLAUDE_PROJECT_DIR"] = str(Path(self.tmp.name))  # session opened at the parent
+        p = self.run_cli("learn", "--scope", "global", "--title", "t", "--cause", "c",
+                         "--rule", "r", "--confidence", "verified", project=repo)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        db = sqlite3.connect(self.data / "my-error.db"); db.row_factory = sqlite3.Row
+        try:
+            origin = db.execute("select origin_project_id from lessons where id=1").fetchone()[0]
+            root = db.execute("select root from projects where id=?", (origin,)).fetchone()[0]
+        finally:
+            db.close()
+        self.assertEqual(root, str(repo), "origin must be the repository, not the session root")
+
     # ------------------------------------------------------------------
     # Scope: an audited, identity-preserving move.
     # ------------------------------------------------------------------
