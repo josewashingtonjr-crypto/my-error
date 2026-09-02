@@ -12,7 +12,7 @@ verifiable. That path is the *cheapest* source of evidence, not the definition o
 A logic defect, a wrong assumption, a badly sized task or an unsafe judgment produces no
 failing command and is recorded deliberately, through the same verification bar.
 
-> ### ⚠️ EXPERIMENTAL — v0.4.3
+> ### ⚠️ EXPERIMENTAL — v0.4.4
 >
 > Ships in **SHADOW mode**: the guard records what it *would* have blocked and **blocks
 > nothing**. The automatic guard is on a 30-day probation while its real base rate is
@@ -157,7 +157,7 @@ the plugin is healthy.
 cross-project recalls:
 
 ```
-▊ sua barra atual  │  🧠 ME ✅ 0.4.3 · SHADOW · L8 · X2
+▊ sua barra atual  │  🧠 ME ✅ 0.4.4 · SHADOW · L8 · X2
 ```
 
 Claude Code runs exactly one `statusLine` command, so if you already have a bar this
@@ -198,7 +198,7 @@ answer; tests redirect it with `MY_ERROR_STATUSLINE_TRACE`.
 | | |
 |---|---|
 | [docs/TESTING.md](docs/TESTING.md) | Reproduce the controlled test, including the anti-superstition check |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Hooks, pipeline, storage, watchdog, CLI |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Hooks, pipeline, storage, watchdog, CLI, release rules |
 | [docs/METRICS.md](docs/METRICS.md) | Exact meaning of every counter — read before quoting one |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Real failure modes and how to diagnose them |
 | [docs/STATUSLINE.md](docs/STATUSLINE.md) | Which clients render the status bar, and why absence is not inactivity |

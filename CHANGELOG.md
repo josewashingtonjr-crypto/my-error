@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.4 — a published version is frozen
+
+**Documentation and process only. No functional change to the runtime.** The hook pipeline,
+the schema, the guards, the recall ranking and the SHADOW experiment are byte-for-byte the
+behaviour shipped in 0.4.3; the only executable line that moved is the `VERSION` constant,
+which has to move for the live beacon to be able to declare which body of code it is running.
+
+**Why this release exists at all.** 0.4.3 was already published, installed, and running —
+its beacon had declared it, and the install record bound it to commit `e702631`. Two
+documentation fixes were then written. Landing them on top of 0.4.3 would have produced two
+different bodies of code sharing one version number, which is precisely the state the new
+rule forbids. The bump is not paperwork around the doc change; it *is* the correct handling
+of the doc change.
+
+- **Release immutability is now written down** (`docs/ARCHITECTURE.md`, new `## Releasing`
+  section). Once a version number exists outside the working tree — installed, tagged,
+  pushed, or sitting in the plugin cache — the code carrying that number is frozen, and any
+  further distributed change requires a new number. The mechanism is that the updater is
+  version-gated: it compares installed against marketplace and skips on a match, so
+  re-cutting the same number yields `updater says "latest" ≠ the code is latest`, with the
+  live instance executing old bytes while every indicator agrees it should not. That is
+  ERR-0016 with its evidence trail removed — the beacon still tells the truth, but the
+  number it reports no longer identifies a single body of code.
+- **Schema version in the docs corrected**, 2 → 4. `docs/ARCHITECTURE.md` had been stating a
+  `PRAGMA user_version` that two migrations had already left behind, while the live database
+  and `SCHEMA_VERSION` in the script were both at 4.
+
+**The SHADOW experiment is untouched.** Start date, day count, thresholds, verdicts, guards,
+families, natural-vs-controlled split and recall ranking all carry over unchanged. The clock
+continues from where it was; a release does not restart it.
+
 ## 0.4.3 — captures stop disappearing during the schema upgrade
 
 A concurrency test failed intermittently with `7 != 8`: eight hooks fired at the same

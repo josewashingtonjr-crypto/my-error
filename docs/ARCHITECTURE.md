@@ -207,6 +207,46 @@ MY_ERROR=$(ls -d ~/.claude/plugins/cache/*/my-error/*/scripts/my_error.py | tail
 | `MY_ERROR_HEALTH_CACHE` | Where the shared health cache lives. Tests and benchmarks MUST set it. |
 | `MY_ERROR_WRAP_COMMAND` | Watchdog only: an existing hook command to run and merge. |
 
+## Releasing
+
+**A published version is immutable.** Once a version number exists anywhere outside the
+working tree — installed, tagged, pushed, or sitting in the plugin cache — the code that
+carries that number is frozen. Any further change that will be distributed requires a new
+number.
+
+Not this:
+
+```
+0.4.3  (commit A)  →  0.4.3  (commit B)
+```
+
+This:
+
+```
+0.4.3  (commit A)  →  0.4.4  (commit B)
+```
+
+The reason is mechanical, not ceremonial. The updater is **version-gated**: it compares the
+installed version against the marketplace version and skips when they match. Re-cutting the
+same number therefore produces a state that cannot be detected from the outside —
+
+```
+updater says "latest"   ≠   the code is latest
+```
+
+— and the live runtime keeps executing the old bytes while every version indicator agrees
+that it should not. That is the ERR-0016 failure with the evidence trail removed: the beacon
+in `runtime.json` reports `0.4.3` and is telling the truth, but `0.4.3` no longer identifies
+a single body of code. Nothing in the system can then answer the question this plugin exists
+to answer — *is the fix actually running?*
+
+The bump is part of the delivery, not paperwork after it. Concretely, one distributed change
+means all of: `.claude-plugin/plugin.json` version bumped, `CHANGELOG.md` entry, commit, and
+reinstall — then confirm the live instance by its own declaration (`runtime.json`, or the
+`--plugin-dir` of the running process), never by a fresh CLI invocation.
+
+The only edits that may keep a version number are ones that never leave the working tree.
+
 ## Failure containment
 
 A hook must never break the session it observes. Any internal error — locked database,
@@ -219,6 +259,6 @@ capture loss -- hooks reported success while their events disappeared.
 ## Schema
 
 `projects`, `candidates`, `lessons`, `guards`, `guard_events`, `meta`. Migrations are
-forward-only and idempotent, tracked by `PRAGMA user_version` (currently 2). WAL is enabled
+forward-only and idempotent, tracked by `PRAGMA user_version` (currently 4). WAL is enabled
 once, not on every connect — issuing `PRAGMA journal_mode` repeatedly caused lost writes,
 because it needs an exclusive lock and does not honour `busy_timeout`.
