@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.4.0 — knowledge that travels between projects
+
+`0.4.0` rather than `0.3.4`: `learn --scope` is now **required**, which breaks every existing
+invocation that relied on the default, there is a new `scope` command, a schema migration to
+v4, and project identity resolves differently. In 0.x the minor is where a break belongs.
+
+### The defect this fixes
+
+Two of them, and they compounded.
+
+**Project identity followed the session, not the work.** `canonical_root()` preferred
+`CLAUDE_PROJECT_DIR`, which Claude Code sets to the directory the session was launched from
+and never changes. Measured with a live hook trace on 2026-09-02: session at `/home/w-jr`,
+Bash tool operating inside `/home/w-jr/PoolBet`, env var reading `/home/w-jr` and
+`event["cwd"]` reading `/home/w-jr/PoolBet`. Every repository under the home directory was
+therefore filed into a single namespace named "home" — three unrelated projects sharing one
+lesson store. That resembles cross-project transfer and is its opposite: it is the absence of
+separation, and it collapses the moment a session is opened inside one of those repositories.
+
+**Scope defaulted to `project` in silence.** A rule that generalises — "a caught query error
+still aborts a Postgres transaction" — was recorded reachable from one repository unless
+somebody remembered a flag. ERR-0012, a general observability principle, was stranded that
+way and nobody would have noticed for months.
+
+### Added
+
+- **`my_error.py scope <ERR-id> <project|global> [--reason]`.** Moves a lesson in place:
+  id, title, cause, rule, confidence, source, origin, provenance, `created_at` and
+  `use_count` all survive, and the change is written to a new `lesson_scope_changes` audit
+  table with old scope, new scope, timestamp and reason. The alternatives were rejected as
+  lossy — a direct `UPDATE` leaves no trace that a rule's reach was widened, and
+  `forget` + `learn` mints a new id, discarding the evidence that the lesson has been
+  earning its place.
+- **`lessons.origin_project_id`** — provenance, separate from scope. Where a lesson was
+  *learned* is not where it may be *used*, and promotion to global must not erase the
+  birthplace. This is what makes "we paid for this in Fidren and it came back in Livara"
+  answerable.
+- **`recall_events`** — one row per recall, carrying lesson scope, origin project, consuming
+  project and a recorded `cross_project` flag.
+- **Knowledge-transfer metrics**, reported by `doctor` in their own section, deliberately
+  apart from every guard number: active global vs project lessons, recalls by scope,
+  cross-project recalls, and the learned-in → used-in pairs. `recalled` means placed in
+  front of the agent; nothing here claims it helped.
+- **`projects.kind`** — `git`, `directory` or `workspace`. A home directory holding several
+  repositories is not a project, and is now labelled rather than silently treated as one.
+
+### Changed
+
+- **Project identity prefers `event["cwd"]`**, then `CLAUDE_PROJECT_DIR`, then the process
+  directory — evidence first, the session's opinion second. Linked worktrees still share one
+  identity through `git --git-common-dir`, unchanged.
+- **`learn --scope` is required.** No default, with `--scope-reason` available to record why.
+
+### Unchanged
+
+The SHADOW experiment is untouched: `SHADOW_EXPERIMENT_DAYS`, `SHADOW_PROMOTE_THRESHOLD`,
+the pre-committed decision rule, guard criteria, command families, prediction classification
+and the `controlled_test`/`natural_usage` split are all exactly as frozen on 2026-08-18. The
+17/09 verdict judges the deterministic auto-guard and nothing else — which is why the
+transfer metrics above are reported separately rather than folded in beside it.
+
+### Tests
+
+75 (9 new), nine of them verified failing against 0.3.3. Benchmarks re-run: prevention rate
+1.0, zero false blocks.
+
 ## 0.3.3 — an error is a verified mistake, not a non-zero exit code
 
 A doctrine fix. The plugin's own workflow skill defined its scope as "**only** verified

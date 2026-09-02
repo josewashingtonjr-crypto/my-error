@@ -17,6 +17,10 @@ def me_version() -> str:
     return re.search(r'VERSION = "([^"]+)"', src).group(1)
 
 
+# Bumped with SCHEMA_VERSION in my_error.py; named so a schema bump touches one line.
+SCHEMA_VERSION_EXPECTED = 4
+
+
 class MyErrorTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -64,6 +68,7 @@ class MyErrorTest(unittest.TestCase):
     def lesson_count(self):
         db = sqlite3.connect(self.data / "my-error.db")
         try: return db.execute("select count(*) from lessons where status='active'").fetchone()[0]
+        except sqlite3.OperationalError: return 0  # schema never created: nothing was written
         finally: db.close()
 
     def train_pair(self, bad, error, good, sid="s1", locale=None, origin=None):
@@ -163,14 +168,14 @@ class MyErrorTest(unittest.TestCase):
         self.assertEqual(self.lesson_count(), 0)
 
     def test_manual_lesson_is_recalled_by_prompt(self):
-        p = self.run_cli("learn", "--title", "Generated Prisma client", "--cause", "Generated code was edited directly", "--rule", "Edit prisma/schema.prisma and regenerate the client instead of editing generated client files.", "--confidence", "verified", "--tags", "prisma,schema,generated")
+        p = self.run_cli("learn", "--scope", "project", "--title", "Generated Prisma client", "--cause", "Generated code was edited directly", "--rule", "Edit prisma/schema.prisma and regenerate the client instead of editing generated client files.", "--confidence", "verified", "--tags", "prisma,schema,generated")
         self.assertEqual(p.returncode, 0, p.stderr)
         event = {"session_id":"s","cwd":str(self.project),"prompt":"Update the Prisma generated client after changing the schema"}
         out = self.hook("prompt", event)
         self.assertIn("prisma/schema.prisma", out["hookSpecificOutput"]["additionalContext"])
 
     def test_manual_write_guard_blocks_precise_pattern(self):
-        p = self.run_cli("learn", "--title", "Do not edit generated file", "--cause", "File is generated", "--rule", "Do not write generated/client.ts directly.", "--confidence", "verified", "--guard-tool", "Write", "--guard-field", "file_path", "--guard-match", "contains", "--guard-pattern", "generated/client.ts", "--guard-reason", "Generated file must be regenerated")
+        p = self.run_cli("learn", "--scope", "project", "--title", "Do not edit generated file", "--cause", "File is generated", "--rule", "Do not write generated/client.ts directly.", "--confidence", "verified", "--guard-tool", "Write", "--guard-field", "file_path", "--guard-match", "contains", "--guard-pattern", "generated/client.ts", "--guard-reason", "Generated file must be regenerated")
         self.assertEqual(p.returncode, 0, p.stderr)
         event = {"session_id":"s","cwd":str(self.project),"tool_name":"Write","tool_input":{"file_path":str(self.project / 'generated/client.ts'),"content":"x"}}
         out = self.hook("guard", event)
@@ -305,11 +310,187 @@ class MyErrorTest(unittest.TestCase):
 
     def test_learn_still_rejects_a_candidate_id_that_does_not_exist(self):
         """The manual path widens what may be learned, never what may be claimed."""
-        p = self.run_cli("learn", "--candidate-id", "9999", "--title", "t",
+        p = self.run_cli("learn", "--scope", "project", "--candidate-id", "9999", "--title", "t",
                          "--cause", "c", "--rule", "r", "--confidence", "verified")
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("not found", p.stderr)
         self.assertEqual(self.lesson_count(), 0)
+
+    # ------------------------------------------------------------------
+    # Project identity. Measured from real hook payloads on 2026-09-02:
+    # CLAUDE_PROJECT_DIR is the session's launch directory and never moves,
+    # while event["cwd"] follows the tool. Preferring the env var filed every
+    # repository under one home-directory namespace.
+    # ------------------------------------------------------------------
+
+    def _mkrepo(self, name):
+        d = Path(self.tmp.name) / name
+        d.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-q"], cwd=str(d), check=True)
+        return d
+
+    def _pid_of(self, root, event_cwd=None):
+        """The namespace a hook would file work under, read back from the DB."""
+        ev = {"session_id": "id", "cwd": str(event_cwd or root), "tool_name": "Bash",
+              "tool_input": {"command": "true"}, "tool_response": {"stdout": "ok"}}
+        self.hook("success", ev, project=root)
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            rows = {r[1]: (r[0], r[2]) for r in db.execute("select id, root, kind from projects")}
+        finally:
+            db.close()
+        return rows
+
+    def test_two_repos_under_one_session_root_get_separate_namespaces(self):
+        """Fidren and Livara must not share a lesson store by accident."""
+        a, b = self._mkrepo("fidren"), self._mkrepo("livara")
+        # Session launched at the shared parent, tools operating inside each repo.
+        home = Path(self.tmp.name)
+        self.env["CLAUDE_PROJECT_DIR"] = str(home)
+        rows = self._pid_of(home, event_cwd=a)
+        rows = self._pid_of(home, event_cwd=b)
+        roots = set(rows)
+        self.assertIn(str(a), roots, f"tool cwd inside the repo must win over the session root: {roots}")
+        self.assertIn(str(b), roots)
+        self.assertNotEqual(rows[str(a)][0], rows[str(b)][0], "two repos, two namespaces")
+        self.assertEqual(rows[str(a)][1], "git")
+        self.assertEqual(rows[str(b)][1], "git")
+
+    def test_session_started_inside_the_repo_lands_in_the_same_namespace(self):
+        """The namespace must not depend on where Claude Code happened to start."""
+        a = self._mkrepo("fidren")
+        home = Path(self.tmp.name)
+        self.env["CLAUDE_PROJECT_DIR"] = str(home)
+        from_home = self._pid_of(home, event_cwd=a)[str(a)][0]
+        self.env["CLAUDE_PROJECT_DIR"] = str(a)
+        from_repo = self._pid_of(a, event_cwd=a)[str(a)][0]
+        self.assertEqual(from_home, from_repo,
+                         "same repository, so same lessons, whichever directory the session opened in")
+
+    def test_linked_worktree_shares_the_repository_identity(self):
+        """Preserved from the earlier decision: worktrees are one repository."""
+        a = self._mkrepo("fidren")
+        (a / "f.txt").write_text("x")
+        subprocess.run(["git", "add", "-A"], cwd=str(a), check=True)
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "i"],
+                       cwd=str(a), check=True)
+        wt = Path(self.tmp.name) / "fidren-wt"
+        r = subprocess.run(["git", "worktree", "add", "-q", str(wt), "-b", "side"],
+                           cwd=str(a), capture_output=True, text=True)
+        if r.returncode != 0:
+            self.skipTest("git worktree unavailable")
+        rows = self._pid_of(a, event_cwd=a)
+        main_pid = rows[str(a)][0]
+        before = len(rows)
+        rows = self._pid_of(a, event_cwd=wt)
+        # The worktree resolves onto the repository's existing identity, so no
+        # new namespace appears and the stored root stays the one first seen.
+        # Counting rows is the assertion; looking the worktree path up by root
+        # would find nothing precisely *because* the behaviour is correct.
+        self.assertEqual(len(rows), before, f"a linked worktree must not mint a namespace: {rows}")
+        self.assertIn(main_pid, {v[0] for v in rows.values()})
+
+    def test_directory_without_git_is_marked_not_invented(self):
+        """No repository means the identity is a path, and says so."""
+        plain = Path(self.tmp.name) / "loose"
+        plain.mkdir()
+        rows = self._pid_of(plain, event_cwd=plain)
+        self.assertIn(rows[str(plain)][1], ("directory", "workspace"))
+        self.assertNotEqual(rows[str(plain)][1], "git")
+
+    # ------------------------------------------------------------------
+    # Scope: an audited, identity-preserving move.
+    # ------------------------------------------------------------------
+
+    def test_scope_promotion_preserves_identity_and_records_an_audit_row(self):
+        self.run_cli("learn", "--scope", "project", "--title", "SLI measuring itself",
+                     "--cause", "the metric was derived from the collector it was judging",
+                     "--rule", "a stopped series must read as bad, never as healthy",
+                     "--confidence", "verified", "--tags", "observability")
+        db = sqlite3.connect(self.data / "my-error.db"); db.row_factory = sqlite3.Row
+        before = dict(db.execute("select * from lessons where id=1").fetchone()); db.close()
+
+        p = self.run_cli("scope", "ERR-0001", "global", "--reason", "observability principle, not Fidren's")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("PROJECT -> GLOBAL", p.stdout)
+
+        db = sqlite3.connect(self.data / "my-error.db"); db.row_factory = sqlite3.Row
+        after = dict(db.execute("select * from lessons where id=1").fetchone())
+        audit = dict(db.execute("select * from lesson_scope_changes where lesson_id=1").fetchone())
+        db.close()
+        # Everything that identifies the lesson survives.
+        for field in ("id", "title", "cause", "rule_text", "confidence", "source",
+                      "created_at", "use_count", "origin", "origin_project_id", "tags"):
+            self.assertEqual(before[field], after[field], f"{field} must survive a scope change")
+        self.assertEqual(after["scope"], "global")
+        self.assertIsNone(after["project_id"], "a global lesson belongs to no project")
+        self.assertIsNotNone(after["origin_project_id"], "promotion must not erase where it was learned")
+        self.assertEqual((audit["old_scope"], audit["new_scope"]), ("project", "global"))
+        self.assertIn("Fidren", audit["reason"])
+
+    def test_scope_is_idempotent_and_rejects_unknown_lessons(self):
+        self.run_cli("learn", "--scope", "global", "--title", "t", "--cause", "c",
+                     "--rule", "r", "--confidence", "verified")
+        p = self.run_cli("scope", "ERR-0001", "global")
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("already GLOBAL", p.stdout)
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            self.assertEqual(db.execute("select count(*) from lesson_scope_changes").fetchone()[0], 0,
+                             "a no-op must not write an audit row")
+        finally:
+            db.close()
+        self.assertNotEqual(self.run_cli("scope", "ERR-9999", "global").returncode, 0)
+
+    def test_learn_refuses_to_guess_the_scope(self):
+        """The silent `project` default is how a universal rule gets stranded."""
+        p = self.run_cli("learn", "--title", "t", "--cause", "c", "--rule", "r", "--confidence", "verified")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("--scope", p.stderr)
+        # argparse refuses before anything opens the database, so there may be
+        # no schema at all -- which is the strongest form of "nothing was
+        # written", not a reason to skip the check.
+        self.assertEqual(self.lesson_count() if (self.data / "my-error.db").exists() else 0, 0)
+
+    # ------------------------------------------------------------------
+    # The thesis: knowledge paid for in one project, recovered in another.
+    # ------------------------------------------------------------------
+
+    def test_global_lesson_learned_in_one_repo_is_recalled_in_another(self):
+        a, b = self._mkrepo("fidren"), self._mkrepo("livara")
+        self.env["CLAUDE_PROJECT_DIR"] = str(a)
+        p = self.run_cli("learn", "--scope", "global", "--title", "PG transaction abort",
+                         "--cause", "a caught query error still aborts the transaction",
+                         "--rule", "move the reads out of the transaction, or use a SAVEPOINT per read",
+                         "--confidence", "verified", "--scope-reason", "PostgreSQL semantics, not this repo",
+                         "--tags", "postgres,transaction", project=a)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+        # Now working in the *other* repository.
+        out = self.hook("prompt", {"session_id": "x", "cwd": str(b),
+                                   "prompt": "wrap these postgres queries in one transaction"}, project=b)
+        self.assertIsNotNone(out, "a global lesson must cross the project boundary")
+        self.assertIn("SAVEPOINT", out["hookSpecificOutput"]["additionalContext"])
+
+        db = sqlite3.connect(self.data / "my-error.db"); db.row_factory = sqlite3.Row
+        ev = dict(db.execute("select * from recall_events order by id desc limit 1").fetchone())
+        roots = {r[0]: r[1] for r in db.execute("select id, root from projects")}
+        db.close()
+        self.assertEqual(ev["cross_project"], 1, "recalled somewhere other than where it was learned")
+        self.assertEqual(roots[ev["origin_project_id"]], str(a))
+        self.assertEqual(roots[ev["consuming_project_id"]], str(b))
+
+    def test_project_lesson_does_not_leak_into_another_repo(self):
+        """Transfer must be a decision, not the absence of separation."""
+        a, b = self._mkrepo("fidren"), self._mkrepo("livara")
+        self.env["CLAUDE_PROJECT_DIR"] = str(a)
+        self.run_cli("learn", "--scope", "project", "--title", "local script path",
+                     "--cause", "wrong helper invoked", "--rule",
+                     "in this repository the deploy helper is scripts/deploy-fidren.sh",
+                     "--confidence", "verified", "--tags", "deploy", project=a)
+        out = self.hook("prompt", {"session_id": "y", "cwd": str(b),
+                                   "prompt": "which deploy helper script should I run"}, project=b)
+        self.assertIsNone(out, "a repository-specific rule must not travel")
 
     def test_expired_guard_fails_open(self):
         self.train_pair("npm run buil", "Exit code 1\nMissing script: buil", "npm run build")
@@ -361,7 +542,7 @@ class MyErrorTest(unittest.TestCase):
         self.assertEqual(self.lesson_count(), 0)
 
     def test_v11_semantic_recall_ranks_money_rule_first(self):
-        p = self.run_cli("learn", "--title", "Money precision", "--cause", "Binary floating point corrupted monetary values", "--rule", "Use decimal or integer minor units for money.", "--confidence", "verified", "--tags", "money,decimal,precision")
+        p = self.run_cli("learn", "--scope", "project", "--title", "Money precision", "--cause", "Binary floating point corrupted monetary values", "--rule", "Use decimal or integer minor units for money.", "--confidence", "verified", "--tags", "money,decimal,precision")
         self.assertEqual(p.returncode, 0, p.stderr)
         event = {"session_id":"sem2","cwd":str(self.project),"prompt":"Compute invoice totals and payment amounts"}
         out = self.hook("prompt", event)
@@ -548,7 +729,7 @@ class MyErrorTest(unittest.TestCase):
         self.assertEqual(m["lessons_active"], 1)
         db = sqlite3.connect(self.data / "my-error.db")
         try:
-            self.assertEqual(int(db.execute("PRAGMA user_version").fetchone()[0]), 3)
+            self.assertEqual(int(db.execute("PRAGMA user_version").fetchone()[0]), SCHEMA_VERSION_EXPECTED)
             # Data present before the origin column existed is backfilled
             # controlled_test, never natural_usage, so it can't leak into the verdict.
             origin = db.execute("SELECT origin FROM lessons LIMIT 1").fetchone()[0]
@@ -585,14 +766,14 @@ class MyErrorTest(unittest.TestCase):
         self.assertEqual(src, "auto-verified-recovery")
 
     def test_manual_lessons_are_still_recalled(self):
-        self.run_cli("learn", "--title", "Money precision", "--cause", "float corrupted money",
+        self.run_cli("learn", "--scope", "project", "--title", "Money precision", "--cause", "float corrupted money",
                      "--rule", "Use decimal for money.", "--confidence", "verified", "--tags", "money")
         out = self.hook("prompt", {"session_id": "r", "cwd": str(self.project),
                                    "prompt": "compute invoice payment amounts"})
         self.assertIn("Use decimal", out["hookSpecificOutput"]["additionalContext"])
 
     def test_dormant_lessons_leave_recall_but_stay_stored(self):
-        self.run_cli("learn", "--title", "Old rule", "--cause", "c", "--rule",
+        self.run_cli("learn", "--scope", "project", "--title", "Old rule", "--cause", "c", "--rule",
                      "Use decimal for money.", "--confidence", "verified", "--tags", "money")
         db = sqlite3.connect(self.data / "my-error.db")
         db.execute("UPDATE lessons SET updated_at='2020-01-01T00:00:00+00:00',"
@@ -677,7 +858,7 @@ class MyErrorTest(unittest.TestCase):
 
     def test_D_manual_lesson_is_visible_to_the_hook_path(self):
         home, env = self._isolated()
-        self.assertEqual(self._run(env, "learn", "--title", "T", "--cause", "C",
+        self.assertEqual(self._run(env, "learn", "--scope", "project", "--title", "T", "--cause", "C",
                                    "--rule", "Use decimal for money.",
                                    "--confidence", "verified", "--tags", "money").returncode, 0)
         hook_env = dict(env, CLAUDE_PLUGIN_DATA=str(Path(self.tmp.name) / "injected"))
@@ -831,7 +1012,7 @@ class MyErrorTest(unittest.TestCase):
         self.assertEqual(event_origin, "natural_usage")
 
     def test_learn_origin_flag_overrides_inherited_origin(self):
-        p = self.run_cli("learn", "--title", "T", "--cause", "C", "--rule", "Use decimal for money.",
+        p = self.run_cli("learn", "--scope", "project", "--title", "T", "--cause", "C", "--rule", "Use decimal for money.",
                          "--confidence", "verified", "--tags", "money", "--origin", "controlled_test")
         self.assertEqual(p.returncode, 0, p.stderr)
         db = sqlite3.connect(self.data / "my-error.db")

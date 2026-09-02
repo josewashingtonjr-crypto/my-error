@@ -1,6 +1,6 @@
 {
   "benchmark": "my-error v0.3 independent live held-out A/B",
-  "plugin_version": "0.3.2",
+  "plugin_version": "0.4.0",
   "attempted_pairs": 36,
   "valid_pairs": 33,
   "skipped": [
@@ -406,5 +406,5 @@
     }
   ],
   "false_block_commands": [],
-  "temp_project": "/tmp/my-error-v11-heldout-y0lymjoy/project"
+  "temp_project": "/tmp/my-error-v11-heldout-6uevlv57/project"
 }

@@ -21,6 +21,13 @@ omit `--candidate-id` entirely. Verification still applies — a test that fails
 old code and passes against the new one, or a concrete before/after measurement.
 
 Then follow the evidence-gated workflow in the `my-error:workflow` skill: check the four
-admission criteria, choose `--scope global` when the rule is not specific to this
-repository, and store a concise causal lesson. Do not add a blocking guard unless the
+admission criteria and store a concise causal lesson.
+
+**`--scope` is required — decide it, do not let it be guessed.** `global` when the failure
+mechanism generalises beyond this repository (a language, a database, a protocol, an
+engineering principle); `project` when the rule leans on this repo's paths, scripts,
+services or internal APIs. Add `--scope-reason` and state the classification out loud before
+writing, e.g. *"Scope: GLOBAL — PostgreSQL transaction semantics, independent of this
+repository."* A universal rule filed as project-scoped is the failure this requirement
+exists to prevent. Do not add a blocking guard unless the
 forbidden tool action is precise and safe to reject deterministically.

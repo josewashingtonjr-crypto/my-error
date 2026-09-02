@@ -137,7 +137,37 @@ it is a way of noticing that the bar should be applied at all.
 A good lesson is causal, reusable, scoped to the project unless truly universal, and
 falsifiable. Prefer one precise rule over several speculative rules.
 
-Scope is a real decision, not a default. A rule that follows from a language, a database or
-a protocol is `global` — it will be true in the next project too. A rule that depends on this
-repository's layout, tooling or conventions is `project`. Marking a universal rule as
-project-scoped quietly throws away most of its value.
+## Scope — the decision that makes a lesson worth having
+
+**`--scope` is required and has no default.** That is deliberate. The point of this store is
+that Claude should not pay twice for the same lesson, *including across different projects*,
+and a silent `project` default is exactly how a universal rule ends up reachable from one
+repository and discovered stranded months later.
+
+**`project`** when the rule depends on this repository: its paths, script names, services,
+internal APIs, particular configuration — anything that would be plainly wrong somewhere
+else. *"In this repository the deploy helper is `scripts/deploy-x.sh`."* That must not
+travel.
+
+**`global`** when there is a generalisable failure mechanism and a reusable prevention rule.
+It follows from a language, a database, a protocol or an engineering principle, and it will
+be just as true in the next project:
+
+- a caught query error still aborts the enclosing Postgres transaction;
+- a metric derived from the collector it is judging cannot prove its own health;
+- readiness is not the same thing as bootstrap having finished;
+- a wrong proxy-trust setting silently voids rate limiting;
+- publication must fail closed when required evidence is absent;
+- a backup nobody has restored is not a backup;
+- work split between subagents must be sized by the input, not by file count.
+
+Say why, with `--scope-reason`. It is recorded on the lesson and is what a later reader uses
+to decide whether the classification still holds.
+
+**Automatic command corrections stay `project`.** `git sttaus` → `git status` is a keystroke
+fact about one environment. Auto-capture is not authorised to produce global knowledge; that
+is what keeps a shared store from filling with one machine's typing habits.
+
+Got it wrong? `my_error.py scope <ERR-id> <project|global> --reason "..."` moves it in place,
+preserving id, dates, `use_count` and provenance, and records the change. See the `scope`
+skill.

@@ -22,8 +22,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "0.3.3"
-SCHEMA_VERSION = 3
+VERSION = "0.4.0"
+SCHEMA_VERSION = 4
 MAX_TEXT = 4000
 AUTO_GUARD_TTL_DAYS = 90
 RECOVERY_WINDOW_MINUTES = 15
@@ -225,9 +225,33 @@ def redact(text: Any) -> str:
 
 
 def canonical_root(event: dict[str, Any] | None = None) -> str:
-    root = os.getenv("CLAUDE_PROJECT_DIR")
-    if not root and event:
+    """Where the work is actually happening, preferred over where the session started.
+
+    The order used to be `CLAUDE_PROJECT_DIR` first, and that was a real defect
+    rather than a cosmetic one. Claude Code sets that variable to the directory
+    the session was launched from and never changes it, while the hook payload
+    carries `cwd`, the *effective* working directory of the tool call. Measured
+    on 2026-09-02 with a live trace: with a session started at `/home/w-jr` and a
+    Bash tool operating inside `/home/w-jr/PoolBet`, the env var read
+    `/home/w-jr` and `event["cwd"]` read `/home/w-jr/PoolBet`.
+
+    Preferring the env var therefore filed every failure in every repository
+    under the home directory into one namespace named "home". Three separate
+    projects shared one lesson store by accident, which happens to look like
+    cross-project transfer and is not: it is the absence of separation. The
+    moment a session is started inside one of those repositories the namespace
+    changes and the lessons stop being recalled -- the failure mode arrives
+    exactly when someone starts working project by project.
+
+    Evidence first, then the session's opinion, then the process. Each fallback
+    is weaker than the one before it, and `project_kind` records which of them
+    answered so the uncertainty is visible instead of implied.
+    """
+    root = None
+    if event:
         root = event.get("cwd")
+    if not root:
+        root = os.getenv("CLAUDE_PROJECT_DIR")
     root = root or os.getcwd()
     try:
         return str(Path(root).resolve())
@@ -268,6 +292,34 @@ def git_common_dir(root: str) -> str | None:
 def project_identity(root: str) -> str:
     """Prefer the repository over the directory; fall back to the path outside Git."""
     return git_common_dir(root) or root
+
+
+# What kind of thing the identity actually names. Recorded rather than inferred
+# at read time, because "this is a repository" and "this is whatever directory
+# the session happened to open in" are different amounts of confidence and the
+# difference must not be invisible.
+KIND_GIT = "git"
+KIND_WORKSPACE = "workspace"
+KIND_DIRECTORY = "directory"
+
+
+def project_kind(root: str) -> str:
+    """`git` when the path resolves to a repository, else `workspace` or `directory`.
+
+    A path outside Git that is the user's home is not a project and must not be
+    presented as one -- it is the container several projects happen to sit in,
+    and calling it a project is precisely the mistake that merged three of them.
+    `workspace` says "identity could not be determined from evidence" out loud
+    instead of quietly inventing certainty.
+    """
+    if git_common_dir(root):
+        return KIND_GIT
+    try:
+        if Path(root).resolve() == Path.home().resolve():
+            return KIND_WORKSPACE
+    except Exception:
+        pass
+    return KIND_DIRECTORY
 
 
 def project_id(root: str) -> str:
@@ -583,6 +635,52 @@ def _add_origin_columns(db: sqlite3.Connection) -> None:
             db.execute(f"ALTER TABLE {table} ADD COLUMN origin TEXT NOT NULL DEFAULT 'natural_usage'")
 
 
+SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS lesson_scope_changes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lesson_id INTEGER NOT NULL,
+  old_scope TEXT NOT NULL,
+  new_scope TEXT NOT NULL,
+  changed_at TEXT NOT NULL,
+  reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_scope_changes_lesson ON lesson_scope_changes(lesson_id);
+CREATE TABLE IF NOT EXISTS recall_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lesson_id INTEGER NOT NULL,
+  lesson_scope TEXT NOT NULL,
+  origin_project_id TEXT,
+  consuming_project_id TEXT NOT NULL,
+  cross_project INTEGER NOT NULL,
+  recalled_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recall_events_lesson ON recall_events(lesson_id);
+CREATE INDEX IF NOT EXISTS idx_recall_events_at ON recall_events(recalled_at);
+"""
+
+
+def _add_v4_columns(db: sqlite3.Connection) -> None:
+    """`projects.kind` and the lesson provenance columns.
+
+    Same non-idempotent ALTER problem as `_add_origin_columns`, handled the
+    same way: read PRAGMA first rather than catching "duplicate column name",
+    so a rolled-back `user_version` can re-enter this without failing.
+    """
+    cols = {row[1] for row in db.execute("PRAGMA table_info(projects)")}
+    if "kind" not in cols:
+        db.execute("ALTER TABLE projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'directory'")
+    cols = {row[1] for row in db.execute("PRAGMA table_info(lessons)")}
+    # Provenance is deliberately separate from scope. `scope` says where a
+    # lesson may be *used*; `origin_project_id` says where it was *learned*,
+    # and promoting a lesson to global must never erase that. "We learned this
+    # in Fidren and it saved us in Livara" is the sentence this column exists
+    # to make answerable.
+    if "origin_project_id" not in cols:
+        db.execute("ALTER TABLE lessons ADD COLUMN origin_project_id TEXT")
+    if "scope_reason" not in cols:
+        db.execute("ALTER TABLE lessons ADD COLUMN scope_reason TEXT")
+
+
 def migrate(db: sqlite3.Connection, current: int) -> None:
     """Forward-only migrations. Each step is idempotent and independently retried."""
     if current < 2:
@@ -612,6 +710,18 @@ def migrate(db: sqlite3.Connection, current: int) -> None:
             "INSERT OR REPLACE INTO meta(key,value) VALUES('origin_migration_backfilled_at',?)",
             (backfilled_at,)), db)
         with_retry(lambda: db.execute("PRAGMA user_version=3"), db)
+        with_retry(db.commit, db)
+    if current < 4:
+        with_retry(lambda: db.executescript(SCHEMA_V4), db)
+        with_retry(lambda: _add_v4_columns(db), db)
+        # Backfill provenance from scope for rows that predate the column: a
+        # project-scoped lesson was, by construction, learned in that project.
+        # A global one from before this release has no recoverable origin, and
+        # is left NULL rather than attributed to a guess.
+        with_retry(lambda: db.execute(
+            "UPDATE lessons SET origin_project_id=project_id "
+            "WHERE origin_project_id IS NULL AND project_id IS NOT NULL"), db)
+        with_retry(lambda: db.execute("PRAGMA user_version=4"), db)
         with_retry(db.commit, db)
 
 
@@ -678,9 +788,9 @@ def ensure_project(db: sqlite3.Connection, root: str) -> str:
 
     def write():
         db.execute(
-            "INSERT INTO projects(id,root,created_at,last_seen) VALUES(?,?,?,?) "
-            "ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen",
-            (pid, root, now, now),
+            "INSERT INTO projects(id,root,created_at,last_seen,kind) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen, kind=excluded.kind",
+            (pid, root, now, now, project_kind(root)),
         )
         db.commit()
     with_retry(write, db)
@@ -923,6 +1033,23 @@ def recall(db: sqlite3.Connection, pid: str, query: str, limit: int = 5) -> list
     if chosen:
         now = utcnow()
         db.executemany("UPDATE lessons SET use_count=use_count+1,last_used=? WHERE id=?", [(now, r["id"]) for r in chosen])
+        # One row per recall, carrying where the lesson was learned and where it
+        # was just used. `use_count` alone cannot answer the question this
+        # plugin is actually for -- "how often did something we paid for in one
+        # project save us in another" -- because it collapses every use into a
+        # single number with no idea of place.
+        #
+        # `cross_project` is recorded, never inferred later: it is true when a
+        # lesson born in one project is recalled in a different one, which stops
+        # being computable the moment a project row is renamed or removed.
+        # And it is deliberately *recalled*, not *useful*: this counts what was
+        # put in front of the agent, and nothing here claims it helped.
+        db.executemany(
+            "INSERT INTO recall_events(lesson_id,lesson_scope,origin_project_id,consuming_project_id,cross_project,recalled_at) "
+            "VALUES(?,?,?,?,?,?)",
+            [(r["id"], r["scope"], r["origin_project_id"], pid,
+              1 if (r["origin_project_id"] and r["origin_project_id"] != pid) else 0, now)
+             for r in chosen])
         db.commit()
     return chosen
 
@@ -1398,10 +1525,14 @@ def cmd_learn(args: argparse.Namespace) -> int:
     else:
         origin = event_origin()
     cur = db.execute("""
-      INSERT INTO lessons(project_id,scope,created_at,updated_at,title,cause,rule_text,confidence,status,source,source_candidate_id,tags,origin)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+      INSERT INTO lessons(project_id,scope,created_at,updated_at,title,cause,rule_text,confidence,status,source,source_candidate_id,tags,origin,origin_project_id,scope_reason)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (None if scope == "global" else pid, scope, now, now, args.title, args.cause, args.rule, conf,
-          "active", "manual-verified", source_candidate, args.tags or "", origin))
+          "active", "manual-verified", source_candidate, args.tags or "", origin,
+          # Provenance is recorded for both scopes. A global lesson still has a
+          # birthplace, and losing it would make "learned in Fidren, used in
+          # Livara" unanswerable -- which is the whole point of the split.
+          pid, args.scope_reason or None))
     lid = int(cur.lastrowid)
     if source_candidate:
         db.execute("UPDATE candidates SET status='learned',lesson_id=? WHERE id=?", (lid, source_candidate))
@@ -1419,9 +1550,74 @@ def cmd_learn(args: argparse.Namespace) -> int:
         """, (lid, None if scope == "global" else pid, args.guard_tool, args.guard_field, args.guard_match,
               args.guard_pattern, args.replacement, args.guard_reason or args.rule, now, expires, origin))
     db.commit()
-    print(f"Learned ERR-{lid:04d} confidence={conf:.2f} scope={scope}" + (" with guard" if args.guard_tool else ""))
+    print(f"Learned ERR-{lid:04d} confidence={conf:.2f} scope={scope.upper()}" + (" with guard" if args.guard_tool else ""))
+    if args.scope_reason:
+        print(f"Scope reason: {args.scope_reason}")
     return 0
 
+
+
+def cmd_scope(args: argparse.Namespace) -> int:
+    """Move a lesson between `project` and `global`, in place and on the record.
+
+    The alternatives are both lossy and both were rejected. A direct `UPDATE`
+    on the database leaves no trace that the reach of a rule was widened, which
+    for a store whose whole value is trust is the wrong kind of silent. `forget`
+    plus a fresh `learn` supersedes the old row and mints a new id, so the
+    lesson loses its identity, its creation date, its accumulated `use_count`
+    and its link to the candidate that produced it -- the evidence that it has
+    been earning its place.
+
+    So this changes exactly two columns, `scope` and the `project_id` that
+    follows from it, and writes a row in `lesson_scope_changes`. Everything
+    else -- id, title, cause, rule, confidence, source, origin, provenance,
+    created_at, use_count -- is untouched by construction, and the tests assert
+    that.
+
+    `origin_project_id` in particular survives promotion. A rule learned in one
+    repository and made global is still a rule learned in that repository.
+    """
+    db = connect()
+    root = canonical_root()
+    pid = ensure_project(db, root)
+    new_scope = args.new_scope
+    lid = parse_id(args.lesson_id)
+    if lid is None:
+        print(f"Not a lesson id: {args.lesson_id}", file=sys.stderr)
+        return 2
+    row = db.execute("SELECT * FROM lessons WHERE id=?", (lid,)).fetchone()
+    if not row:
+        print(f"ERR-{lid:04d} not found", file=sys.stderr)
+        return 2
+    old_scope = row["scope"]
+    if old_scope == new_scope:
+        print(f"ERR-{lid:04d} is already {new_scope.upper()} - nothing changed")
+        return 0
+
+    # Promotion needs no project; demotion needs one to belong to. Prefer the
+    # place it was learned, so demoting a global lesson returns it to its origin
+    # rather than to whichever project happened to run the command.
+    target_pid = None if new_scope == "global" else (row["origin_project_id"] or pid)
+    now = utcnow()
+    with_retry(lambda: db.execute(
+        "UPDATE lessons SET scope=?, project_id=?, updated_at=?, scope_reason=COALESCE(?,scope_reason) WHERE id=?",
+        (new_scope, target_pid, now, args.reason or None, lid)), db)
+    with_retry(lambda: db.execute(
+        "INSERT INTO lesson_scope_changes(lesson_id,old_scope,new_scope,changed_at,reason) VALUES(?,?,?,?,?)",
+        (lid, old_scope, new_scope, now, args.reason or None)), db)
+    # Guards follow their lesson: a guard left pinned to one project while its
+    # lesson went global would enforce in one place and advise in every other.
+    with_retry(lambda: db.execute(
+        "UPDATE guards SET project_id=? WHERE lesson_id=?", (target_pid, lid)), db)
+    with_retry(db.commit, db)
+    print(f"ERR-{lid:04d}: {old_scope.upper()} -> {new_scope.upper()}")
+    if args.reason:
+        print(f"Reason: {args.reason}")
+    origin = row["origin_project_id"]
+    if origin:
+        orow = db.execute("SELECT root FROM projects WHERE id=?", (origin,)).fetchone()
+        print(f"Origin preserved: {orow['root'] if orow else origin}")
+    return 0
 
 
 def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
@@ -1451,6 +1647,35 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
     guards = one(
         "SELECT COUNT(*) FROM guards g JOIN lessons l ON l.id=g.lesson_id "
         "WHERE g.active=1 AND l.status='active' AND (g.project_id IS NULL OR g.project_id=?)", (pid,))
+
+    # --- knowledge transfer -------------------------------------------------
+    # Deliberately computed and reported apart from every guard number below.
+    # The SHADOW experiment asks one narrow question -- does a deterministic
+    # guard stop a repeated tool action -- and its 30-day verdict judges that
+    # guard and nothing else. These counts answer a different question that no
+    # exit code can: did knowledge paid for in one project come back in
+    # another. Mixing them would let a verdict about the guard read as a
+    # verdict about the plugin.
+    global_lessons = one("SELECT COUNT(*) FROM lessons WHERE status='active' AND scope='global'")
+    project_lessons = one(
+        "SELECT COUNT(*) FROM lessons WHERE status='active' AND scope='project' AND project_id=?", (pid,))
+    lessons_used = one(
+        "SELECT COUNT(*) FROM lessons WHERE status='active' AND use_count>0 AND (scope='global' OR project_id=?)", (pid,))
+    rc = lambda where, a=(): one(f"SELECT COUNT(*) FROM recall_events WHERE 1=1 {where}", a)  # noqa: E731
+    global_recalled = rc("AND lesson_scope='global'")
+    project_recalled = rc("AND lesson_scope='project'")
+    # The headline number for the transfer thesis: a lesson recalled somewhere
+    # other than where it was learned.
+    cross_project_recalls = rc("AND cross_project=1")
+    transfer_pairs = [
+        {"origin": r[0], "consumer": r[1], "recalls": r[2]}
+        for r in db.execute(
+            "SELECT COALESCE(o.root, re.origin_project_id), COALESCE(c.root, re.consuming_project_id), COUNT(*) "
+            "FROM recall_events re "
+            "LEFT JOIN projects o ON o.id=re.origin_project_id "
+            "LEFT JOIN projects c ON c.id=re.consuming_project_id "
+            "WHERE re.cross_project=1 GROUP BY 1,2 ORDER BY 3 DESC LIMIT 10")
+    ]
 
     ev = lambda where, a=(): one(  # noqa: E731
         f"SELECT COUNT(*) FROM guard_events WHERE project_id=? {where}", (pid,) + a)
@@ -1502,6 +1727,18 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
         "controlled_confirmed": controlled_confirmed,
         "controlled_refuted": controlled_refuted,
         "controlled_pending": controlled_pending,
+        # --- knowledge transfer: independent of the SHADOW experiment --------
+        # Reported apart from every guard number above, because the 30-day
+        # verdict judges the deterministic guard and nothing else. Mixing the
+        # two would let a verdict about the guard read as a verdict about the
+        # plugin.
+        "global_lessons_active": global_lessons,
+        "project_lessons_active": project_lessons,
+        "lessons_used": lessons_used,
+        "global_lessons_recalled": global_recalled,
+        "project_lessons_recalled": project_recalled,
+        "cross_project_recalls": cross_project_recalls,
+        "transfer_pairs": transfer_pairs,
     }
 
 
@@ -1755,7 +1992,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     L.append(f"    would-block (SHADOW): {m['would_block_shadow']}")
     L.append(f"    actual blocks:        {m['actual_blocks_enforce']}")
     L.append("")
-    L.append("Shadow experiment")
+    L.append("Knowledge transfer (measured separately from the SHADOW experiment)")
+    L.append(f"  global lessons active:   {m['global_lessons_active']}")
+    L.append(f"  project lessons active:  {m['project_lessons_active']} (this project)")
+    L.append(f"  lessons ever recalled:   {m['lessons_used']}")
+    L.append(f"  recalls, global:         {m['global_lessons_recalled']}")
+    L.append(f"  recalls, project:        {m['project_lessons_recalled']}")
+    L.append(f"  CROSS-PROJECT recalls:   {m['cross_project_recalls']}")
+    if m["transfer_pairs"]:
+        L.append("  learned in -> used in:")
+        for pair in m["transfer_pairs"]:
+            L.append(f"    {pair['origin']} -> {pair['consumer']}  x{pair['recalls']}")
+    else:
+        L.append("  learned in -> used in:    nothing recorded yet")
+    L.append("  'recalled' means placed in front of the agent. It is not a claim that it helped.")
+    L.append("")
+    L.append("Shadow experiment (judges the auto-guard only, not the plugin)")
     L.append("")
     L.append("Natural usage:")
     L.append(f"  would_block: {m['natural_would_block']}")
@@ -1784,7 +2036,17 @@ def build_parser() -> argparse.ArgumentParser:
     l = sub.add_parser("learn")
     l.add_argument("--candidate-id", type=int)
     l.add_argument("--title", required=True); l.add_argument("--cause", required=True); l.add_argument("--rule", required=True)
-    l.add_argument("--confidence", default="high"); l.add_argument("--scope", choices=["project","global"], default="project"); l.add_argument("--tags", default="")
+    l.add_argument("--confidence", default="high")
+    # No default. A silent `project` default is how a rule that belongs
+    # everywhere ends up reachable from one repository, discovered months later
+    # -- which is exactly what happened to ERR-0012. Classifying reach is part
+    # of writing the lesson, not an afterthought the CLI can guess.
+    l.add_argument("--scope", choices=["project","global"], required=True,
+                   help="REQUIRED. `global` when the failure mechanism generalises beyond this "
+                        "repository; `project` when the rule depends on this repo's paths, "
+                        "scripts, services or internal APIs.")
+    l.add_argument("--scope-reason", default="", help="Why that scope. Recorded with the lesson.")
+    l.add_argument("--tags", default="")
     l.add_argument("--guard-tool", choices=["Bash","Write","Edit"]); l.add_argument("--guard-field")
     l.add_argument("--guard-match", choices=["exact","contains","regex"], default="exact"); l.add_argument("--guard-pattern")
     l.add_argument("--replacement"); l.add_argument("--guard-reason"); l.add_argument("--guard-ttl-days", type=int, default=0)
@@ -1795,6 +2057,11 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status"); s.set_defaults(func=cmd_status)
     r = sub.add_parser("review"); r.add_argument("--limit", type=int, default=20); r.set_defaults(func=cmd_review)
     f = sub.add_parser("forget"); f.add_argument("lesson_id"); f.set_defaults(func=cmd_forget)
+    sc = sub.add_parser("scope", help="Move a lesson between project and global, auditably.")
+    sc.add_argument("lesson_id", help="ERR-0012 or 12")
+    sc.add_argument("new_scope", choices=["project","global"])
+    sc.add_argument("--reason", default="", help="Why the reach changed. Recorded in the audit trail.")
+    sc.set_defaults(func=cmd_scope)
     i = sub.add_parser("ignore"); i.add_argument("candidate_id"); i.set_defaults(func=cmd_ignore)
     d = sub.add_parser("doctor"); d.add_argument("--json", action="store_true"); d.set_defaults(func=cmd_doctor)
     dd = sub.add_parser("datadir"); dd.add_argument("--compact", action="store_true"); dd.set_defaults(func=cmd_datadir)

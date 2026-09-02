@@ -12,7 +12,7 @@ verifiable. That path is the *cheapest* source of evidence, not the definition o
 A logic defect, a wrong assumption, a badly sized task or an unsafe judgment produces no
 failing command and is recorded deliberately, through the same verification bar.
 
-> ### ⚠️ EXPERIMENTAL — v0.3.3
+> ### ⚠️ EXPERIMENTAL — v0.4.0
 >
 > Ships in **SHADOW mode**: the guard records what it *would* have blocked and **blocks
 > nothing**. The automatic guard is on a 30-day probation while its real base rate is
