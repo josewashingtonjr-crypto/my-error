@@ -12,7 +12,7 @@ verifiable. That path is the *cheapest* source of evidence, not the definition o
 A logic defect, a wrong assumption, a badly sized task or an unsafe judgment produces no
 failing command and is recorded deliberately, through the same verification bar.
 
-> ### ⚠️ EXPERIMENTAL — v0.4.2
+> ### ⚠️ EXPERIMENTAL — v0.4.3
 >
 > Ships in **SHADOW mode**: the guard records what it *would* have blocked and **blocks
 > nothing**. The automatic guard is on a 30-day probation while its real base rate is
@@ -157,7 +157,7 @@ the plugin is healthy.
 cross-project recalls:
 
 ```
-▊ sua barra atual  │  🧠 ME ✅ 0.4.2 · SHADOW · L8 · X2
+▊ sua barra atual  │  🧠 ME ✅ 0.4.3 · SHADOW · L8 · X2
 ```
 
 Claude Code runs exactly one `statusLine` command, so if you already have a bar this
@@ -182,7 +182,16 @@ Both report degradation honestly — `DB INDISPONÍVEL`, `HOOKS INATIVOS`, `MÉT
 prints the settings snippets rather than editing your `settings.json` for you.
 
 After restarting, `~/.claude/watchdogs/.my-error-statusline.json` records that the *live*
-bar ran the code. Running the script in a shell proves only that the shell can.
+bar ran the code. Running the script in a shell proves only that the shell can. Nothing
+automated may write that file — it is evidence, and a test that writes it destroys the
+answer; tests redirect it with `MY_ERROR_STATUSLINE_TRACE`.
+
+> **The bar only exists where the client invokes `statusLine`.** Terminal Claude Code does;
+> the Electron / `--output-format stream-json` harness does not invoke it at all, so no bar
+> appears there — neither this segment nor your own. **That is a client surface limitation,
+> not a plugin fault, and it does not mean `my-error` is inactive**: the hooks, the
+> watchdog and `/my-error:doctor` are unaffected. See
+> [docs/STATUSLINE.md](docs/STATUSLINE.md).
 
 ## Documentation
 
@@ -192,6 +201,7 @@ bar ran the code. Running the script in a shell proves only that the shell can.
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Hooks, pipeline, storage, watchdog, CLI |
 | [docs/METRICS.md](docs/METRICS.md) | Exact meaning of every counter — read before quoting one |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Real failure modes and how to diagnose them |
+| [docs/STATUSLINE.md](docs/STATUSLINE.md) | Which clients render the status bar, and why absence is not inactivity |
 | [docs/TEST_REPORT.md](docs/TEST_REPORT.md) | Benchmark results and their limits |
 | [CHANGELOG.md](CHANGELOG.md) | What changed and why |
 

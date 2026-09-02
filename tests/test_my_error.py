@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -524,19 +525,69 @@ class MyErrorTest(unittest.TestCase):
         self.assertIsNone(self.hook("guard", pre))
 
     def test_concurrent_duplicate_failure_capture_is_atomic(self):
+        """Every racing hook must be counted, including the ones that arrive
+        while the schema is still being built.
+
+        This used to fail intermittently (7 of 8, 6 of 8). The counter was never
+        the problem -- `occurrences=occurrences+1` runs in SQLite and is atomic.
+        The loss was upstream, in `connect()`: each process read the schema
+        state without holding a write lock, all of them concluded the migration
+        was still pending, and the losers of the resulting
+        `ALTER TABLE ... ADD COLUMN` race raised "duplicate column name", which
+        is not a lock error and so was re-raised past `with_retry` and swallowed
+        by the exit-0 catch-all in `main()`. A fresh data directory is therefore
+        essential to this test: a warm database never reproduced it.
+        """
         from concurrent.futures import ThreadPoolExecutor
+        n = 8
         event = {"session_id":"parallel","cwd":str(self.project),"tool_name":"Bash","tool_input":{"command":"npm run buil"},"error":"Exit code 1\nMissing script: buil","is_interrupt":False}
         def one(_):
             p = self.run_cli("hook", "failure", event=event)
             return p.returncode, p.stderr
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            results = list(ex.map(one, range(8)))
+        # Every worker must be able to start at once; a pool narrower than the
+        # task count serialises the very collision under test.
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            results = list(ex.map(one, range(n)))
         self.assertTrue(all(code == 0 for code, _ in results), results)
         db = sqlite3.connect(self.data / "my-error.db")
         row = db.execute("select count(*), max(occurrences) from candidates").fetchone()
+        # Exit 0 is not proof of capture -- that combination is exactly what made
+        # this bug invisible -- so the swallow counter is part of the assertion.
+        dropped = db.execute("select value from meta where key='dropped_events'").fetchone()
         db.close()
         self.assertEqual(row[0], 1)
-        self.assertEqual(row[1], 8)
+        self.assertEqual(row[1], n)
+        self.assertIsNone(dropped, f"hooks silently swallowed events: {dropped}")
+
+    def test_concurrent_cold_start_across_the_shared_paths(self):
+        """New failure, duplicate failure and recovery, all racing a cold store.
+
+        They share `candidates`, `meta` and the same write lock, so a lock or
+        transaction defect in one is a defect in all three.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        jobs = []
+        for i in range(4):
+            jobs.append(("failure", {"session_id":f"n{i}","cwd":str(self.project),"tool_name":"Bash",
+                                     "tool_input":{"command":f"cat nope{i}.txt"},
+                                     "error":f"cat: nope{i}.txt: No such file or directory","is_interrupt":False}))
+        dup = {"session_id":"d","cwd":str(self.project),"tool_name":"Bash",
+               "tool_input":{"command":"npm run buil"},"error":"Exit code 1\nMissing script: buil","is_interrupt":False}
+        jobs += [("failure", dup)] * 4
+        for i in range(4):
+            jobs.append(("success", {"session_id":f"r{i}","cwd":str(self.project),"tool_name":"Bash",
+                                     "tool_input":{"command":f"cat ok{i}.txt"}}))
+        with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+            codes = list(ex.map(lambda j: self.run_cli("hook", j[0], event=j[1]).returncode, jobs))
+        self.assertTrue(all(c == 0 for c in codes), codes)
+        db = sqlite3.connect(self.data / "my-error.db")
+        distinct = db.execute("select count(*) from candidates where bad_action like 'cat nope%'").fetchone()[0]
+        dup_occ = db.execute("select occurrences from candidates where bad_action='npm run buil'").fetchone()[0]
+        dropped = db.execute("select value from meta where key='dropped_events'").fetchone()
+        db.close()
+        self.assertEqual(distinct, 4)
+        self.assertEqual(dup_occ, 4)
+        self.assertIsNone(dropped)
 
     def test_v11_node_entrypoint_pytest_and_module_typos_auto_learn(self):
         pairs = [
@@ -1071,18 +1122,37 @@ class ObservabilityWrapperTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.data = Path(self.tmp.name) / "data"
         self.data.mkdir()
+        self.artifacts = Path(self.tmp.name) / "artifacts"
+        self.artifacts.mkdir()
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_statusline(self, stdin="{}", script=None, **env_extra):
+    def isolated_env(self, **env_extra):
+        """Environment for anything that may write an observability artifact.
+
+        No automated run may touch the real installation's files. The invocation
+        beacon is the sharp case: it is the only evidence that the *live* status
+        bar ran this code, so a test that overwrites it destroys the signal it
+        exists to provide, and does so invisibly. `MY_ERROR_STATUSLINE_TRACE`
+        and `MY_ERROR_HEALTH_CACHE` redirect both artifacts into this test's
+        temporary directory; the ambient `HOME` is deliberately left alone so
+        these tests keep reading the real installation, which is what they are
+        about.
+        """
         env = os.environ.copy()
+        env["MY_ERROR_STATUSLINE_TRACE"] = str(self.artifacts / ".my-error-statusline.json")
+        env["MY_ERROR_HEALTH_CACHE"] = str(self.artifacts / ".my-error-health.json")
         env.update({k: v for k, v in env_extra.items() if v is not None})
         for k, v in env_extra.items():
             if v is None:
                 env.pop(k, None)
+        return env
+
+    def run_statusline(self, stdin="{}", script=None, **env_extra):
         p = subprocess.run(["node", str(script or self.STATUSLINE)],
-                           input=stdin, capture_output=True, text=True, env=env, timeout=30)
+                           input=stdin, capture_output=True, text=True,
+                           env=self.isolated_env(**env_extra), timeout=30)
         return p
 
     # --- units -------------------------------------------------------------
@@ -1209,6 +1279,8 @@ class ObservabilityWrapperTest(unittest.TestCase):
         env = os.environ.copy()
         env["HOME"] = str(home)
         env.pop("MY_ERROR_STATUSLINE_WRAP", None)
+        # This test is about the *default* location, so the override must be off.
+        env.pop("MY_ERROR_STATUSLINE_TRACE", None)
         subprocess.run(["node", str(self.STATUSLINE)], input='{"session_id":"prova","cwd":"/tmp"}',
                        capture_output=True, text=True, env=env, timeout=30)
         trace = home / ".claude" / "watchdogs" / ".my-error-statusline.json"
@@ -1217,6 +1289,72 @@ class ObservabilityWrapperTest(unittest.TestCase):
         self.assertEqual(rec["session_id"], "prova")
         self.assertIn("segment", rec)
         self.assertIn("ms", rec)
+
+    def test_tests_never_touch_the_installations_invocation_beacon(self):
+        """The beacon is evidence, and a test that writes it is not a test.
+
+        `~/.claude/watchdogs/.my-error-statusline.json` is the only artifact
+        that distinguishes a status bar which really executed this code from one
+        which never did. An automated run that writes it manufactures the
+        evidence and destroys the answer, silently and permanently -- and the
+        old module-level constant made that the default behaviour.
+
+        Three steps, deliberately: plant a sentinel where a real installation
+        keeps its beacon, drive the entire status line routine under the test
+        environment, then prove the sentinel is byte-identical. No part of this
+        touches the real HOME.
+        """
+        installed_home = Path(self.tmp.name) / "installed-home"
+        beacon = installed_home / ".claude" / "watchdogs" / ".my-error-statusline.json"
+        beacon.parent.mkdir(parents=True)
+        sentinel = json.dumps({"at": "2020-01-01T00:00:00Z", "segment": "SENTINELA",
+                               "pid": 1, "line": "prova de execução real"})
+        beacon.write_text(sentinel)
+        # Age it past the write throttle. A freshly written beacon is skipped by
+        # the rate limiter, which would make this test pass for the wrong reason
+        # -- it must be a beacon the routine *would* rewrite if it could.
+        old_time = time.time() - 3600
+        os.utime(beacon, (old_time, old_time))
+        before = (sentinel, beacon.stat().st_mtime_ns)
+
+        # The full routine, several times, through every branch a test drives:
+        # bar present, bar broken, payload malformed, data dir absent.
+        for kwargs in ({"MY_ERROR_STATUSLINE_WRAP": None},
+                       {"MY_ERROR_STATUSLINE_WRAP": "printf 'BARRA'"},
+                       {"MY_ERROR_STATUSLINE_WRAP": "exit 7"},
+                       {"MY_ERROR_STATUSLINE_WRAP": "printf 'B'",
+                        "MY_ERROR_DATA_DIR": str(self.data / "inexistente")}):
+            env = self.isolated_env(**kwargs)
+            # HOME points at the sentinel installation: if the trace path were
+            # still resolved from HOME alone, every one of these would overwrite
+            # it. Only the explicit override keeps it intact.
+            env["HOME"] = str(installed_home)
+            p = subprocess.run(["node", str(self.STATUSLINE)], input='{"session_id":"t"}',
+                               capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stderr)
+
+        self.assertEqual((beacon.read_text(), beacon.stat().st_mtime_ns), before,
+                         "uma execução de teste sobrescreveu o probe da instalação")
+        # And the redirected copy really was written, so the assertion above is
+        # proof of isolation and not proof that tracing quietly stopped working.
+        redirected = self.artifacts / ".my-error-statusline.json"
+        self.assertTrue(redirected.exists(), "o trace não foi escrito em lugar nenhum")
+        self.assertEqual(json.loads(redirected.read_text())["session_id"], "t")
+
+    def test_watchdog_probe_never_touches_the_installations_health_cache(self):
+        """Same rule, the other artifact: `--probe` writes a shared health cache."""
+        installed_home = Path(self.tmp.name) / "wd-home"
+        cache = installed_home / ".claude" / "watchdogs" / ".my-error-health.json"
+        cache.parent.mkdir(parents=True)
+        cache.write_text('{"stamp":"SENTINELA"}')
+        before = (cache.read_text(), cache.stat().st_mtime_ns)
+        env = self.isolated_env()
+        env["HOME"] = str(installed_home)
+        p = subprocess.run(["node", str(self.WATCHDOG_DIR / "my-error-watchdog.cjs"), "--probe"],
+                           input='{"session_id":"probe","cwd":"/tmp"}',
+                           capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual((cache.read_text(), cache.stat().st_mtime_ns), before)
 
     def _fake_install(self, lessons=8, cross=2, db_ahead=False):
         """A data directory shaped like a real one, so the segment can be driven
@@ -1269,7 +1407,7 @@ class ObservabilityWrapperTest(unittest.TestCase):
         """--probe is what the installer tells people to run; it must exist."""
         p = subprocess.run(["node", str(self.WATCHDOG_DIR / "my-error-watchdog.cjs"), "--probe"],
                            input='{"session_id":"probe","cwd":"/tmp"}',
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, env=self.isolated_env(), timeout=30)
         self.assertEqual(p.returncode, 0, p.stderr)
         out = json.loads(p.stdout)
         self.assertIn("health", out)

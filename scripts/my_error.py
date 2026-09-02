@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 SCHEMA_VERSION = 4
 MAX_TEXT = 4000
 AUTO_GUARD_TTL_DAYS = 90
@@ -509,8 +509,8 @@ def with_retry(fn, db: sqlite3.Connection | None = None, attempts: int = 8):
 
 
 def connect() -> sqlite3.Connection:
+    """Open the store, bringing the schema to SCHEMA_VERSION first if needed."""
     db_path = data_dir() / "my-error.db"
-    is_new = not db_path.exists()
     # Several hooks can fire concurrently (parallel tool calls, subagents). A short
     # busy timeout silently drops captures under I/O contention, so keep it generous:
     # a hook that waits is invisible, a hook that loses a lesson is not.
@@ -526,11 +526,123 @@ def connect() -> sqlite3.Connection:
         with_retry(lambda: db.execute("PRAGMA journal_mode=WAL"), db)
     db.execute("PRAGMA synchronous=NORMAL")
     db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-    current = int(db.execute("PRAGMA user_version").fetchone()[0])
-    if current < 1:
-        # Every statement here is idempotent, so a racing creator is harmless; the
-        # retry only absorbs the write lock that concurrent first-run hooks contend for.
-        with_retry(lambda: db.executescript("""
+    ensure_schema(db_path)
+    # Only write when it actually changes. An unconditional write here dirties the
+    # database on every invocation, including read-only ones, which destroys the
+    # watchdog's ability to tell a real mutation from a routine open.
+    row = db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    if row is None or str(row[0]) != str(SCHEMA_VERSION):
+        with_retry(lambda: db.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),)), db)
+        with_retry(db.commit, db)
+    return db
+
+
+def ensure_schema(db_path: Path) -> None:
+    """Bring the file to SCHEMA_VERSION under a cross-process write lock.
+
+    This is the fix for a silent capture-loss bug (0.4.3). The old code read
+    `PRAGMA user_version` -- and, inside each migration step, `PRAGMA
+    table_info` -- while holding no write lock, then acted on what it had read.
+    Two hooks starting at the same instant both observed the *pre-migration*
+    schema, both decided the column was missing, and both issued
+    `ALTER TABLE ... ADD COLUMN`. The loser raised
+    `OperationalError('duplicate column name: ...')`, which is not a lock error,
+    so `with_retry` correctly refused to retry it and the catch-all in `main()`
+    swallowed it into exit 0. The hook reported success and the event was gone.
+
+    Check-then-act on schema metadata cannot be made safe by checking harder:
+    the check and the act must happen inside one transaction that no other
+    process can interleave with. `BEGIN IMMEDIATE` takes the write lock up
+    front, so a second upgrader blocks (honouring busy_timeout) and then
+    re-reads `user_version` inside the lock and finds the work already done.
+
+    A dedicated connection is used because the upgrade needs explicit
+    transaction control (`isolation_level = None`), which Python's legacy
+    per-statement transaction handling would otherwise take away.
+    """
+    up = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_MS / 1000.0)
+    try:
+        up.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        # Fast path: the overwhelmingly common case is an already-current file,
+        # and it must not pay for a write lock.
+        if _user_version(up) >= SCHEMA_VERSION:
+            return
+        up.isolation_level = None
+        with_retry(lambda: _schema_upgrade(up), up)
+    finally:
+        up.close()
+
+
+def _user_version(db: sqlite3.Connection) -> int:
+    return int(db.execute("PRAGMA user_version").fetchone()[0])
+
+
+def _schema_upgrade(db: sqlite3.Connection) -> None:
+    """One atomic create-or-migrate, serialised against other processes."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        current = _user_version(db)
+        if current >= SCHEMA_VERSION:
+            db.execute("ROLLBACK")   # another process did it while we queued
+            return
+        if current < 1:
+            _exec_script(db, SCHEMA_V1)
+            db.execute("PRAGMA user_version=1")
+            current = 1
+        migrate(db, current)
+        db.execute("COMMIT")
+    except BaseException:
+        try:
+            db.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+
+
+def _exec_script(db: sqlite3.Connection, script: str) -> None:
+    """Run a multi-statement script *inside* the caller's transaction.
+
+    `Connection.executescript()` must not be used here. It issues an implicit
+    COMMIT before running, and it does so regardless of `isolation_level` --
+    verified directly, not assumed: with an explicit `BEGIN IMMEDIATE` open, a
+    second connection could already see the table the script had just created,
+    and the following ROLLBACK failed with "no transaction is active". Using it
+    inside `_schema_upgrade` would end the transaction that makes the upgrade
+    atomic and reopen the race it exists to close.
+    """
+    stmt = ""
+    for line in script.splitlines(keepends=True):
+        stmt += line
+        if sqlite3.complete_statement(stmt):
+            if stmt.strip():
+                db.execute(stmt)
+            stmt = ""
+    if stmt.strip():
+        db.execute(stmt)
+
+
+def add_column(db: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    """Idempotent ALTER TABLE ADD COLUMN.
+
+    SQLite has no `ADD COLUMN IF NOT EXISTS`, so the existence check is a read
+    of `PRAGMA table_info`. That read is only trustworthy while the caller holds
+    the write lock -- which `_schema_upgrade` does. The tolerated
+    "duplicate column name" is a second line of defence, not the mechanism: if
+    this ever runs unlocked again, a lost race must degrade to a no-op rather
+    than to a swallowed exception and a lost event.
+    """
+    cols = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+    if column in cols:
+        return
+    try:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
+
+
+SCHEMA_V1 = """
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS projects (
           id TEXT PRIMARY KEY, root TEXT NOT NULL, created_at TEXT NOT NULL, last_seen TEXT NOT NULL
@@ -590,20 +702,7 @@ def connect() -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_candidates_project ON candidates(project_id, status, last_seen);
         CREATE INDEX IF NOT EXISTS idx_lessons_project ON lessons(project_id, status);
         CREATE INDEX IF NOT EXISTS idx_guards_project ON guards(project_id, active, tool_name);
-        PRAGMA user_version=1;
-        """), db)
-        with_retry(db.commit, db)
-        current = 1
-    migrate(db, current)
-    # Only write when it actually changes. An unconditional write here dirties the
-    # database on every invocation, including read-only ones, which destroys the
-    # watchdog's ability to tell a real mutation from a routine open.
-    row = db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-    if row is None or str(row[0]) != str(SCHEMA_VERSION):
-        with_retry(lambda: db.execute(
-            "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),)), db)
-        with_retry(db.commit, db)
-    return db
+"""
 
 
 SCHEMA_V2 = """
@@ -629,19 +728,9 @@ ORIGIN_TABLES = ("candidates", "lessons", "guards", "guard_events")
 
 
 def _add_origin_columns(db: sqlite3.Connection) -> None:
-    """ALTER ADD COLUMN, guarded against a column that already exists.
-
-    Unlike the CREATE TABLE IF NOT EXISTS statements elsewhere, ALTER TABLE ADD
-    COLUMN has no idempotent form in SQLite -- re-running it against a table
-    that already has the column raises "duplicate column name". That is a real
-    path, not just theoretical: `user_version` can be rolled back (as the v1
-    migration test deliberately does) without the columns themselves being
-    dropped, so this must tolerate being entered more than once.
-    """
+    """The v3 provenance column, on every table that carries provenance."""
     for table in ORIGIN_TABLES:
-        cols = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
-        if "origin" not in cols:
-            db.execute(f"ALTER TABLE {table} ADD COLUMN origin TEXT NOT NULL DEFAULT 'natural_usage'")
+        add_column(db, table, "origin", "TEXT NOT NULL DEFAULT 'natural_usage'")
 
 
 SCHEMA_V4 = """
@@ -669,35 +758,30 @@ CREATE INDEX IF NOT EXISTS idx_recall_events_at ON recall_events(recalled_at);
 
 
 def _add_v4_columns(db: sqlite3.Connection) -> None:
-    """`projects.kind` and the lesson provenance columns.
-
-    Same non-idempotent ALTER problem as `_add_origin_columns`, handled the
-    same way: read PRAGMA first rather than catching "duplicate column name",
-    so a rolled-back `user_version` can re-enter this without failing.
-    """
-    cols = {row[1] for row in db.execute("PRAGMA table_info(projects)")}
-    if "kind" not in cols:
-        db.execute("ALTER TABLE projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'directory'")
-    cols = {row[1] for row in db.execute("PRAGMA table_info(lessons)")}
+    """`projects.kind` and the lesson provenance columns."""
+    add_column(db, "projects", "kind", "TEXT NOT NULL DEFAULT 'directory'")
     # Provenance is deliberately separate from scope. `scope` says where a
     # lesson may be *used*; `origin_project_id` says where it was *learned*,
     # and promoting a lesson to global must never erase that. "We learned this
     # in Fidren and it saved us in Livara" is the sentence this column exists
     # to make answerable.
-    if "origin_project_id" not in cols:
-        db.execute("ALTER TABLE lessons ADD COLUMN origin_project_id TEXT")
-    if "scope_reason" not in cols:
-        db.execute("ALTER TABLE lessons ADD COLUMN scope_reason TEXT")
+    add_column(db, "lessons", "origin_project_id", "TEXT")
+    add_column(db, "lessons", "scope_reason", "TEXT")
 
 
 def migrate(db: sqlite3.Connection, current: int) -> None:
-    """Forward-only migrations. Each step is idempotent and independently retried."""
+    """Forward-only migrations.
+
+    Called only from `_schema_upgrade`, which already holds the write lock and
+    owns the surrounding transaction. Nothing here may commit or retry: a
+    commit would end that transaction early and reopen the very race this
+    exists to close, and a retry inside a held lock cannot help.
+    """
     if current < 2:
-        with_retry(lambda: db.executescript(SCHEMA_V2), db)
-        with_retry(lambda: db.execute("PRAGMA user_version=2"), db)
-        with_retry(db.commit, db)
+        _exec_script(db, SCHEMA_V2)
+        db.execute("PRAGMA user_version=2")
     if current < 3:
-        with_retry(lambda: _add_origin_columns(db), db)
+        _add_origin_columns(db)
         # Explicit, auditable backfill -- not a counter reset. Every row that
         # existed before this plugin tracked origin was produced while
         # developing and testing my-error itself, never by unprompted agent
@@ -706,32 +790,21 @@ def migrate(db: sqlite3.Connection, current: int) -> None:
         # those rows (they are never deleted) while starting the natural
         # population at a true, auditable zero. The timestamp in `meta` is the
         # audit trail: exactly when this reclassification happened and why.
-        backfilled_at = utcnow()
-        with_retry(lambda: db.execute(
-            "UPDATE candidates SET origin=? WHERE origin=?", (ORIGIN_CONTROLLED, ORIGIN_NATURAL)), db)
-        with_retry(lambda: db.execute(
-            "UPDATE lessons SET origin=? WHERE origin=?", (ORIGIN_CONTROLLED, ORIGIN_NATURAL)), db)
-        with_retry(lambda: db.execute(
-            "UPDATE guards SET origin=? WHERE origin=?", (ORIGIN_CONTROLLED, ORIGIN_NATURAL)), db)
-        with_retry(lambda: db.execute(
-            "UPDATE guard_events SET origin=? WHERE origin=?", (ORIGIN_CONTROLLED, ORIGIN_NATURAL)), db)
-        with_retry(lambda: db.execute(
-            "INSERT OR REPLACE INTO meta(key,value) VALUES('origin_migration_backfilled_at',?)",
-            (backfilled_at,)), db)
-        with_retry(lambda: db.execute("PRAGMA user_version=3"), db)
-        with_retry(db.commit, db)
+        for table in ORIGIN_TABLES:
+            db.execute(f"UPDATE {table} SET origin=? WHERE origin=?", (ORIGIN_CONTROLLED, ORIGIN_NATURAL))
+        db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('origin_migration_backfilled_at',?)",
+                   (utcnow(),))
+        db.execute("PRAGMA user_version=3")
     if current < 4:
-        with_retry(lambda: db.executescript(SCHEMA_V4), db)
-        with_retry(lambda: _add_v4_columns(db), db)
+        _exec_script(db, SCHEMA_V4)
+        _add_v4_columns(db)
         # Backfill provenance from scope for rows that predate the column: a
         # project-scoped lesson was, by construction, learned in that project.
         # A global one from before this release has no recoverable origin, and
         # is left NULL rather than attributed to a guess.
-        with_retry(lambda: db.execute(
-            "UPDATE lessons SET origin_project_id=project_id "
-            "WHERE origin_project_id IS NULL AND project_id IS NOT NULL"), db)
-        with_retry(lambda: db.execute("PRAGMA user_version=4"), db)
-        with_retry(db.commit, db)
+        db.execute("UPDATE lessons SET origin_project_id=project_id "
+                   "WHERE origin_project_id IS NULL AND project_id IS NOT NULL")
+        db.execute("PRAGMA user_version=4")
 
 
 def experiment_started(db: sqlite3.Connection, create: bool = False) -> str | None:
@@ -1933,7 +2006,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "families_supported": sorted(AUTO_ELIGIBLE),
             "shadow_verdict": shadow_verdict(m)[0], "shadow_verdict_reason": shadow_verdict(m)[1],
             "verdict_dataset": "NATURAL USAGE ONLY",
-            "origin_migration_backfilled_at": origin_backfilled_at, **m,
+            "origin_migration_backfilled_at": origin_backfilled_at,
+            "dropped_events": dropped_events(db)[0], "dropped_events_last": dropped_events(db)[1],
+            "capture_reliability_fix": CAPTURE_FIX_NOTE, **m,
         }, indent=2, ensure_ascii=False))
         return 0
 
@@ -1966,6 +2041,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         L.append(f"  session:          {beacon.get('session_id') or '(none)'}")
     else:
         L.append("  ABSENT - no hook of this plugin has run yet")
+    L.append("")
+    dropped, dropped_last = dropped_events(db)
+    L.append(f"Dropped events:     {dropped}"
+             + ("" if not dropped else "  <-- hook failures swallowed at the boundary"))
+    if dropped_last:
+        L.append(f"  last:             {dropped_last}")
+    L.append(f"Statusline surface: {statusline_surface()}")
     L.append("")
     L.append(f"Database:           {db_path.resolve()}")
     L.append(f"Database readable:  {'yes' if os.access(db_path, os.R_OK) else 'NO'}")
@@ -2079,6 +2161,77 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+# Stamped into `doctor --json` so any later analysis of the SHADOW dataset can
+# see exactly where the capture path stopped losing events. Data before this
+# point is NOT reset and NOT reclassified: the losses were silent, so which
+# historical events went missing is unknowable and is stated as unknowable.
+CAPTURE_FIX_NOTE = "capture reliability fix introduced in version 0.4.3 on 2026-09-02T00:00:00Z"
+
+
+def dropped_events(db: sqlite3.Connection) -> tuple[int, str | None]:
+    """How many hook events the boundary catch-all swallowed, and the last one."""
+    try:
+        n = db.execute("SELECT value FROM meta WHERE key='dropped_events'").fetchone()
+        last = db.execute("SELECT value FROM meta WHERE key='dropped_events_last'").fetchone()
+    except sqlite3.Error:
+        return 0, None
+    return (int(n[0]) if n else 0), (str(last[0]) if last else None)
+
+
+def statusline_surface() -> str:
+    """What can honestly be said about the status line, and nothing more.
+
+    Claude Code in a terminal runs `settings.statusLine`; the Electron /
+    stream-json client in use here does not invoke it at all. There is no
+    reliable way for this process to interrogate the client, so no detection is
+    invented: the three answers below are read off artifacts that either exist
+    or do not. In particular, "configured but never observed" is reported as
+    exactly that, because a status line that has simply not been drawn yet and
+    a client that never calls it are indistinguishable from here.
+    """
+    trace = Path.home() / ".claude" / "watchdogs" / ".my-error-statusline.json"
+    try:
+        settings = json.loads((Path.home() / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return "unknown (settings.json unreadable)"
+    if not settings.get("statusLine"):
+        return "not configured in settings.json"
+    if trace.exists():
+        try:
+            rec = json.loads(trace.read_text(encoding="utf-8"))
+            return f"active - last rendered {rec.get('at')}"
+        except Exception:  # noqa: BLE001
+            return "configured; invocation beacon unreadable"
+    return ("configured, never observed running - unavailable in current client, "
+            "or simply not drawn yet (see docs/STATUSLINE.md)")
+
+
+def record_dropped_event(kind: str, exc: BaseException) -> None:
+    """Leave a trace of an event the hook boundary swallowed.
+
+    Best effort by construction: the most likely reason a hook failed is that
+    the database was unreachable, and this must never raise on top of the
+    failure it is reporting. stderr always gets the reason; the counter is
+    written when it can be.
+    """
+    print(f"my-error hook error ({kind}): {exc!r}", file=sys.stderr)
+    try:
+        db = sqlite3.connect(data_dir() / "my-error.db", timeout=1.0)
+        try:
+            db.execute("PRAGMA busy_timeout=1000")
+            db.execute("INSERT INTO meta(key,value) VALUES('dropped_events','0') "
+                       "ON CONFLICT(key) DO NOTHING")
+            db.execute("UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) "
+                       "WHERE key='dropped_events'")
+            db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('dropped_events_last',?)",
+                       (f"{utcnow()} {kind}: {type(exc).__name__}: {str(exc)[:200]}",))
+            db.commit()
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001 - reporting a failure must not fail
+        pass
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -2089,8 +2242,14 @@ def main() -> int:
         try:
             return int(cmd_hook(args))
         except Exception as exc:  # noqa: BLE001 - deliberate catch-all at the boundary
-            if os.getenv("MY_ERROR_DEBUG"):
-                print(f"my-error hook error: {exc!r}", file=sys.stderr)
+            # Exit 0 stays: a learning plugin must never break a session. What
+            # changes in 0.4.3 is that the swallow is no longer *silent*. This
+            # catch is what turned a schema race into invisible data loss --
+            # hooks reported success while their events vanished, and nothing
+            # anywhere recorded that it had happened. A count that `doctor`
+            # reports is the difference between a known gap and a clean-looking
+            # dataset that is quietly wrong.
+            record_dropped_event(args.kind, exc)
             return 0
     return int(args.func(args))
 

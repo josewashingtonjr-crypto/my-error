@@ -35,8 +35,22 @@ const { spawnSync } = require('child_process');
 
 const HOME = os.homedir();
 const CLAUDE = path.join(HOME, '.claude');
-const CACHE = path.join(CLAUDE, 'watchdogs', '.my-error-health.json');
 const CACHE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Where the shared health cache lives. Resolved per call and overridable, for
+ * the same reason as the status line's invocation beacon: an automated run must
+ * never be able to touch the real installation's observability artifacts. A
+ * module-level constant makes that impossible to arrange from the outside,
+ * because the path is fixed before any caller can redirect it.
+ *
+ *   MY_ERROR_HEALTH_CACHE  absolute path to use instead of the default.
+ */
+function cachePath() {
+  const override = process.env.MY_ERROR_HEALTH_CACHE;
+  if (override && override.trim()) return override.trim();
+  return path.join(CLAUDE, 'watchdogs', '.my-error-health.json');
+}
 const PROBE_TIMEOUT_MS = 2500;
 
 const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } };
@@ -103,7 +117,7 @@ function structuralHealth(opts) {
   const settingsPath = path.join(CLAUDE, 'settings.json');
   const stamp = `${mtime(installedPath)}:${mtime(settingsPath)}`;
 
-  const cached = readJson(CACHE);
+  const cached = readJson(cachePath());
   const cacheFresh = cached && cached.stamp === stamp && Date.now() - cached.at < CACHE_TTL_MS;
   // The override is applied on the way out of every path, cache hit included:
   // a cache written by a process that did not have MY_ERROR_DATA_DIR set would
@@ -162,8 +176,9 @@ function structuralHealth(opts) {
   // hand a throwaway directory to the real status line for the next five minutes.
   if (writeCache && allowSpawn && !process.env.MY_ERROR_DATA_DIR) {
     try {
-      fs.mkdirSync(path.dirname(CACHE), { recursive: true });
-      fs.writeFileSync(CACHE, JSON.stringify({ stamp, at: Date.now(), health }));
+      const target = cachePath();
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, JSON.stringify({ stamp, at: Date.now(), health }));
     } catch { /* cache is an optimisation, never a requirement */ }
   }
   return health;
@@ -204,7 +219,7 @@ function liveState(health, sessionId) {
 }
 
 module.exports = {
-  CACHE, CACHE_TTL_MS, PROBE_TIMEOUT_MS,
+  cachePath, CACHE_TTL_MS, PROBE_TIMEOUT_MS,
   readJson, mtime, resolveDataDir, fallbackDataDir, applyDataDirOverride,
   structuralHealth, liveState,
 };

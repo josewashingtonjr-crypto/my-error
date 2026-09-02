@@ -202,14 +202,19 @@ MY_ERROR=$(ls -d ~/.claude/plugins/cache/*/my-error/*/scripts/my_error.py | tail
 |---|---|
 | `MY_ERROR_DATA_DIR` | Override the storage directory. Used by the test suite. |
 | `MY_ERROR_MODE` | Override the stored mode for one invocation. |
-| `MY_ERROR_DEBUG` | Print errors that hooks otherwise swallow. |
+| `MY_ERROR_DEBUG` | Legacy: swallowed hook errors go to stderr unconditionally since 0.4.3. |
+| `MY_ERROR_STATUSLINE_TRACE` | Where the status line writes its invocation beacon. Tests and benchmarks MUST set it. |
+| `MY_ERROR_HEALTH_CACHE` | Where the shared health cache lives. Tests and benchmarks MUST set it. |
 | `MY_ERROR_WRAP_COMMAND` | Watchdog only: an existing hook command to run and merge. |
 
 ## Failure containment
 
 A hook must never break the session it observes. Any internal error — locked database,
 read-only directory, malformed event — is swallowed: no output, exit 0, the tool call
-proceeds untouched. `MY_ERROR_DEBUG=1` surfaces them for diagnosis.
+proceeds untouched. Since 0.4.3 the swallow is never silent: the reason goes to stderr and
+the occurrence is counted in `meta.dropped_events`, which `/my-error:doctor` reports. That
+counter exists because a silent swallow is what turned a schema-upgrade race into invisible
+capture loss -- hooks reported success while their events disappeared.
 
 ## Schema
 

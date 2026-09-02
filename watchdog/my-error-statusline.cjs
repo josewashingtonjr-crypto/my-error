@@ -46,6 +46,11 @@
  *                             Receives the same stdin. Optional: with no value
  *                             this prints the my-error segment alone.
  *   MY_ERROR_DATA_DIR         overrides the canonical data directory.
+ *   MY_ERROR_STATUSLINE_TRACE where to write the invocation beacon. Tests and
+ *                             benchmarks MUST set this (or a temporary HOME):
+ *                             writing the real installation's beacon from an
+ *                             automated run destroys the only evidence that the
+ *                             live status bar ran this code.
  */
 'use strict';
 
@@ -61,8 +66,26 @@ const SEPARATOR = '  │  ';
 // Measured: the bar wrapped here runs in ~60 ms, with one 3 s outlier in 300
 // samples taken under load.
 const WRAP_TIMEOUT_MS = 5000;
-const TRACE = path.join(os.homedir(), '.claude', 'watchdogs', '.my-error-statusline.json');
 const TRACE_INTERVAL_MS = 5000;
+
+/**
+ * Where the invocation beacon is written.
+ *
+ * Resolved per call, never frozen at module load, and honouring an explicit
+ * override. This is a correctness requirement, not a convenience: the beacon is
+ * the *only* evidence that the live status bar — as opposed to a shell or a
+ * test — executed this code, so any automated run that writes to the real
+ * installation's copy destroys the very signal it exists to provide. A module
+ * -level constant made that unavoidable, because a test cannot redirect a path
+ * that was already computed before it could set anything.
+ *
+ *   MY_ERROR_STATUSLINE_TRACE  absolute path to use instead of the default.
+ */
+function tracePath() {
+  const override = process.env.MY_ERROR_STATUSLINE_TRACE;
+  if (override && override.trim()) return override.trim();
+  return path.join(os.homedir(), '.claude', 'watchdogs', '.my-error-statusline.json');
+}
 
 /** The shared reader. Its absence is a real failure state, not a crash: the
  *  installer copies three files and someone may have copied one. */
@@ -168,13 +191,14 @@ function wrapped(stdin) {
 
 /** The live-instance beacon. Throttled, best-effort, never load-bearing. */
 function trace(record) {
+  const target = tracePath();
   try {
-    const prev = fs.statSync(TRACE).mtimeMs;
+    const prev = fs.statSync(target).mtimeMs;
     if (Date.now() - prev < TRACE_INTERVAL_MS) return;
   } catch { /* first run */ }
   try {
-    fs.mkdirSync(path.dirname(TRACE), { recursive: true });
-    fs.writeFileSync(TRACE, JSON.stringify(record));
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, JSON.stringify(record));
   } catch { /* evidence is nice to have, never required */ }
 }
 
@@ -232,7 +256,7 @@ function main() {
 // Exported so the tests and the benchmark can exercise the segment without
 // paying for a process per sample — measuring `node` startup would tell us
 // about node, not about this file.
-module.exports = { segment, wrapped, SEPARATOR, TRACE };
+module.exports = { segment, wrapped, trace, tracePath, SEPARATOR };
 
 if (require.main === module) {
   try {

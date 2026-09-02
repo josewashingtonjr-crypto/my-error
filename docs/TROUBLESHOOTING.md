@@ -118,7 +118,11 @@ missing on 0.3.1 or later, that is a bug worth reporting — include the output 
 MY_ERROR_DEBUG=1 python3 "$MY_ERROR" hook failure < /tmp/your-event.json
 ```
 
-`MY_ERROR_DEBUG=1` surfaces errors that hooks otherwise swallow. They are swallowed by
+Since 0.4.3 a swallowed hook error always goes to stderr and is counted: `/my-error:doctor`
+reports `Dropped events` with the last reason, so a capture that vanished is visible without
+having to reproduce it. `MY_ERROR_DEBUG` is no longer needed for that.
+
+Errors that hooks swallow are swallowed by
 design: a learning plugin must never be able to break the session it observes.
 
 ## Starting over

@@ -1,5 +1,102 @@
 # Changelog
 
+## 0.4.3 — captures stop disappearing during the schema upgrade
+
+A concurrency test failed intermittently with `7 != 8`: eight hooks fired at the same
+instant, all eight exited 0, and only seven events were in the database. For a plugin whose
+entire value is a faithful record of what went wrong, an event that vanishes while the hook
+reports success is the worst possible defect — it does not just lose data, it makes the
+remaining data look complete.
+
+**The counter was never the problem.** `occurrences=occurrences+1` runs inside SQLite and is
+atomic; there is no `SELECT` into Python, no `INSERT OR REPLACE`, no read-modify-write on
+the count. Proven, not assumed: with the schema already at the current version, 160
+concurrent events across 20 rounds lost exactly zero. The losses were all upstream, and only
+ever on a database that was still being created or migrated.
+
+**The real mechanism is check-then-act on schema metadata, across processes.** `connect()`
+read `PRAGMA user_version` — and, inside each migration step, `PRAGMA table_info` — while
+holding no write lock, then acted on what it had read. Several hooks starting together all
+observed the pre-migration schema, all concluded the column was missing, and all issued
+`ALTER TABLE ... ADD COLUMN`. SQLite has no `ADD COLUMN IF NOT EXISTS`, so the losers raised
+`OperationalError('duplicate column name: origin')`. That is not a lock error, so `with_retry`
+correctly declined to retry it; it propagated to the catch-all in `main()`, which exists so a
+learning plugin can never break a session, and was swallowed into exit 0. Every observed loss
+matched an error one-for-one: `origin`, `scope_reason`, `kind`, `origin_project_id`.
+
+`busy_timeout` was being honoured throughout and was never implicated: no `SQLITE_BUSY`
+reached the boundary. Checking harder would not have helped either — the check and the act
+have to be inside one transaction no other process can interleave with.
+
+Measured on identical stress runs, 2,130 events across 8, 16 and 32 concurrent processes:
+
+| | expected | recorded | lost |
+|---|---|---|---|
+| before | 2130 | 2086 | **44** |
+| after | 2130 | 2130 | **0** |
+
+### Fixed
+
+- **The schema upgrade is now one atomic, cross-process-serialised transaction.**
+  `ensure_schema()` keeps a lock-free fast path for the common case (already current), and
+  otherwise runs the whole create-or-migrate under `BEGIN IMMEDIATE` on a dedicated
+  connection: the write lock is taken *before* `user_version` is read, so a second upgrader
+  blocks on `busy_timeout`, then re-reads inside the lock and finds the work already done.
+  Table creation, every `ALTER`, every backfill and `user_version` itself now commit or roll
+  back together.
+- **`executescript()` is no longer used inside that transaction.** It issues an implicit
+  `COMMIT` before it runs, and it does so regardless of `isolation_level` — verified directly:
+  with an explicit `BEGIN IMMEDIATE` open, a second connection could already see the new
+  table, and the following `ROLLBACK` failed with "no transaction is active". Using it here
+  would have quietly reopened the race. `_exec_script()` replaces it.
+- **`ALTER TABLE ADD COLUMN` degrades to a no-op instead of an exception.** The write lock is
+  the mechanism; tolerating `duplicate column name` in `add_column()` is the second line of
+  defence, so that if this ever runs unlocked again the result is a harmless repeat rather
+  than a swallowed exception and a lost event.
+- **Tests can no longer overwrite the real installation's observability artifacts.** The
+  status line's invocation beacon path was frozen at module load from `os.homedir()`, so
+  every automated run wrote `~/.claude/watchdogs/.my-error-statusline.json` — the one file
+  that distinguishes a status bar which really executed this code from one that never did.
+  Writing it from a test manufactures the evidence and destroys the answer. Both that path
+  and the shared health cache are now resolved per call and overridable
+  (`MY_ERROR_STATUSLINE_TRACE`, `MY_ERROR_HEALTH_CACHE`), the test harness sets both, and
+  `test_tests_never_touch_the_installations_invocation_beacon` plants a sentinel, drives the
+  whole routine, and proves the sentinel is byte-identical. The sentinel is aged past the
+  write throttle first, so the test cannot pass for the wrong reason.
+
+### Added
+
+- **`Dropped events` in `/my-error:doctor`.** The boundary catch-all still returns 0 — a
+  learning plugin must never break a session — but it is no longer *silent*. Hook failures
+  are counted in `meta` with the last reason, and reported. A silent swallow is what turned
+  this bug into invisible data loss; a visible counter is the difference between a known gap
+  and a dataset that merely looks clean. The concurrency regressions now assert this counter
+  is untouched, because exit 0 is not proof of capture.
+- **`Statusline surface:` in `/my-error:doctor`**, and **`docs/STATUSLINE.md`**. Terminal
+  Claude Code invokes `settings.statusLine`; the Electron / `--output-format stream-json`
+  harness does not invoke it at all, so no bar appears there — neither this segment nor the
+  user's own. That is a client surface limitation, **not a plugin bug**, and the absence of
+  the bar does not mean my-error is inactive: hooks, watchdog and `doctor` are unaffected.
+  The doctor line is read off artifacts that exist or do not; where a client that never calls
+  `statusLine` is genuinely indistinguishable from a bar not yet drawn, it says so instead of
+  guessing.
+- **`capture_reliability_fix`** in `doctor --json`, naming the version and timestamp of this
+  fix, so any later analysis of the SHADOW dataset can see where the capture path became
+  reliable.
+
+### The SHADOW experiment is untouched
+
+Duration, threshold, `shadow_verdict`, the natural/controlled split, guards, families,
+heuristics and recall ranking are all unchanged. This is an infrastructure fix. **No existing
+data was reset or reclassified.**
+
+**Which historical events were lost is unknowable, and is stated as unknowable.** The losses
+were silent by construction: the hook exited 0 and wrote nothing, so there is no record of an
+event that failed to be recorded. What can be bounded is *where* they could occur — only
+while a database was being created or upgraded, never on a warm one — which in practice means
+the first concurrent hooks after an install or a schema-bumping upgrade. The counter added in
+this release makes any future occurrence visible from the moment it happens.
+
 ## 0.4.2 — the status bar tells you it is alive
 
 `systemMessage` turned out not to be a persistent surface in this build of Claude Code: the
