@@ -622,6 +622,29 @@ class MyErrorTest(unittest.TestCase):
         out = self.hook("prompt", event)
         self.assertIn("Use decimal", out["hookSpecificOutput"]["additionalContext"])
 
+    def test_doctor_reports_runtime_version_drift(self):
+        """A fresh CLI run proves nothing about a long-lived client that resolved
+        the plugin path at startup (ERR-0016). Where no status bar renders, this
+        doctor line is the only place that drift is visible, so it is asserted."""
+        self.hook("failure", {"session_id":"drift","cwd":str(self.project),"tool_name":"Bash",
+                              "tool_input":{"command":"cat nope.txt"},
+                              "error":"cat: nope.txt: No such file or directory","is_interrupt":False})
+        beacon = self.data / "runtime.json"
+        rec = json.loads(beacon.read_text())
+        self.assertEqual(rec["version"], me_version())
+        d = json.loads(self.run_cli("doctor", "--json").stdout)
+        self.assertEqual(d["runtime_version"], me_version())
+        self.assertTrue(d["runtime_matches_installed"])
+        self.assertIn("matches this code", self.run_cli("doctor").stdout)
+
+        rec["version"] = "0.0.1-antiga"
+        beacon.write_text(json.dumps(rec))
+        d = json.loads(self.run_cli("doctor", "--json").stdout)
+        self.assertFalse(d["runtime_matches_installed"])
+        out = self.run_cli("doctor").stdout
+        self.assertIn("DRIFT", out)
+        self.assertIn("0.0.1-antiga", out)
+
     def test_doctor_and_status(self):
         d = self.run_cli("doctor", "--json"); s = self.run_cli("status")
         self.assertEqual(d.returncode, 0, d.stderr); self.assertEqual(s.returncode, 0, s.stderr)

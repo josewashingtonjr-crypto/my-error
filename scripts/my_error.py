@@ -2005,6 +2005,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "locale_recognized": loc_ok, "fallback_active": not loc_ok, "hooks_declared": hooks, "beacon": beacon,
             "families_supported": sorted(AUTO_ELIGIBLE),
             "shadow_verdict": shadow_verdict(m)[0], "shadow_verdict_reason": shadow_verdict(m)[1],
+            "runtime_version": (beacon or {}).get("version"),
+            "runtime_matches_installed": (
+                (beacon or {}).get("version") == VERSION if beacon and beacon.get("version") else None),
             "verdict_dataset": "NATURAL USAGE ONLY",
             "origin_migration_backfilled_at": origin_backfilled_at,
             "dropped_events": dropped_events(db)[0], "dropped_events_last": dropped_events(db)[1],
@@ -2039,6 +2042,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if beacon:
         L.append(f"  last hook:        {beacon.get('last_hook')} at {beacon.get('last_seen')}")
         L.append(f"  session:          {beacon.get('session_id') or '(none)'}")
+        # The version the *live* instance declares, which is not necessarily the
+        # one on disk. A fresh CLI run proves nothing about a client that
+        # resolved the plugin path at startup (ERR-0016), so the comparison is
+        # printed rather than assumed. In a client that renders the status bar
+        # this also shows there as an `inst <version>` marker; where it does not,
+        # this line is the only place the drift is visible.
+        runtime_version = beacon.get("version")
+        L.append(f"  runtime version:  {runtime_version or '(unknown)'}")
+        L.append(f"  plugin root:      {beacon.get('plugin_root') or '(unknown)'}")
+        if runtime_version and runtime_version != VERSION:
+            L.append(f"  DRIFT:            live runtime is {runtime_version}, this code is {VERSION}")
+            L.append("                    the running client still holds the old plugin path - restart it")
+        elif runtime_version:
+            L.append("                    matches this code - the live instance is running it")
     else:
         L.append("  ABSENT - no hook of this plugin has run yet")
     L.append("")

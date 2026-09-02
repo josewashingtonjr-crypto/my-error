@@ -80,6 +80,11 @@ Measured on identical stress runs, 2,130 events across 8, 16 and 32 concurrent p
   The doctor line is read off artifacts that exist or do not; where a client that never calls
   `statusLine` is genuinely indistinguishable from a bar not yet drawn, it says so instead of
   guessing.
+- **Runtime drift in `/my-error:doctor`.** The beacon's `runtime version` and `plugin root`
+  are printed next to the version of the code being read, with an explicit `DRIFT:` line when
+  they disagree. A long-lived client resolves the plugin path at startup, so a fresh CLI run
+  proves nothing about it (ERR-0016); where no status bar renders, this is the only surface
+  that shows the live instance is still on the old code.
 - **`capture_reliability_fix`** in `doctor --json`, naming the version and timestamp of this
   fix, so any later analysis of the SHADOW dataset can see where the capture path became
   reliable.
