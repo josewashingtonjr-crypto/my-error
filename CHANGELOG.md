@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.3.3 — an error is a verified mistake, not a non-zero exit code
+
+A doctrine fix. The plugin's own workflow skill defined its scope as "**only** verified
+operational failures — a command or tool action that failed", and routed everything else to
+the host's project memory on the grounds that design lessons are not falsifiable. That was
+wrong, and wrong in the expensive direction: it excluded exactly the logic, architecture and
+judgment mistakes worth remembering longest. Many of them *are* falsifiable — "a `.catch()`
+around a query inside one Postgres transaction does not prevent the abort" is checkable in
+thirty seconds — they simply never produce an exit code.
+
+Because that text is loaded into context whenever the skill is used, the written doctrine
+beat every session-level instruction to the contrary. A lesson recorded by hand outside the
+command path depended on an agent noticing that `--candidate-id` happens to be optional.
+
+### Changed
+
+- **Learning boundary rewritten** (`skills/workflow/SKILL.md`). A lesson may come from a
+  failed command, a logic defect, a design error, a false assumption, bad task sizing, an
+  unsafe judgment, a repeated inefficiency, or inexperience. Four admission criteria replace
+  the exit-code test: something went wrong or would reproducibly go wrong; the mechanism is
+  understood; the rule is falsifiable; remembering it prevents recurrence. Preferences,
+  hunches, unverified speculation and bare project state are rejected as before.
+- **Memory boundary redrawn by kind of claim**, not by how the mistake was found: my-error
+  keeps the reusable prevention rule, project memory keeps what happened. Both may reference
+  one incident from their own side; neither copies the other. A worked example is included.
+- **`skills/learn`** documents the no-candidate path as first class instead of leaving it as
+  an undocumented property of the CLI.
+- **README** no longer opens by defining the plugin as the failed-command pair.
+
+### Added
+
+- **Reflection prompt at `Stop`.** Once per session, when no candidate carries recovery
+  evidence, my-error asks whether anything went wrong for a reason that was *not* a failed
+  command. Capture fires on exit codes, so the class of mistake this plugin most wants has
+  no trigger at all; this is that trigger. It only asks — it never creates a lesson, the
+  quality gate still decides, and a session that was already sent to `learn` for a candidate
+  does not also get asked.
+- Five tests, including two verified failing against the previous code.
+
+### Unchanged
+
+The SHADOW experiment is untouched: `SHADOW_EXPERIMENT_DAYS`, `SHADOW_PROMOTE_THRESHOLD`,
+the pre-committed decision rule, `AUTO_LESSON_SOURCES` and the automatic guard path are all
+exactly as frozen on 2026-08-18. This release changes what a human-reviewed lesson may be
+about; it changes nothing the experiment measures.
+
 ## 0.3.2 — separate controlled_test from natural_usage (methodology fix)
 
 A methodology correction, not a feature. The 6 `predictions_confirmed` on record so far were

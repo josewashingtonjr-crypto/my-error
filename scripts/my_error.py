@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 SCHEMA_VERSION = 3
 MAX_TEXT = 4000
 AUTO_GUARD_TTL_DAYS = 90
@@ -1296,6 +1296,16 @@ def _dispatch_hook(args: argparse.Namespace) -> tuple[int, sqlite3.Connection, s
                 "Stop",
                 f"[my-error] {ids} now has recovery evidence: a previously failing operation succeeded. Before finishing, invoke the `my-error:learn` skill for these candidates. Promote only if you can state the root cause and why the successful verification proves the correction; otherwise ignore the candidate."
             ))
+            # Burn this session's reflection slot. The agent has already been
+            # sent to `learn`; asking "did anything else go wrong?" in the same
+            # breath would be two prompts competing for the same action, and the
+            # second one trains the reader to skim both.
+            reflection_due(db, session)
+            return 0, db, pid, event
+        # No candidate carries recovery evidence — which is the common case and
+        # says nothing about whether the session contained a mistake. Ask.
+        if reflection_due(db, session):
+            json_out(hook_context("Stop", REFLECTION_PROMPT))
         return 0, db, pid, event
 
     if kind == "cleanup":
@@ -1306,6 +1316,53 @@ def _dispatch_hook(args: argparse.Namespace) -> tuple[int, sqlite3.Connection, s
         return 0, db, pid, event
 
     return 0, db, pid, event
+
+
+# The reflection question, asked once per session at a Stop.
+#
+# It exists because the capture path cannot see the errors that matter most.
+# `PostToolUseFailure` fires on a non-zero exit code, so every candidate in the
+# store is by construction a command that broke. A wrong assumption, a bad
+# decomposition, an unsafe judgment or a logic defect found by reading the code
+# produces no failing tool call at all — nothing fires, nothing is captured, and
+# the class of mistake an experienced engineer would most want remembered is the
+# one class with no trigger. This asks the question that no exit code can.
+#
+# It only asks. Nothing here creates a lesson: the quality gate in the `learn`
+# skill still decides, and "nothing went wrong" is the expected answer most of
+# the time.
+REFLECTION_PROMPT = (
+    "[my-error] Before finishing: did anything go wrong here for a reason that was NOT "
+    "simply a failed command? Wrong assumption, logic or design defect, bad task sizing, "
+    "unsafe judgment, or something an experienced engineer would not repeat. "
+    "If yes and you can state the root cause AND the correction was verified, record it "
+    "with `my_error.py learn` (no --candidate-id needed — a lesson does not require a "
+    "captured failure). If it is a preference, a hunch, or project state with no reusable "
+    "rule, do not record it."
+)
+
+
+def reflection_due(db: sqlite3.Connection, session: str) -> bool:
+    """True once per session, then False for the rest of it.
+
+    Stop fires at the end of every assistant turn, so an unthrottled prompt
+    would repeat all session long and be tuned out — which for an advisory
+    line is the same as not shipping it. One `meta` row holds the last session
+    already asked rather than one row per session, so the throttle cannot grow
+    into a table that needs its own retention rule.
+    """
+    if not session:
+        return False
+    row = db.execute("SELECT value FROM meta WHERE key='reflection_last_session'").fetchone()
+    if row and str(row[0]) == session:
+        return False
+    # Committed here rather than left to the caller: the marker has to survive
+    # even when this runs after the caller already committed its own work, and
+    # an uncommitted throttle is the same as no throttle.
+    with_retry(lambda: db.execute(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES('reflection_last_session',?)", (session,)), db)
+    db.commit()
+    return True
 
 
 def confidence_value(raw: str) -> float:

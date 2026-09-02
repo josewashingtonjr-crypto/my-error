@@ -2,12 +2,17 @@
 
 Persistent, evidence-gated error memory for [Claude Code](https://claude.com/claude-code).
 
-When Claude runs a command that fails and then runs a corrected one that works, `my-error`
-records the pair — but only when the correction is verifiable. It keeps that history in a
-local SQLite database, recalls reviewed lessons on later prompts, and can block an exact
-action that was already proven wrong.
+`my-error` remembers mistakes that were diagnosed and corrected, so they are not made
+twice. It keeps them in a local SQLite database, recalls the relevant ones on later
+prompts, and can block an exact action that was already proven wrong.
 
-> ### ⚠️ EXPERIMENTAL — v0.3.1
+Failed commands are captured automatically: when Claude runs a command that fails and then
+a corrected one that works, the pair is recorded — but only when the correction is
+verifiable. That path is the *cheapest* source of evidence, not the definition of an error.
+A logic defect, a wrong assumption, a badly sized task or an unsafe judgment produces no
+failing command and is recorded deliberately, through the same verification bar.
+
+> ### ⚠️ EXPERIMENTAL — v0.3.3
 >
 > Ships in **SHADOW mode**: the guard records what it *would* have blocked and **blocks
 > nothing**. The automatic guard is on a 30-day probation while its real base rate is
@@ -16,12 +21,15 @@ action that was already proven wrong.
 
 ## The core rule
 
-**A failure is not a lesson. A failure with a diagnosed cause and a verified correction
-can become a lesson.**
+**A failure is not a lesson. A mistake with a diagnosed cause and a verified correction
+can become a lesson — however it was discovered.**
 
 Everything else follows from that. A test that fails and later passes is not proof of
 anything. A network timeout is not a lesson. A command that happened to succeed nearby is
-not the correction for the one that failed.
+not the correction for the one that failed. And a non-zero exit code is evidence that
+something broke, never the boundary of what counts as breaking: the mistakes worth
+remembering longest — the wrong assumption, the design that could not work — leave no exit
+code at all.
 
 ## Install
 

@@ -225,6 +225,92 @@ class MyErrorTest(unittest.TestCase):
         # Review request is one-shot to avoid a stop loop.
         self.assertIsNone(self.hook("stop", stop))
 
+    # ------------------------------------------------------------------
+    # Verified-mistake learning: the error classes no exit code can capture.
+    # ------------------------------------------------------------------
+
+    def test_stop_asks_the_reflection_question_when_no_candidate_has_evidence(self):
+        """Scenario B/C: a session whose mistakes were logic or judgment errors.
+
+        Nothing failed, so nothing was captured, so the candidate path has
+        nothing to offer — which is precisely when the reflection prompt has to
+        fire. Without it the most valuable class of lesson has no trigger at
+        all.
+        """
+        stop = {"session_id": "quiet", "cwd": str(self.project), "hook_event_name": "Stop", "stop_hook_active": False}
+        out = self.hook("stop", stop)
+        self.assertIsNotNone(out)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("NOT", ctx)
+        self.assertIn("failed command", ctx)
+        # Names the manual path, so the escape hatch is not folklore.
+        self.assertIn("--candidate-id", ctx)
+
+    def test_reflection_is_asked_once_per_session_not_every_turn(self):
+        """Stop fires at the end of every turn; an unthrottled prompt is noise."""
+        stop = {"session_id": "once", "cwd": str(self.project), "hook_event_name": "Stop", "stop_hook_active": False}
+        self.assertIsNotNone(self.hook("stop", stop))
+        self.assertIsNone(self.hook("stop", stop))
+        self.assertIsNone(self.hook("stop", stop))
+        # A different session gets its own single ask.
+        other = dict(stop, session_id="another")
+        self.assertIsNotNone(self.hook("stop", other))
+
+    def test_candidate_review_and_reflection_never_both_fire_in_one_session(self):
+        """Two prompts competing for the same action train the reader to skim."""
+        fail = {"session_id": "both", "cwd": str(self.project), "tool_name": "Bash",
+                "tool_input": {"command": "npm test"}, "error": "Exit code 1\nAssertionError", "is_interrupt": False}
+        success = {"session_id": "both", "cwd": str(self.project), "tool_name": "Bash",
+                   "tool_input": {"command": "npm test"}, "tool_response": {"stdout": "all tests passed"}}
+        self.hook("failure", fail)
+        self.hook("success", success)
+        stop = {"session_id": "both", "cwd": str(self.project), "hook_event_name": "Stop", "stop_hook_active": False}
+        first = self.hook("stop", stop)
+        self.assertIn("my-error:learn", first["hookSpecificOutput"]["additionalContext"])
+        self.assertNotIn("NOT simply a failed command", first["hookSpecificOutput"]["additionalContext"])
+        self.assertIsNone(self.hook("stop", stop))
+
+    def test_lesson_without_candidate_is_stored_and_recalled(self):
+        """Scenario B: a verified logic bug where every command exited zero.
+
+        This is the ERR-0011/0013/0014 shape — found by reading code, verified
+        by a regression test, never once producing a failed tool call. It must
+        be a first-class lesson, and it must come back on a later prompt.
+        """
+        p = self.run_cli(
+            "learn",
+            "--title", "catch inside one PG transaction does not degrade",
+            "--cause", "seven reads shared one transaction; a raise aborts it and the catch cannot undo that",
+            "--rule", "move the reads out of the transaction, or use a SAVEPOINT per read",
+            "--confidence", "verified", "--scope", "global", "--tags", "postgres,transaction",
+        )
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("Learned ERR-", p.stdout)
+        self.assertEqual(self.lesson_count(), 1)
+        self.assertEqual(self.candidate_count(), 0, "a manual lesson must not invent a candidate")
+
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            row = db.execute("select source, source_candidate_id, scope from lessons").fetchone()
+        finally:
+            db.close()
+        self.assertEqual(row[0], "manual-verified")
+        self.assertIsNone(row[1], "no candidate means no candidate id, not a fabricated one")
+        self.assertEqual(row[2], "global")
+
+        recalled = self.hook("prompt", {"session_id": "later", "cwd": str(self.project),
+                                        "prompt": "wrap these postgres queries in a transaction"})
+        self.assertIsNotNone(recalled, "a manually recorded lesson must be injectable like any other")
+        self.assertIn("SAVEPOINT", recalled["hookSpecificOutput"]["additionalContext"])
+
+    def test_learn_still_rejects_a_candidate_id_that_does_not_exist(self):
+        """The manual path widens what may be learned, never what may be claimed."""
+        p = self.run_cli("learn", "--candidate-id", "9999", "--title", "t",
+                         "--cause", "c", "--rule", "r", "--confidence", "verified")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("not found", p.stderr)
+        self.assertEqual(self.lesson_count(), 0)
+
     def test_expired_guard_fails_open(self):
         self.train_pair("npm run buil", "Exit code 1\nMissing script: buil", "npm run build")
         db = sqlite3.connect(self.data / "my-error.db")
