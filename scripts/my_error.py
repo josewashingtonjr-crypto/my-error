@@ -22,8 +22,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "0.4.5"
-SCHEMA_VERSION = 5
+VERSION = "0.5.0"
+SCHEMA_VERSION = 6
 MAX_TEXT = 4000
 AUTO_GUARD_TTL_DAYS = 90
 RECOVERY_WINDOW_MINUTES = 15
@@ -81,9 +81,71 @@ SHADOW_PROMOTE_THRESHOLD = 3
 #
 # Nothing is deleted. v1's rows stay queryable; they are excluded from v2's
 # verdict by timestamp, not by removal.
-SHADOW_GENERATION = 2
+SHADOW_GENERATION = 3
 SHADOW_V1_STATUS = "INCONCLUSIVE_DUE_TO_MATERIAL_SYSTEM_CHANGES"
 SHADOW_V2_BASELINE_VERSION = "0.4.4"
+
+# v2 is closed the same way and for a stronger reason: not that the system
+# underneath it changed, but that the *instrument* could not support the claim
+# the verdict would have made. Four defects, each independently sufficient, all
+# found by auditing the rows rather than by waiting for day 30. Closing early
+# is the honest move -- a verdict computed on a defective instrument would be
+# quoted long after the defect was forgotten.
+SHADOW_V2_STATUS = "INCONCLUSIVE_DUE_TO_MEASUREMENT_DEFECTS"
+SHADOW_V2_DEFECTS = (
+    "verdict dataset was filtered by project_id, so the pre-committed rule "
+    "returned a different answer depending on the directory the doctor ran in "
+    "(from /home/w-jr: EXTEND; from /home/w-jr/fidren, where confirmed==0: REMOVE)",
+    "outcome was decided by `command failed` alone, which records correlation "
+    "and calls it confirmation: no check that the failure was caused by the "
+    "guarded pattern",
+    "guards exist whose predicted harm is not representable as an exit code "
+    "(git add -A stages the wrong paths and exits 0), so the scorer could only "
+    "ever refute them, by construction",
+    "at least one recorded confirmation is demonstrably spurious: guard_events "
+    "id=7 matched `pkill -f` appearing inside a quoted lesson body and the "
+    "command then died of an unrelated bash syntax error (exit 127 on `|`)",
+)
+SHADOW_V3_BASELINE_VERSION = "0.4.5"
+
+# --- causal outcome vocabulary ----------------------------------------------
+# v2 had two values and inferred both from one bit (did the command exit
+# non-zero). v3 separates the question "did the predicted harm occur" from the
+# question "can we tell". UNVERIFIED is not a failure of the guard; it is an
+# admission about the instrument, and it is the default precisely so that
+# silence can never be read as success.
+CAUSAL_CONFIRMED = "causally_confirmed"
+CAUSAL_REFUTED = "causally_refuted"
+CAUSAL_UNVERIFIED = "unverified"
+# Stamped on every row that predates the causal model. Deliberately distinct
+# from UNVERIFIED: those rows were not evaluated under this model at all, and
+# relabelling them as if they had been is the retroactive reclassification this
+# release exists to avoid.
+CAUSAL_NOT_EVALUATED = "not_evaluated"
+
+# --- guard evaluation classes -----------------------------------------------
+# Every guard declares which observable decides its prediction. The class is a
+# property of the *harm*, not of the regex, and a guard whose harm this process
+# cannot observe is honestly marked so rather than scored by proxy.
+#
+#   execution_error  the predicted harm IS the command failing, and the failure
+#                    text must implicate the guarded token. A failure that does
+#                    not mention it is UNVERIFIED, never CONFIRMED -- this is
+#                    exactly the defect that produced the spurious event 7.
+#   side_effect      the harm is a state change the command makes while exiting
+#                    0 (wrong paths staged, wrong file overwritten). Requires an
+#                    effect probe; with none available the row is UNVERIFIED and
+#                    the guard is simply not on trial in this experiment.
+#   destructive      the harm is irreversible. Never confirmed by proxy, and
+#                    never provoked to obtain evidence.
+GUARD_CLASS_EXECUTION = "execution_error"
+GUARD_CLASS_SIDE_EFFECT = "side_effect"
+GUARD_CLASS_DESTRUCTIVE = "destructive"
+GUARD_CLASSES = (GUARD_CLASS_EXECUTION, GUARD_CLASS_SIDE_EFFECT, GUARD_CLASS_DESTRUCTIVE)
+# Classes whose harm this process can observe today. Anything outside this set
+# yields UNVERIFIED rows by design; widening it requires writing a real probe,
+# not editing this tuple.
+GUARD_CLASSES_OBSERVABLE = (GUARD_CLASS_EXECUTION,)
 
 # What the verdict does and does not judge. Printed by the doctor verbatim so
 # the scope cannot quietly widen between the code and the report.
@@ -99,6 +161,14 @@ VERDICT_SCOPE_NOTE = (
 # future automatic path must be added here, and the test suite asserts that an
 # auto-created lesson actually carries it.
 AUTO_LESSON_SOURCES = {"auto-verified-recovery"}
+
+# Status for a lesson that was never operational knowledge -- scaffolding left
+# behind by a controlled test. Distinct from `superseded` (which `forget` sets
+# for a lesson that WAS real and turned out wrong) because the two say different
+# things about the store, and collapsing them would hide how much of the
+# historical total was never knowledge at all. The row is kept; only its status
+# and its guards change.
+STATUS_RETIRED_FIXTURE = "retired_fixture"
 
 RECALL_DORMANT_DAYS = 90
 # Technical ceiling only. It is a guard against a pathological table, never the
@@ -794,6 +864,99 @@ def _add_v4_columns(db: sqlite3.Connection) -> None:
     add_column(db, "lessons", "scope_reason", "TEXT")
 
 
+SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS recall_misses (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lesson_id INTEGER NOT NULL,
+  lesson_scope TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  session_id TEXT,
+  phase TEXT NOT NULL,
+  score REAL NOT NULL,
+  rank INTEGER NOT NULL,
+  top_k INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recall_misses_lesson ON recall_misses(lesson_id, created_at);
+CREATE TABLE IF NOT EXISTS missed_recalls (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guard_event_id INTEGER,
+  lesson_id INTEGER NOT NULL,
+  project_id TEXT NOT NULL,
+  session_id TEXT,
+  tool_name TEXT NOT NULL,
+  detected_at TEXT NOT NULL,
+  basis TEXT NOT NULL,
+  experiment TEXT NOT NULL,
+  origin TEXT NOT NULL DEFAULT 'natural_usage'
+);
+CREATE INDEX IF NOT EXISTS idx_missed_recalls_lesson ON missed_recalls(lesson_id, detected_at);
+CREATE INDEX IF NOT EXISTS idx_missed_recalls_experiment ON missed_recalls(experiment, origin);
+CREATE TABLE IF NOT EXISTS lesson_retirements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lesson_id INTEGER NOT NULL,
+  previous_status TEXT NOT NULL,
+  new_status TEXT NOT NULL,
+  retired_at TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  guards_deactivated INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_lesson_retirements_lesson ON lesson_retirements(lesson_id);
+CREATE INDEX IF NOT EXISTS idx_guard_events_experiment ON guard_events(experiment, origin, causal_outcome);
+"""
+
+
+def _add_v6_columns(db: sqlite3.Connection) -> None:
+    """The causal-outcome columns, the guard class, and recall provenance.
+
+    `guard_events.outcome` is deliberately left alone. It holds what the v2
+    instrument recorded, and overwriting it would destroy the only evidence that
+    the defect existed. The causal verdict lives in new columns beside it.
+    """
+    add_column(db, "guard_events", "experiment", "TEXT")
+    add_column(db, "guard_events", "guard_class", "TEXT")
+    add_column(db, "guard_events", "causal_outcome", f"TEXT NOT NULL DEFAULT '{CAUSAL_NOT_EVALUATED}'")
+    add_column(db, "guard_events", "causal_basis", "TEXT")
+    add_column(db, "guard_events", "match_context", "TEXT")
+    # Which observable decides this guard's prediction. Defaulting every existing
+    # guard to execution_error would be a claim, so the column defaults to the
+    # class the auto-learner actually produces and the two known hand-written
+    # guards are classified explicitly in the migration below.
+    add_column(db, "guards", "eval_class", f"TEXT NOT NULL DEFAULT '{GUARD_CLASS_EXECUTION}'")
+    # The observable this guard declares as proof its predicted harm occurred:
+    # a regex over the failure text. NULL means "not declared", which yields
+    # UNVERIFIED rather than a guess -- the whole point of the v3 model.
+    add_column(db, "guards", "confirm_evidence", "TEXT")
+    # Recall provenance rich enough to answer "was it in front of the agent
+    # BEFORE the action, and at what rank". `recall_events` could previously
+    # only say that something was recalled somewhere.
+    add_column(db, "recall_events", "session_id", "TEXT")
+    add_column(db, "recall_events", "rank", "INTEGER")
+    add_column(db, "recall_events", "phase", "TEXT")
+    add_column(db, "recall_events", "top_k", "INTEGER")
+    add_column(db, "recall_events", "pool_size", "INTEGER")
+
+
+def _experiment_for(started_v2: str | None, started_v3: str | None, created_at: str) -> str:
+    """Which generation a row belongs to, from its timestamp alone.
+
+    Derivation, not reclassification: the row's own recorded outcome is never
+    touched. Timestamps are fixed-format UTC ISO-8601, so string comparison is
+    chronological.
+    """
+    if started_v3:
+        if created_at >= started_v3:
+            return "v3"
+        return "v2" if (started_v2 and created_at >= started_v2) else "v1"
+    if started_v2:
+        return "v2" if created_at >= started_v2 else "v1"
+    # No boundary stamped at all. Only SHADOW creates the stamp, so an ENFORCE-only
+    # database has none -- and inferring "v1" there would file rows produced by
+    # this code under a generation that closed before it existed. The running code
+    # IS the current generation; that is the honest default.
+    return f"v{SHADOW_GENERATION}"
+
+
 def migrate(db: sqlite3.Connection, current: int) -> None:
     """Forward-only migrations.
 
@@ -854,6 +1017,61 @@ def migrate(db: sqlite3.Connection, current: int) -> None:
             db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('shadow_v2_baseline_snapshot',?)",
                        (json.dumps(_baseline_snapshot(db, now), ensure_ascii=False, sort_keys=True),))
         db.execute("PRAGMA user_version=5")
+    if current < 6:
+        # Columns first: SCHEMA_V6 creates an index over guard_events.experiment,
+        # which does not exist until _add_v6_columns has run. File order is not
+        # execution order, and the index is the half that fails loudly.
+        _add_v6_columns(db)
+        _exec_script(db, SCHEMA_V6)
+        now = utcnow()
+        v2_started = (db.execute("SELECT value FROM meta WHERE key='shadow_v2_started_at'").fetchone() or [None])[0]
+        # Close v2 on measurement grounds and open v3. As with v1: pure
+        # metadata. Not one guard_event is deleted, rewritten or rescored, and
+        # `outcome` keeps exactly what the v2 instrument recorded.
+        if v2_started:
+            db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('shadow_v2_ended_at',?)", (now,))
+            db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('shadow_v2_status',?)", (SHADOW_V2_STATUS,))
+            db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('shadow_v2_defects',?)",
+                       (json.dumps(list(SHADOW_V2_DEFECTS), ensure_ascii=False),))
+            db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('shadow_v3_started_at',?)", (now,))
+            db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('shadow_v3_baseline_version',?)",
+                       (SHADOW_V3_BASELINE_VERSION,))
+            db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('shadow_v3_baseline_snapshot',?)",
+                       (json.dumps(_baseline_snapshot(db, now), ensure_ascii=False, sort_keys=True),))
+        v3_started = (db.execute("SELECT value FROM meta WHERE key='shadow_v3_started_at'").fetchone() or [None])[0]
+        # Stamp each existing row with the generation its timestamp already
+        # places it in, so the canonical dataset can select by generation
+        # instead of by a timestamp comparison spread across call sites.
+        for row in db.execute("SELECT id,created_at FROM guard_events WHERE experiment IS NULL").fetchall():
+            db.execute("UPDATE guard_events SET experiment=? WHERE id=?",
+                       (_experiment_for(v2_started, v3_started, str(row[1])), row[0]))
+        # The two hand-written guards, classified by the harm they predict.
+        # `pkill -f` kills the invoking shell, which IS an execution failure and
+        # is observable. Broad `git add` stages the wrong paths and exits 0:
+        # its harm is a side effect this process has no probe for, so it is
+        # honestly marked unobservable rather than scored by exit code.
+        db.execute(
+            "UPDATE guards SET eval_class=? WHERE match_type=? AND pattern LIKE '%pkill%'",
+            (GUARD_CLASS_EXECUTION, MATCH_REGEX))
+        db.execute(
+            "UPDATE guards SET eval_class=? WHERE pattern LIKE 'git%add%'",
+            (GUARD_CLASS_SIDE_EFFECT,))
+        # Re-point the lexical guard at the shell-aware matcher. This is the one
+        # substantive behaviour change in this release, and it is why v2 had to
+        # be closed rather than continued: the instrument and the guard both
+        # moved, so their rows cannot share a verdict.
+        db.execute(
+            "UPDATE guards SET match_type=? WHERE match_type=? AND pattern LIKE '%pkill%'",
+            (MATCH_SHELL_CMD, MATCH_REGEX))
+        # The self-kill signature ERR-0039 names explicitly: a shell that matched
+        # its own argv dies by signal, so the wrapper reports 128+SIGTERM (143) or
+        # 128+SIGKILL (137), and 144 is what this harness reported when the
+        # invocation took itself down. That string is the proof the predicted harm
+        # happened, as opposed to the command merely failing.
+        db.execute(
+            "UPDATE guards SET confirm_evidence=? WHERE match_type=? AND pattern LIKE '%pkill%'",
+            (r"[Ee]xit code (137|143|144)\b", MATCH_SHELL_CMD))
+        db.execute("PRAGMA user_version=6")
 
 
 def _baseline_snapshot(db: sqlite3.Connection, at: str) -> dict[str, Any]:
@@ -893,12 +1111,14 @@ def meta_get(db: sqlite3.Connection, key: str) -> str | None:
 
 
 def active_experiment_started(db: sqlite3.Connection, create: bool = False) -> str | None:
-    """Start of the experiment generation currently being judged (v2).
+    """Start of the experiment generation currently being judged (v3).
 
-    `experiment_started` is kept as the v1 stamp and is never rewritten -- it is
-    the historical record. This is the clock the pre-committed rule runs on.
+    `experiment_started` is kept as the v1 stamp and `shadow_v2_started_at` as
+    v2's; neither is ever rewritten -- they are the historical record. This is
+    the clock the pre-committed rule runs on, and it moves to a new key each time
+    a generation closes rather than being reset in place.
     """
-    val = meta_get(db, "shadow_v2_started_at")
+    val = meta_get(db, "shadow_v3_started_at")
     if val:
         return val
     if not create:
@@ -906,11 +1126,11 @@ def active_experiment_started(db: sqlite3.Connection, create: bool = False) -> s
     now = utcnow()
     try:
         with_retry(lambda: db.execute(
-            "INSERT OR IGNORE INTO meta(key,value) VALUES('shadow_v2_started_at',?)", (now,)), db)
+            "INSERT OR IGNORE INTO meta(key,value) VALUES('shadow_v3_started_at',?)", (now,)), db)
         with_retry(db.commit, db)
     except sqlite3.Error:
         return now
-    return meta_get(db, "shadow_v2_started_at") or now
+    return meta_get(db, "shadow_v3_started_at") or now
 
 
 def experiment_started(db: sqlite3.Connection, create: bool = False) -> str | None:
@@ -1196,7 +1416,53 @@ def lesson_rows(db: sqlite3.Connection, pid: str) -> list[sqlite3.Row]:
     ))
 
 
-def recall(db: sqlite3.Connection, pid: str, query: str, limit: int = 5) -> list[sqlite3.Row]:
+def record_recall_deliveries(db: sqlite3.Connection, pid: str, rows: list[sqlite3.Row], session: str,
+                             phase: str, top_k: int, pool_size: int) -> None:
+    """Persist what was actually put in front of the agent, with rank and phase.
+
+    Every injection path goes through here, including the SessionStart one. That
+    matters for correctness and not tidiness: `missed_relevant_recall` asks
+    whether a lesson reached the agent before the action, and a delivery path
+    that wrote no row would make lessons it injected look missing.
+
+    `phase` is the whole point of the column. A lesson delivered at `prompt` or
+    `session-start` arrived BEFORE the action; one delivered at `failure` arrived
+    after, and cannot have prevented anything.
+    """
+    if not rows:
+        return
+    now = utcnow()
+    db.executemany("UPDATE lessons SET use_count=use_count+1,last_used=? WHERE id=?",
+                   [(now, r["id"]) for r in rows])
+    # One row per recall, carrying where the lesson was learned and where it was
+    # just used. `use_count` alone cannot answer the question this plugin is
+    # actually for -- "how often did something we paid for in one project save us
+    # in another" -- because it collapses every use into a single number with no
+    # idea of place.
+    #
+    # `cross_project` is recorded, never inferred later: it is true when a lesson
+    # born in one project is recalled in a different one, which stops being
+    # computable the moment a project row is renamed or removed. And it is
+    # deliberately *recalled*, not *useful*: this counts what was put in front of
+    # the agent, and nothing here claims it helped.
+    db.executemany(
+        "INSERT INTO recall_events(lesson_id,lesson_scope,origin_project_id,consuming_project_id,"
+        "cross_project,recalled_at,session_id,rank,phase,top_k,pool_size) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        [(r["id"], r["scope"], r["origin_project_id"], pid,
+          1 if (r["origin_project_id"] and r["origin_project_id"] != pid) else 0, now,
+          session, i + 1, phase, top_k, pool_size)
+         for i, r in enumerate(rows)])
+
+
+# How many just-below-the-cut lessons to record per recall. Bounded on purpose:
+# the question "what did top-k drop" needs a sample, not the whole scored pool
+# written to disk on every prompt.
+RECALL_MISS_SAMPLE = 5
+
+
+def recall(db: sqlite3.Connection, pid: str, query: str, limit: int = 5,
+           session: str = "", phase: str = "prompt") -> list[sqlite3.Row]:
     q_raw = base_tokens(query)
     q = tokenize(query)
     scored: list[tuple[float, sqlite3.Row]] = []
@@ -1219,25 +1485,16 @@ def recall(db: sqlite3.Connection, pid: str, query: str, limit: int = 5) -> list
     scored.sort(key=lambda x: (-x[0], -x[1]["confidence"], x[1]["id"]))
     chosen = [r for _, r in scored[:limit]]
     if chosen:
+        record_recall_deliveries(db, pid, chosen, session, phase, limit, len(scored))
+        # What top-k dropped, sampled. This is the only way to answer "is 5 the
+        # right cut" with evidence instead of a guess: without it, a lesson that
+        # scored sixth leaves no trace at all, and the cut looks free.
         now = utcnow()
-        db.executemany("UPDATE lessons SET use_count=use_count+1,last_used=? WHERE id=?", [(now, r["id"]) for r in chosen])
-        # One row per recall, carrying where the lesson was learned and where it
-        # was just used. `use_count` alone cannot answer the question this
-        # plugin is actually for -- "how often did something we paid for in one
-        # project save us in another" -- because it collapses every use into a
-        # single number with no idea of place.
-        #
-        # `cross_project` is recorded, never inferred later: it is true when a
-        # lesson born in one project is recalled in a different one, which stops
-        # being computable the moment a project row is renamed or removed.
-        # And it is deliberately *recalled*, not *useful*: this counts what was
-        # put in front of the agent, and nothing here claims it helped.
         db.executemany(
-            "INSERT INTO recall_events(lesson_id,lesson_scope,origin_project_id,consuming_project_id,cross_project,recalled_at) "
-            "VALUES(?,?,?,?,?,?)",
-            [(r["id"], r["scope"], r["origin_project_id"], pid,
-              1 if (r["origin_project_id"] and r["origin_project_id"] != pid) else 0, now)
-             for r in chosen])
+            "INSERT INTO recall_misses(lesson_id,lesson_scope,project_id,session_id,phase,score,rank,top_k,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            [(r["id"], r["scope"], pid, session, phase, float(s), limit + 1 + i, limit, now)
+             for i, (s, r) in enumerate(scored[limit:limit + RECALL_MISS_SAMPLE])])
         db.commit()
     return chosen
 
@@ -1386,6 +1643,241 @@ def observe_success(db: sqlite3.Connection, pid: str, event: dict[str, Any]) -> 
             return int(row["id"]), None
     return None, None
 
+MATCH_EXACT = "exact"
+MATCH_CONTAINS = "contains"
+MATCH_REGEX = "regex"
+# A regex evaluated only where the shell would run a command. See
+# mask_shell_data() for why a plain regex over the raw string cannot be used.
+MATCH_SHELL_CMD = "shell_cmd"
+MATCH_TYPES = (MATCH_EXACT, MATCH_CONTAINS, MATCH_REGEX, MATCH_SHELL_CMD)
+
+# Masked-out bytes. NUL cannot appear in a real command line and matches no
+# pattern we store, so a masked span is inert without shifting any offset.
+SHELL_MASK = "\x00"
+_SHELL_SEPARATORS = ";|&\n()"
+# Words the shell runs *something else* through. `sudo pkill -f x` is still a
+# pkill invocation, so these are stepped over rather than treated as the command.
+_SHELL_TRANSPARENT = frozenset({
+    "sudo", "doas", "nohup", "env", "command", "exec", "time", "nice", "ionice",
+    "stdbuf", "setsid", "xargs", "builtin", "eval", "then", "do", "else", "elif", "!",
+})
+_ENV_ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=\S*\Z")
+_HEREDOC_OPEN = re.compile(r"<<-?\s*(?:'([^']*)'|\"([^\"]*)\"|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def mask_shell_data(cmd: str) -> str:
+    """Blank out every span of `cmd` the shell treats as data, preserving offsets.
+
+    This exists because a guard pattern searched against the raw command string
+    cannot tell an invocation from a mention. Recording the lesson "never run
+    `pkill -f`" ships the string `pkill -f` inside a quoted rule body, and a raw
+    regex fires on the sentence describing the rule -- the self-referential false
+    positive measured as guard_events id=8. The four layers that carry the same
+    token without meaning it are quoted strings, heredoc bodies, payloads aimed
+    at another interpreter, and prose.
+
+    Deliberately *not* deletion. Removing the spans would change token
+    boundaries and shift every offset after them, which is how a "safe" cleanup
+    turns `echo x; pkill -f y` into something that no longer parses the way the
+    shell parses it. Each data byte becomes NUL instead, so length, boundaries
+    and offsets all survive and only the content is gone.
+
+    Newlines are never masked, even inside a quoted span. Keeping them means the
+    line structure that follows a heredoc terminator stays intact, so a real
+    command on the next line is still found. It cannot reintroduce a false match
+    either: the content that would have matched is already NUL.
+
+    Command substitution stays code. `"$(pkill -f x)"` runs pkill despite the
+    quotes, so `$(` and backticks inside double quotes reopen a code region
+    rather than being masked -- masking them would trade this false positive for
+    a false negative, which is the worse of the two.
+    """
+    out: list[str] = []
+    # Stack of open contexts: "dq" double quote, "sub" $( ), "bt" backtick.
+    stack: list[str] = []
+    pending_heredocs: list[tuple[str, bool]] = []
+    i, n = 0, len(cmd)
+
+    def in_data() -> bool:
+        return bool(stack) and stack[-1] == "dq"
+
+    while i < n:
+        ch = cmd[i]
+
+        # Consume heredoc bodies at the newline that starts them.
+        if ch == "\n" and pending_heredocs and not stack:
+            out.append("\n")
+            i += 1
+            for delim, strip in pending_heredocs:
+                while i < n:
+                    eol = cmd.find("\n", i)
+                    line = cmd[i:] if eol < 0 else cmd[i:eol]
+                    if (line.strip() if strip else line).strip() == delim:
+                        out.append(line)          # terminator is structure, kept
+                        break
+                    # Body is data for another program: blank it, keep the newline.
+                    out.append(SHELL_MASK * len(line))
+                    if eol < 0:
+                        i = n
+                        break
+                    out.append("\n")
+                    i = eol + 1
+                else:
+                    continue
+                if eol < 0:
+                    i = n
+                    break
+                i += len(line)
+            pending_heredocs = []
+            continue
+
+        if ch == "\\" and i + 1 < n and (not stack or stack[-1] == "dq"):
+            # Escape: the backslash and its target are structure, not content.
+            out.append(cmd[i:i + 2])
+            i += 2
+            continue
+
+        if not stack:
+            if ch == "'":
+                # Single quotes admit no substitution at all: pure data.
+                j = cmd.find("'", i + 1)
+                j = n if j < 0 else j
+                out.append("'" + _mask_keep_newlines(cmd[i + 1:j]) + ("'" if j < n else ""))
+                i = j + 1
+                continue
+            if ch == '"':
+                stack.append("dq")
+                out.append('"')
+                i += 1
+                continue
+            if ch == "`":
+                stack.append("bt")
+                out.append("`")
+                i += 1
+                continue
+            m = _HEREDOC_OPEN.match(cmd, i)
+            if m:
+                delim = m.group(1) or m.group(2) or m.group(3) or ""
+                pending_heredocs.append((delim, cmd[i:i + 3].startswith("<<-")))
+                out.append(cmd[i:m.end()])
+                i = m.end()
+                continue
+            out.append(ch)
+            i += 1
+            continue
+
+        # Inside a double-quoted or substitution context.
+        if stack[-1] == "dq":
+            if ch == '"':
+                stack.pop()
+                out.append('"')
+                i += 1
+                continue
+            if cmd.startswith("$(", i):
+                stack.append("sub")
+                out.append("$(")
+                i += 2
+                continue
+            if ch == "`":
+                stack.append("bt")
+                out.append("`")
+                i += 1
+                continue
+            out.append("\n" if ch == "\n" else SHELL_MASK)
+            i += 1
+            continue
+
+        if stack[-1] == "sub":
+            if ch == ")":
+                stack.pop()
+                out.append(")")
+                i += 1
+                continue
+            if ch == "'":
+                j = cmd.find("'", i + 1)
+                j = n if j < 0 else j
+                out.append("'" + _mask_keep_newlines(cmd[i + 1:j]) + ("'" if j < n else ""))
+                i = j + 1
+                continue
+            if ch == '"':
+                stack.append("dq")
+                out.append('"')
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+            continue
+
+        # Backticks: code, same as $( ).
+        if ch == "`":
+            stack.pop()
+            out.append("`")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def _mask_keep_newlines(span: str) -> str:
+    return "".join("\n" if c == "\n" else SHELL_MASK for c in span)
+
+
+def shell_command_offsets(masked: str) -> list[int]:
+    """Offsets in `masked` where the shell would begin reading a command word.
+
+    Boundaries are the start of the string and anything after a control
+    operator. Leading variable assignments and transparent wrappers (`sudo`,
+    `env`, `xargs`, ...) are stepped over, because `sudo pkill -f x` is a pkill
+    invocation and a guard that missed it would be worse than useless.
+    """
+    starts: list[int] = [0]
+    for i, ch in enumerate(masked):
+        if ch in _SHELL_SEPARATORS:
+            starts.append(i + 1)
+    offsets: list[int] = []
+    for start in starts:
+        pos = start
+        # Step over whitespace, env assignments and transparent wrappers, in any
+        # order and any number of times.
+        while pos < len(masked):
+            while pos < len(masked) and masked[pos] in " \t":
+                pos += 1
+            end = pos
+            while end < len(masked) and masked[end] not in " \t\n":
+                end += 1
+            word = masked[pos:end]
+            if not word:
+                break
+            if word in _SHELL_TRANSPARENT or _ENV_ASSIGN.match(word) or word.startswith("-"):
+                pos = end
+                continue
+            break
+        if pos < len(masked) and pos not in offsets:
+            offsets.append(pos)
+    return offsets
+
+
+def shell_cmd_match(pattern: str, value: str) -> str | None:
+    """Where `pattern` matches `value` in shell terms: command position or nowhere.
+
+    Returns "command_position" when the pattern matches a word the shell would
+    actually execute, "data_only" when it matches the raw text but every match
+    lies in masked-out data (the mention-not-invocation case), and None when it
+    does not appear at all. The middle value is kept rather than collapsed to
+    None because it is the evidence that a lexical guard was about to misfire.
+    """
+    try:
+        masked = mask_shell_data(value)
+        for off in shell_command_offsets(masked):
+            if re.match(pattern, masked[off:]):
+                return "command_position"
+        return "data_only" if re.search(pattern, value, re.MULTILINE) else None
+    except re.error:
+        return None
+
+
 def get_field(tool_input: dict[str, Any], field_name: str) -> str:
     val = tool_input.get(field_name, "")
     if isinstance(val, (dict, list)):
@@ -1394,15 +1886,20 @@ def get_field(tool_input: dict[str, Any], field_name: str) -> str:
 
 
 def guard_matches(match_type: str, pattern: str, value: str) -> bool:
-    if match_type == "exact":
+    if match_type == MATCH_EXACT:
         return value.strip() == pattern.strip()
-    if match_type == "contains":
+    if match_type == MATCH_CONTAINS:
         return pattern in value
-    if match_type == "regex":
+    if match_type == MATCH_REGEX:
         try:
             return re.search(pattern, value, re.MULTILINE) is not None
         except re.error:
             return False
+    if match_type == MATCH_SHELL_CMD:
+        # Only a match the shell would actually execute counts as a hit. A match
+        # that exists solely inside quoted data is reported by shell_cmd_match()
+        # as "data_only" and is deliberately not a hit.
+        return shell_cmd_match(pattern, value) == "command_position"
     return False
 
 
@@ -1412,6 +1909,69 @@ def active_guards(db: sqlite3.Connection, pid: str, tool: str) -> list[sqlite3.R
         "SELECT g.*,l.rule_text FROM guards g JOIN lessons l ON l.id=g.lesson_id WHERE g.active=1 AND l.status='active' AND g.tool_name=? AND (g.project_id IS NULL OR g.project_id=?) AND (g.expires_at IS NULL OR g.expires_at>=?)",
         (tool, pid, now),
     ))
+
+def current_experiment(db: sqlite3.Connection) -> str:
+    """The generation a row created right now belongs to."""
+    return _experiment_for(meta_get(db, "shadow_v2_started_at"),
+                           meta_get(db, "shadow_v3_started_at"), utcnow())
+
+
+def lesson_seen_in_session(db: sqlite3.Connection, lesson_id: int, session: str, before: str) -> bool:
+    """Was this lesson put in front of the agent in this session, before `before`?
+
+    Answers only the delivery question. It makes no claim that the agent read it,
+    understood it, or was helped by it -- `recall_events` counts what was shown,
+    and inferring benefit from presentation is exactly the mistake this release
+    refuses to make.
+    """
+    if not session:
+        return False
+    row = db.execute(
+        "SELECT 1 FROM recall_events WHERE lesson_id=? AND session_id=? AND recalled_at<=? LIMIT 1",
+        (lesson_id, session, before),
+    ).fetchone()
+    return row is not None
+
+
+def record_missed_recall(db: sqlite3.Connection, pid: str, session: str, tool: str, lesson_id: int,
+                         guard_event_id: int | None, experiment: str, origin: str, now: str) -> bool:
+    """Record that a provably relevant lesson was absent from context before the action.
+
+    The basis is the guard match itself, so this is a measurement and not an
+    inference: a deterministic pattern decided the lesson applies to this exact
+    command. One row per session and lesson -- a repeat inside the same session
+    is the same miss, and counting it twice would overstate the signal.
+    """
+    # Only a lesson the recall path could actually have delivered can be counted
+    # as missed by it. Automatically learned lessons are excluded from recall on
+    # purpose (see lesson_rows): their text is a literal command pair, useless as
+    # context, and the guard IS their delivery mechanism. Counting them here would
+    # inflate the metric with cases no ranking change could ever fix.
+    eligible = db.execute(
+        "SELECT 1 FROM lessons WHERE id=? AND status='active' "
+        f"  AND source NOT IN ({','.join('?' * len(AUTO_LESSON_SOURCES))}) LIMIT 1",
+        (lesson_id, *sorted(AUTO_LESSON_SOURCES)),
+    ).fetchone()
+    if not eligible:
+        return False
+    if lesson_seen_in_session(db, lesson_id, session, now):
+        return False
+    dup = db.execute(
+        "SELECT 1 FROM missed_recalls WHERE lesson_id=? AND session_id=? LIMIT 1",
+        (lesson_id, session),
+    ).fetchone()
+    if dup:
+        return False
+    db.execute(
+        "INSERT INTO missed_recalls(guard_event_id,lesson_id,project_id,session_id,tool_name,"
+        "detected_at,basis,experiment,origin) VALUES(?,?,?,?,?,?,?,?,?)",
+        (guard_event_id, lesson_id, pid, session, tool, now,
+         "guard pattern matched this action, proving the lesson applies, and the "
+         "lesson had not been delivered in this session before the action",
+         experiment, origin),
+    )
+    return True
+
 
 def run_guard(db: sqlite3.Connection, pid: str, event: dict[str, Any]) -> dict[str, Any] | None:
     tool = str(event.get("tool_name", ""))
@@ -1427,6 +1987,14 @@ def run_guard(db: sqlite3.Connection, pid: str, event: dict[str, Any]) -> dict[s
             continue
         now = utcnow()
         action = redact(raw)
+        # Where the match sat, recorded at fire time because it cannot be
+        # recovered afterwards from the stored action alone.
+        match_context = None
+        if g["match_type"] == MATCH_SHELL_CMD:
+            match_context = next(
+                (ctx for ctx in (shell_cmd_match(g["pattern"], v) for v in candidates) if ctx), None)
+        klass = (g["eval_class"] if "eval_class" in _keys(g) else None) or GUARD_CLASS_EXECUTION
+        experiment = current_experiment(db)
         # Read fresh here, not inherited from the guard: a guard learned during
         # a controlled test can still fire on genuine natural use later, and
         # that firing must be judged as natural evidence, not attributed
@@ -1435,11 +2003,22 @@ def run_guard(db: sqlite3.Connection, pid: str, event: dict[str, Any]) -> dict[s
 
         def record() -> None:
             db.execute("UPDATE guards SET hit_count=hit_count+1,last_hit=? WHERE id=?", (now, g["id"]))
-            db.execute(
-                "INSERT INTO guard_events(guard_id,lesson_id,project_id,session_id,tool_name,action,mode,created_at,origin)"
-                " VALUES(?,?,?,?,?,?,?,?,?)",
-                (g["id"], g["lesson_id"], pid, session, tool, action, mode, now, origin),
+            cur = db.execute(
+                "INSERT INTO guard_events(guard_id,lesson_id,project_id,session_id,tool_name,action,mode,"
+                "created_at,origin,experiment,guard_class,causal_outcome,match_context)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (g["id"], g["lesson_id"], pid, session, tool, action, mode, now, origin,
+                 experiment, klass, CAUSAL_UNVERIFIED, match_context),
             )
+            # A guard match is a DETERMINISTIC proof of relevance: this stored
+            # lesson is about this exact action, decided by a pattern rather than
+            # by a similarity score. So if the lesson was not already in front of
+            # the agent in this session, recall missed something it provably
+            # should have surfaced -- the case that motivated this release, where
+            # ERR-0039 arrived from the failure hook one second after the command
+            # it would have prevented.
+            record_missed_recall(db, pid, session, tool, g["lesson_id"], int(cur.lastrowid),
+                                 experiment, origin, now)
             db.commit()
         with_retry(record, db)
 
@@ -1463,27 +2042,130 @@ def run_guard(db: sqlite3.Connection, pid: str, event: dict[str, Any]) -> dict[s
     return None
 
 
+PATTERN_LITERALS = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{2,}")
+
+
+def pattern_literal_tokens(pattern: str) -> set[str]:
+    """The literal words a guard pattern insists on, with regex syntax stripped.
+
+    Used only as a fallback when a guard declares no `confirm_evidence`: if the
+    failure text names a word the pattern required, the failure plausibly
+    concerns that command. Plausibly is not proof, which is why this can produce
+    CONFIRMED only for guards whose harm IS the command failing, and yields
+    UNVERIFIED whenever it finds nothing.
+    """
+    stripped = re.sub(r"\\[bBdDsSwWAZ]|\(\?[a-zA-Z:]*\)", " ", pattern)
+    return {w.lower() for w in PATTERN_LITERALS.findall(stripped)}
+
+
+def causal_outcome(guard: sqlite3.Row | dict[str, Any], failed: bool, error: str,
+                   match_context: str | None) -> tuple[str, str]:
+    """Decide whether the guard's predicted harm demonstrably occurred.
+
+    Returns (causal_outcome, basis). The basis string is stored so a later reader
+    can see which observable was consulted, not merely the conclusion.
+
+    Three rules, in order of strength:
+
+    1. A guard that matched only quoted data was never about to do anything. That
+       is a refutation of the *match*, independent of what the command did.
+    2. Success refutes any guard that predicted the command would break.
+    3. Failure confirms only when the guard's declared evidence is present. A
+       failure with a different cause is UNVERIFIED -- this is precisely the
+       spurious confirmation (bash syntax error on `|`, scored true_positive)
+       that closed v2.
+
+    A guard whose harm is a side effect or an irreversible action is never
+    confirmed here. It is not being judged, and saying so is the honest output.
+    """
+    klass = (guard["eval_class"] if "eval_class" in _keys(guard) else None) or GUARD_CLASS_EXECUTION
+    declared = (guard["confirm_evidence"] if "confirm_evidence" in _keys(guard) else None) or ""
+
+    if match_context == "data_only":
+        return CAUSAL_REFUTED, "pattern matched only inside quoted data or a heredoc body, never in command position"
+
+    if declared:
+        try:
+            if re.search(declared, error or "", re.MULTILINE):
+                return CAUSAL_CONFIRMED, f"declared evidence present in failure output: /{declared}/"
+        except re.error:
+            return CAUSAL_UNVERIFIED, "declared evidence is not a valid regex; refusing to guess"
+        if not failed:
+            return CAUSAL_REFUTED, "command succeeded; the declared harm did not occur"
+        return CAUSAL_UNVERIFIED, (
+            f"command failed but the declared evidence /{declared}/ is absent: "
+            "the failure has a different cause and does not confirm this guard")
+
+    if klass not in GUARD_CLASSES_OBSERVABLE:
+        return CAUSAL_UNVERIFIED, (
+            f"guard class '{klass}' predicts harm this process cannot observe "
+            "(it does not appear in an exit code); no probe is declared, so the "
+            "guard is not on trial")
+
+    if not failed:
+        return CAUSAL_REFUTED, "command succeeded; the predicted execution failure did not occur"
+
+    literals = pattern_literal_tokens(str(guard["pattern"]))
+    haystack = (error or "").lower()
+    hit = sorted(w for w in literals if w and w in haystack)
+    if hit:
+        return CAUSAL_CONFIRMED, f"failure output names the guarded token(s): {', '.join(hit)}"
+    return CAUSAL_UNVERIFIED, (
+        "command failed but nothing in the failure output ties it to the guarded "
+        "pattern; correlation without causation")
+
+
+def _keys(row: sqlite3.Row | dict[str, Any]) -> set[str]:
+    try:
+        return set(row.keys())
+    except Exception:
+        return set()
+
+
 def resolve_guard_events(db: sqlite3.Connection, pid: str, event: dict[str, Any], failed: bool) -> None:
     """Score a shadow guard against what the command actually did.
 
-    This is the whole point of SHADOW. The guard predicted "this will fail again".
-    If the command then succeeds, the guard was demonstrably wrong -- a false
-    positive measured, not estimated. If it fails again, the prediction held.
+    This is the whole point of SHADOW. The guard predicted a specific harm; the
+    command was allowed to run; now we ask whether that harm actually happened.
+
+    v2 asked a weaker question -- did the command exit non-zero -- and recorded
+    the answer as if it were the same thing. It is not: a command can fail for a
+    reason the guard never predicted (measured: guard_events id=7), and a command
+    can inflict exactly the predicted harm while exiting 0 (git add -A). Both
+    errors are now representable, and neither is silently called a confirmation.
     """
     tool = str(event.get("tool_name", ""))
     session = str(event.get("session_id", ""))
     action = redact(get_field(event.get("tool_input") or {}, "command" if tool == "Bash" else "file_path"))
     if not action:
         return
+    error = redact(event.get("error", "") or event.get("tool_response", "") or "")
+    # Kept for continuity of the old series only. Nothing reads it for a verdict
+    # any more; the causal columns do.
     outcome = "true_positive" if failed else "false_positive"
     now = utcnow()
+    pending = list(db.execute(
+        "SELECT ge.id,ge.guard_id,ge.match_context,g.eval_class,g.confirm_evidence,g.pattern "
+        "  FROM guard_events ge LEFT JOIN guards g ON g.id=ge.guard_id "
+        " WHERE ge.outcome='pending' AND ge.project_id=? AND ge.session_id=? "
+        "   AND ge.tool_name=? AND ge.action=?",
+        (pid, session, tool, action),
+    ))
 
     def write() -> None:
-        db.execute(
-            "UPDATE guard_events SET outcome=?,resolved_at=? "
-            "WHERE outcome='pending' AND project_id=? AND session_id=? AND tool_name=? AND action=?",
-            (outcome, now, pid, session, tool, action),
-        )
+        for row in pending:
+            verdict, basis = causal_outcome(row, failed, error, row["match_context"])
+            db.execute(
+                "UPDATE guard_events SET outcome=?,resolved_at=?,causal_outcome=?,causal_basis=? WHERE id=?",
+                (outcome, now, verdict, basis, row["id"]),
+            )
+        if not pending:
+            # No causal row to write, but keep the legacy series consistent.
+            db.execute(
+                "UPDATE guard_events SET outcome=?,resolved_at=? "
+                "WHERE outcome='pending' AND project_id=? AND session_id=? AND tool_name=? AND action=?",
+                (outcome, now, pid, session, tool, action),
+            )
         db.commit()
     with_retry(write)
 
@@ -1550,15 +2232,23 @@ def _dispatch_hook(args: argparse.Namespace) -> tuple[int, sqlite3.Connection, s
     if get_mode(db) == MODE_SHADOW:
         active_experiment_started(db, create=True)
 
+    session = str(event.get("session_id", ""))
+
     if kind == "session-start":
-        rows = [r for r in lesson_rows(db, pid) if r["confidence"] >= 0.90][:3]
+        eligible = [r for r in lesson_rows(db, pid) if r["confidence"] >= 0.90]
+        rows = eligible[:3]
         if rows:
+            # Recorded as a delivery like any other. Before 0.5.0 this path wrote
+            # nothing, so a lesson injected here looked to the recall audit as if
+            # it had never reached the agent.
+            record_recall_deliveries(db, pid, rows, session, "session-start", 3, len(eligible))
+            db.commit()
             json_out(hook_context("SessionStart", format_lessons(rows, "high-confidence memory loaded at session start")))
         return 0, db, pid, event
 
     if kind == "prompt":
         prompt = redact(event.get("prompt", ""))
-        rows = recall(db, pid, prompt, 5)
+        rows = recall(db, pid, prompt, 5, session=session, phase="prompt")
         if rows:
             json_out(hook_context("UserPromptSubmit", format_lessons(rows)))
         return 0, db, pid, event
@@ -1575,7 +2265,10 @@ def _dispatch_hook(args: argparse.Namespace) -> tuple[int, sqlite3.Connection, s
         if ignored:
             return 0, db, pid, event
         query = f"{event.get('tool_name','')} {extract_action(str(event.get('tool_name','')), event.get('tool_input') or {})} {event.get('error','')}"
-        rows = recall(db, pid, query, 3)
+        # phase="failure": this delivery is AFTER the action. It can inform the
+        # next attempt; it cannot have prevented this one, and the audit must not
+        # be able to confuse the two.
+        rows = recall(db, pid, query, 3, session=session, phase="failure")
         bits = []
         if cid:
             bits.append(f"[my-error] Captured candidate CAND-{cid:04d} ({family}). A failure is NOT yet a lesson; identify root cause and verify the correction before promoting it.")
@@ -1598,7 +2291,6 @@ def _dispatch_hook(args: argparse.Namespace) -> tuple[int, sqlite3.Connection, s
         return 0, db, pid, event
 
     if kind == "stop":
-        session = str(event.get("session_id", ""))
         rows = list(db.execute(
             "SELECT * FROM candidates WHERE project_id=? AND session_id=? AND status='evidence' AND recovery_evidence>0 ORDER BY last_seen DESC LIMIT 3",
             (pid, session),
@@ -1733,10 +2425,12 @@ def cmd_learn(args: argparse.Namespace) -> int:
         if args.guard_ttl_days > 0:
             expires = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=args.guard_ttl_days)).isoformat(timespec="seconds")
         db.execute("""
-          INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at,origin)
-          VALUES(?,?,?,?,?,?,?,?,1,?,?,?)
+          INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at,origin,eval_class,confirm_evidence)
+          VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?)
         """, (lid, None if scope == "global" else pid, args.guard_tool, args.guard_field, args.guard_match,
-              args.guard_pattern, args.replacement, args.guard_reason or args.rule, now, expires, origin))
+              args.guard_pattern, args.replacement, args.guard_reason or args.rule, now, expires, origin,
+              getattr(args, "guard_class", GUARD_CLASS_EXECUTION),
+              getattr(args, "confirm_evidence", None) or None))
     db.commit()
     print(f"Learned ERR-{lid:04d} confidence={conf:.2f} scope={scope.upper()}" + (" with guard" if args.guard_tool else ""))
     if args.scope_reason:
@@ -1806,6 +2500,149 @@ def cmd_scope(args: argparse.Namespace) -> int:
         orow = db.execute("SELECT root FROM projects WHERE id=?", (origin,)).fetchone()
         print(f"Origin preserved: {orow['root'] if orow else origin}")
     return 0
+
+
+# The v3 decision rule, frozen at the instant v3 opens and before any v3 row
+# exists. Same discipline as v1/v2: written before the numbers so day 30 cannot
+# be argued from them.
+#
+#   unverified dominates            -> INSTRUMENT_INSUFFICIENT (no guard verdict)
+#   causally_confirmed == 0, refuted -> REMOVE
+#   causally_refuted > confirmed     -> REMOVE
+#   confirmed >= 3 and refuted == 0  -> PROMOTE to ENFORCE
+#   anything else                    -> EXTEND
+#
+# `missed_relevant_recall` is NOT in this rule. It measures the recall path, and
+# a guard verdict must not absorb it -- that conflation is what made the old
+# single verdict unreadable.
+SHADOW_V3_UNVERIFIED_DOMINANCE = 2.0
+VERDICT_INSTRUMENT = "INSTRUMENT_INSUFFICIENT"
+
+
+def canonical_dataset(db: sqlite3.Connection, experiment: str, origin: str = ORIGIN_NATURAL) -> dict[str, Any]:
+    """The verdict dataset: every natural event of one generation, all projects.
+
+    This is the fix for the defect that closed v2. The old query filtered
+    `project_id = <cwd's project>`, which made the pre-committed rule return a
+    different answer depending on which directory the doctor happened to run in
+    -- EXTEND from /home/w-jr, REMOVE from /home/w-jr/fidren, same database, same
+    instant. A verdict that moves when you cd is not a verdict.
+
+    `project_id` is kept, as a reported dimension. Breaking the numbers down per
+    project is useful; letting the cwd silently pick which rows count is not.
+    """
+    def count(where: str, args: tuple = ()) -> int:
+        return int(db.execute(
+            f"SELECT COUNT(*) FROM guard_events WHERE experiment=? AND origin=? {where}",
+            (experiment, origin) + args).fetchone()[0])
+
+    would_block = count("AND mode='SHADOW'")
+    confirmed = count("AND causal_outcome=?", (CAUSAL_CONFIRMED,))
+    refuted = count("AND causal_outcome=?", (CAUSAL_REFUTED,))
+    unverified = count("AND causal_outcome=?", (CAUSAL_UNVERIFIED,))
+    not_evaluated = count("AND causal_outcome=?", (CAUSAL_NOT_EVALUATED,))
+    pending = count("AND outcome='pending'")
+    missed = int(db.execute(
+        "SELECT COUNT(*) FROM missed_recalls WHERE experiment=? AND origin=?",
+        (experiment, origin)).fetchone()[0])
+    by_project = [
+        {"project": r[0] or r[1], "would_block": r[2], "confirmed": r[3], "refuted": r[4], "unverified": r[5]}
+        for r in db.execute(
+            "SELECT p.root, ge.project_id, COUNT(*), "
+            "  SUM(CASE WHEN ge.causal_outcome=? THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN ge.causal_outcome=? THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN ge.causal_outcome=? THEN 1 ELSE 0 END) "
+            " FROM guard_events ge LEFT JOIN projects p ON p.id=ge.project_id "
+            " WHERE ge.experiment=? AND ge.origin=? GROUP BY ge.project_id ORDER BY 3 DESC",
+            (CAUSAL_CONFIRMED, CAUSAL_REFUTED, CAUSAL_UNVERIFIED, experiment, origin))
+    ]
+    by_class = [
+        {"guard_class": r[0] or "(unclassified)", "events": r[1], "confirmed": r[2],
+         "refuted": r[3], "unverified": r[4]}
+        for r in db.execute(
+            "SELECT guard_class, COUNT(*), "
+            "  SUM(CASE WHEN causal_outcome=? THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN causal_outcome=? THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN causal_outcome=? THEN 1 ELSE 0 END) "
+            " FROM guard_events WHERE experiment=? AND origin=? GROUP BY guard_class ORDER BY 2 DESC",
+            (CAUSAL_CONFIRMED, CAUSAL_REFUTED, CAUSAL_UNVERIFIED, experiment, origin))
+    ]
+    return {
+        "experiment": experiment,
+        "origin": origin,
+        "would_block": would_block,
+        "causally_confirmed": confirmed,
+        "causally_refuted": refuted,
+        "unverified": unverified,
+        "not_evaluated": not_evaluated,
+        "pending": pending,
+        "missed_relevant_recall": missed,
+        "by_project": by_project,
+        "by_guard_class": by_class,
+    }
+
+
+def recall_metrics(db: sqlite3.Connection) -> dict[str, Any]:
+    """How recall performed, measured apart from every guard number.
+
+    Two things are deliberately NOT claimed here. That a delivered lesson helped
+    (only that it was delivered), and that an undelivered one would have helped
+    (only that a deterministic pattern later proved it applied).
+    """
+    one = lambda q, a=(): int(db.execute(q, a).fetchone()[0])  # noqa: E731
+    by_phase = {r[0] or "(unrecorded)": r[1] for r in db.execute(
+        "SELECT phase, COUNT(*) FROM recall_events GROUP BY phase ORDER BY 2 DESC")}
+    missed_by_lesson = [
+        {"lesson_id": r[0], "misses": r[1], "last": r[2]}
+        for r in db.execute(
+            "SELECT lesson_id, COUNT(*), MAX(detected_at) FROM missed_recalls "
+            "GROUP BY lesson_id ORDER BY 2 DESC LIMIT 10")
+    ]
+    # Lessons that scored but fell below the cut. The denominator for "is top-5
+    # the right number", which before 0.5.0 left no trace at all.
+    miss_scope = {r[0]: r[1] for r in db.execute(
+        "SELECT lesson_scope, COUNT(*) FROM recall_misses GROUP BY lesson_scope")}
+    return {
+        "deliveries_total": one("SELECT COUNT(*) FROM recall_events"),
+        "deliveries_by_phase": by_phase,
+        "deliveries_before_action": one(
+            "SELECT COUNT(*) FROM recall_events WHERE phase IN ('prompt','session-start')"),
+        "deliveries_after_action": one("SELECT COUNT(*) FROM recall_events WHERE phase='failure'"),
+        "missed_relevant_recall_total": one("SELECT COUNT(*) FROM missed_recalls"),
+        "missed_relevant_recall_natural": one(
+            "SELECT COUNT(*) FROM missed_recalls WHERE origin=?", (ORIGIN_NATURAL,)),
+        "missed_by_lesson": missed_by_lesson,
+        "below_cut_sampled": one("SELECT COUNT(*) FROM recall_misses"),
+        "below_cut_by_scope": miss_scope,
+        # Structural facts about the recall pool, which explain more than any
+        # ranking tweak could. A lesson excluded by source can never be recalled
+        # at any k, so counting it as a ranking loss would be wrong.
+        "pool_excluded_auto_source": one(
+            f"SELECT COUNT(*) FROM lessons WHERE status='active' AND source IN "
+            f"({','.join('?' * len(AUTO_LESSON_SOURCES))})", tuple(sorted(AUTO_LESSON_SOURCES))),
+        "pool_eligible_global": one(
+            "SELECT COUNT(*) FROM lessons WHERE status='active' AND scope='global' AND source NOT IN "
+            f"({','.join('?' * len(AUTO_LESSON_SOURCES))})", tuple(sorted(AUTO_LESSON_SOURCES))),
+        "pool_eligible_project": one(
+            "SELECT COUNT(*) FROM lessons WHERE status='active' AND scope='project' AND source NOT IN "
+            f"({','.join('?' * len(AUTO_LESSON_SOURCES))})", tuple(sorted(AUTO_LESSON_SOURCES))),
+    }
+
+
+def retired_fixture_counts(db: sqlite3.Connection) -> dict[str, Any]:
+    """Historical total, genuinely active knowledge, and retired fixtures -- apart.
+
+    Reported separately because a single "lessons: N" invites reading the
+    historical total as the amount of useful knowledge, and for this database
+    most of the gap was controlled-test scaffolding.
+    """
+    one = lambda q, a=(): int(db.execute(q, a).fetchone()[0])  # noqa: E731
+    return {
+        "lessons_ever": one("SELECT COUNT(*) FROM lessons"),
+        "lessons_active": one("SELECT COUNT(*) FROM lessons WHERE status='active'"),
+        "fixtures_retired": one("SELECT COUNT(*) FROM lesson_retirements"),
+        "retired_now": one(f"SELECT COUNT(*) FROM lessons WHERE status='{STATUS_RETIRED_FIXTURE}'"),
+    }
 
 
 def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
@@ -1899,27 +2736,34 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
         win, wa = "AND 1=0", ()
         v1win, v1a = "", ()
 
-    natural_would_block = ev(f"AND mode='SHADOW' AND origin=? {win}", (ORIGIN_NATURAL,) + wa)
-    natural_confirmed = ev(f"AND outcome='true_positive' AND origin=? {win}", (ORIGIN_NATURAL,) + wa)
-    natural_refuted = ev(f"AND outcome='false_positive' AND origin=? {win}", (ORIGIN_NATURAL,) + wa)
-    natural_pending = ev(f"AND outcome='pending' AND origin=? {win}", (ORIGIN_NATURAL,) + wa)
+    # The LEGACY v2 series, kept readable but no longer authoritative. It selects
+    # on experiment='v2' rather than on a timestamp window, because the window it
+    # used to derive now belongs to v3. These are the numbers the defective v2
+    # instrument produced, project-scoped exactly as it produced them -- which is
+    # the point: the defect stays visible instead of being quietly corrected.
+    natural_would_block = ev("AND mode='SHADOW' AND origin=? AND experiment='v2'", (ORIGIN_NATURAL,))
+    natural_confirmed = ev("AND outcome='true_positive' AND origin=? AND experiment='v2'", (ORIGIN_NATURAL,))
+    natural_refuted = ev("AND outcome='false_positive' AND origin=? AND experiment='v2'", (ORIGIN_NATURAL,))
+    natural_pending = ev("AND outcome='pending' AND origin=? AND experiment='v2'", (ORIGIN_NATURAL,))
 
-    # Controlled tests inside the v2 window. Reported so the exclusion is
-    # visible and auditable, never summed into the verdict.
-    controlled_would_block = ev(f"AND mode='SHADOW' AND origin=? {win}", (ORIGIN_CONTROLLED,) + wa)
-    controlled_confirmed = ev(f"AND outcome='true_positive' AND origin=? {win}", (ORIGIN_CONTROLLED,) + wa)
-    controlled_refuted = ev(f"AND outcome='false_positive' AND origin=? {win}", (ORIGIN_CONTROLLED,) + wa)
-    controlled_pending = ev(f"AND outcome='pending' AND origin=? {win}", (ORIGIN_CONTROLLED,) + wa)
+    controlled_would_block = ev("AND mode='SHADOW' AND origin=? AND experiment='v2'", (ORIGIN_CONTROLLED,))
+    controlled_confirmed = ev("AND outcome='true_positive' AND origin=? AND experiment='v2'", (ORIGIN_CONTROLLED,))
+    controlled_refuted = ev("AND outcome='false_positive' AND origin=? AND experiment='v2'", (ORIGIN_CONTROLLED,))
+    controlled_pending = ev("AND outcome='pending' AND origin=? AND experiment='v2'", (ORIGIN_CONTROLLED,))
 
     # SHADOW v1, preserved and queryable. Closed as INCONCLUSIVE: the system
     # underneath it changed materially mid-window, so these numbers judge
     # neither the guard nor the plugin. They exist for audit only.
+    # Generation is now a stored column, so these select on it rather than
+    # re-deriving a window from whichever generation happens to be active. That
+    # derivation broke the moment a third generation existed: `started` moved to
+    # v3, and every v2 row silently became "before the start" -- i.e. v1.
     v1_natural_would_block = ev(f"AND mode='SHADOW' AND origin=? {v1win}", (ORIGIN_NATURAL,) + v1a)
-    v1_natural_confirmed = ev(f"AND outcome='true_positive' AND origin=? {v1win}", (ORIGIN_NATURAL,) + v1a)
-    v1_natural_refuted = ev(f"AND outcome='false_positive' AND origin=? {v1win}", (ORIGIN_NATURAL,) + v1a)
-    v1_controlled_would_block = ev(f"AND mode='SHADOW' AND origin=? {v1win}", (ORIGIN_CONTROLLED,) + v1a)
-    v1_controlled_confirmed = ev(f"AND outcome='true_positive' AND origin=? {v1win}", (ORIGIN_CONTROLLED,) + v1a)
-    v1_controlled_refuted = ev(f"AND outcome='false_positive' AND origin=? {v1win}", (ORIGIN_CONTROLLED,) + v1a)
+    v1_natural_confirmed = ev("AND outcome='true_positive' AND origin=? AND experiment='v1'", (ORIGIN_NATURAL,))
+    v1_natural_refuted = ev("AND outcome='false_positive' AND origin=? AND experiment='v1'", (ORIGIN_NATURAL,))
+    v1_controlled_would_block = ev("AND mode='SHADOW' AND origin=? AND experiment='v1'", (ORIGIN_CONTROLLED,))
+    v1_controlled_confirmed = ev("AND outcome='true_positive' AND origin=? AND experiment='v1'", (ORIGIN_CONTROLLED,))
+    v1_controlled_refuted = ev("AND outcome='false_positive' AND origin=? AND experiment='v1'", (ORIGIN_CONTROLLED,))
 
     return {
         "mode": mode,
@@ -1976,6 +2820,19 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
         "project_lessons_recalled": project_recalled,
         "cross_project_recalls": cross_project_recalls,
         "transfer_pairs": transfer_pairs,
+        # --- v3: the canonical, cwd-independent verdict dataset --------------
+        # Computed without any project filter, so this block is byte-identical
+        # no matter which directory the doctor runs in. `pid` above still scopes
+        # the descriptive per-project counts; it must never scope these.
+        "shadow_v2_status": meta_get(db, "shadow_v2_status"),
+        "shadow_v2_ended_at": meta_get(db, "shadow_v2_ended_at"),
+        "shadow_v2_defects": json.loads(meta_get(db, "shadow_v2_defects") or "[]"),
+        "shadow_v3_started_at": meta_get(db, "shadow_v3_started_at"),
+        "shadow_v3_baseline_version": meta_get(db, "shadow_v3_baseline_version") or SHADOW_V3_BASELINE_VERSION,
+        "canonical": canonical_dataset(db, "v3", ORIGIN_NATURAL),
+        "canonical_controlled": canonical_dataset(db, "v3", ORIGIN_CONTROLLED),
+        "recall": recall_metrics(db),
+        "knowledge": retired_fixture_counts(db),
     }
 
 
@@ -1994,19 +2851,33 @@ def shadow_verdict(m: dict[str, Any]) -> tuple[str, str]:
     the pipeline works) never reaches this function's inputs; see
     docs/METRICS.md for why mixing the two would invalidate the experiment.
     """
-    confirmed = m.get("shadow_verdict_confirmed", 0)
-    refuted = m.get("shadow_verdict_refuted", 0)
+    canon = m.get("canonical") or {}
+    confirmed = int(canon.get("causally_confirmed", 0))
+    refuted = int(canon.get("causally_refuted", 0))
+    unverified = int(canon.get("unverified", 0))
     day = m.get("shadow_day")
     if day is None:
         return "NOT STARTED", "no hook has run yet"
     if day < SHADOW_EXPERIMENT_DAYS:
         return "RUNNING", f"day {day} of {SHADOW_EXPERIMENT_DAYS}; verdict is not due yet"
+    decided = confirmed + refuted
+    # The instrument gets judged before the guard does. If most firings could not
+    # be tied to an outcome either way, the honest report is that we still cannot
+    # measure -- not a guard verdict computed from the minority that happened to
+    # be legible. This branch exists because v2's absence of it produced a
+    # verdict that looked like a finding.
+    if unverified > decided * SHADOW_V3_UNVERIFIED_DOMINANCE:
+        return VERDICT_INSTRUMENT, (
+            f"{unverified} of {unverified + decided} firings could not be tied causally to an "
+            f"outcome; fix the observables before judging the guard")
+    if confirmed == 0 and refuted == 0:
+        return "EXTEND", "no causally decided firing yet; nothing to judge in either direction"
     if confirmed == 0:
-        return "REMOVE", "the guard never once correctly predicted a repeat; the mechanism has no measured base rate"
+        return "REMOVE", "the guard never once causally predicted a repeat; the mechanism has no measured base rate"
     if refuted > confirmed:
-        return "REMOVE", f"wrong more often than right ({refuted} refuted vs {confirmed} confirmed)"
+        return "REMOVE", f"wrong more often than right ({refuted} causally refuted vs {confirmed} confirmed)"
     if confirmed >= SHADOW_PROMOTE_THRESHOLD and refuted == 0:
-        return "PROMOTE", f"{confirmed} correct predictions, no false positives"
+        return "PROMOTE", f"{confirmed} causally confirmed predictions, no causal refutations"
     return "EXTEND", f"inconclusive ({confirmed} confirmed, {refuted} refuted); another {SHADOW_EXPERIMENT_DAYS} days"
 
 
@@ -2099,6 +2970,130 @@ def cmd_forget(args: argparse.Namespace) -> int:
     return 0
 
 
+def fixture_candidates(db: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Active lessons that are controlled-test scaffolding rather than knowledge.
+
+    The criterion is structural, not a hand-written id list: a lesson created by
+    the automatic recovery path (`source` in AUTO_LESSON_SOURCES) AND stamped
+    `controlled_test`. Both halves matter. The auto path writes a literal
+    command pair ("do not retry `git --verison`, use `git --version`") which is
+    not reusable knowledge, and the controlled-test origin says it was produced
+    by deliberately provoking a failure to prove the pipeline works.
+
+    An id list would be wrong for any other installation. A criterion travels.
+    """
+    return list(db.execute(
+        "SELECT * FROM lessons WHERE status='active' AND origin=? "
+        f"  AND source IN ({','.join('?' * len(AUTO_LESSON_SOURCES))}) "
+        " ORDER BY id",
+        (ORIGIN_CONTROLLED, *sorted(AUTO_LESSON_SOURCES)),
+    ))
+
+
+def retire_lesson(db: sqlite3.Connection, row: sqlite3.Row, reason: str) -> int:
+    """Retire one lesson, preserving the row and recording why.
+
+    Nothing is deleted. The lesson keeps its id, text, provenance and counters;
+    only `status` changes and its guards are deactivated. `lesson_retirements`
+    is the audit trail, so the historical total stays reconcilable with the
+    active set at any later date.
+    """
+    guards = int(db.execute("SELECT COUNT(*) FROM guards WHERE lesson_id=? AND active=1",
+                            (row["id"],)).fetchone()[0])
+    db.execute("UPDATE lessons SET status=?,updated_at=? WHERE id=?",
+               (STATUS_RETIRED_FIXTURE, utcnow(), row["id"]))
+    db.execute("UPDATE guards SET active=0 WHERE lesson_id=?", (row["id"],))
+    db.execute(
+        "INSERT INTO lesson_retirements(lesson_id,previous_status,new_status,retired_at,reason,guards_deactivated)"
+        " VALUES(?,?,?,?,?,?)",
+        (row["id"], row["status"], STATUS_RETIRED_FIXTURE, utcnow(), reason, guards))
+    return guards
+
+
+def cmd_retire_fixtures(args: argparse.Namespace) -> int:
+    """Retire controlled-test scaffolding, and named lessons, auditably.
+
+    Dry run by default. A command that silently rewrites the knowledge store on
+    first invocation is the wrong default for a tool whose entire claim is that
+    its numbers can be trusted.
+    """
+    db = connect()
+    ensure_project(db, canonical_root())
+    rows = list(fixture_candidates(db))
+    explicit: list[sqlite3.Row] = []
+    for raw in (args.lesson or []):
+        try:
+            lid = parse_id(raw)
+        except ValueError:
+            print(f"Invalid lesson id: {raw}", file=sys.stderr)
+            return 2
+        row = db.execute("SELECT * FROM lessons WHERE id=?", (lid,)).fetchone()
+        if not row:
+            print(f"Lesson not found: {raw}", file=sys.stderr)
+            return 2
+        if row["status"] != "active":
+            print(f"ERR-{lid:04d} is already {row['status']}; skipping")
+            continue
+        if not any(r["id"] == lid for r in rows):
+            explicit.append(row)
+    targets = [(r, "controlled_test scaffolding from the automatic recovery path; "
+                   "a literal command pair, never operational knowledge") for r in rows]
+    targets += [(r, args.reason or "retired explicitly by operator review") for r in explicit]
+    if not targets:
+        print("No fixture lessons to retire.")
+        return 0
+    print(f"{'RETIRING' if args.apply else 'DRY RUN -- would retire'} {len(targets)} lesson(s):")
+    for row, reason in targets:
+        print(f"  ERR-{row['id']:04d}  scope={row['scope']:7} origin={row['origin']:15} "
+              f"source={row['source']}")
+        print(f"            {row['title']}")
+        print(f"            reason: {reason}")
+    if not args.apply:
+        print("\nNothing changed. Re-run with --apply to retire these.")
+        return 0
+    def write() -> None:
+        for row, reason in targets:
+            retire_lesson(db, row, reason)
+        db.commit()
+    with_retry(write, db)
+    counts = retired_fixture_counts(db)
+    print(f"\nRetired {len(targets)}. Rows preserved; guards deactivated; audit trail in lesson_retirements.")
+    print(f"  lessons ever:    {counts['lessons_ever']}")
+    print(f"  lessons active:  {counts['lessons_active']}")
+    print(f"  fixtures retired:{counts['fixtures_retired']}")
+    return 0
+
+
+def cmd_recall_audit(args: argparse.Namespace) -> int:
+    """Report the recall path on its own terms, never as a guard number."""
+    db = connect()
+    ensure_project(db, canonical_root())
+    m = recall_metrics(db)
+    print("RECALL AUDIT (measured separately from the guard experiment)\n")
+    print(f"deliveries total:          {m['deliveries_total']}")
+    print(f"  before the action:       {m['deliveries_before_action']}  (prompt / session-start)")
+    print(f"  after the action:        {m['deliveries_after_action']}  (failure hook -- cannot have prevented it)")
+    for phase, n in m["deliveries_by_phase"].items():
+        print(f"    {phase:16} {n}")
+    print(f"\nMISSED_RELEVANT_RECALL:    {m['missed_relevant_recall_total']} "
+          f"({m['missed_relevant_recall_natural']} natural)")
+    print("  a guard pattern proved a stored lesson applied to the action, and that")
+    print("  lesson had not been delivered in the session before the action ran.")
+    for row in m["missed_by_lesson"]:
+        print(f"    ERR-{row['lesson_id']:04d}  misses={row['misses']}  last={row['last']}")
+    print(f"\nrecall pool (what can be recalled at all):")
+    print(f"  eligible global:         {m['pool_eligible_global']}")
+    print(f"  eligible project:        {m['pool_eligible_project']}")
+    print(f"  excluded by auto source: {m['pool_excluded_auto_source']}  (never recallable at any k)")
+    print(f"\nbelow-cut sample rows:     {m['below_cut_sampled']}")
+    for scope, n in m["below_cut_by_scope"].items():
+        print(f"    {scope:16} {n}")
+    if not m["below_cut_sampled"]:
+        print("    none yet -- this instrumentation starts with 0.5.0, so the top-k")
+        print("    question has no data from before it. Do not read 0 as 'top-5 is fine'.")
+    return 0
+
+
 def cmd_ignore(args: argparse.Namespace) -> int:
     db = connect(); pid = ensure_project(db, canonical_root())
     try:
@@ -2163,7 +3158,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "runtime_version": (beacon or {}).get("version"),
             "runtime_matches_installed": (
                 (beacon or {}).get("version") == VERSION if beacon and beacon.get("version") else None),
-            "verdict_dataset": f"V{SHADOW_GENERATION} NATURAL USAGE ONLY",
+            "verdict_dataset": f"V{SHADOW_GENERATION} NATURAL USAGE, ALL PROJECTS, CAUSAL OUTCOMES ONLY",
             "verdict_scope": VERDICT_SCOPE_NOTE,
             "shadow_v2_baseline_snapshot": (lambda r: json.loads(r) if r else None)(
                 meta_get(db, "shadow_v2_baseline_snapshot")),
@@ -2288,26 +3283,75 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                  f"confirmed {m['v1_controlled_confirmed']}, refuted {m['v1_controlled_refuted']}")
         L.append("  every one of these rows is still in the database and still queryable")
         L.append("")
+    if m["shadow_v2_status"]:
+        L.append("SHADOW v2 -- CLOSED, PRESERVED, NOT A VERDICT")
+        L.append(f"  window:    {m['shadow_v2_started_at']} -> {m['shadow_v2_ended_at']}")
+        L.append(f"  status:    {m['shadow_v2_status']}")
+        L.append("             closed on MEASUREMENT grounds, before day 30, and deliberately:")
+        L.append("             a verdict from a defective instrument outlives the memory of the defect.")
+        L.append(f"  legacy series (what the v2 instrument recorded, untouched):")
+        L.append(f"             would_block {m['natural_would_block']}, "
+                 f"true_positive {m['shadow_verdict_confirmed']}, "
+                 f"false_positive {m['shadow_verdict_refuted']}  [project-scoped, which was the defect]")
+        for i, defect in enumerate(m["shadow_v2_defects"], 1):
+            L.append(f"  defect {i}:  {defect}")
+        L.append("  every one of these rows is still in the database, with its original outcome")
+        L.append("")
+    canon = m["canonical"]
+    ctrl = m["canonical_controlled"]
     L.append(f"SHADOW v{SHADOW_GENERATION} -- ACTIVE")
-    L.append(f"  baseline version: my-error {m['shadow_v2_baseline_version']}")
-    L.append(f"  start:            {m['shadow_v2_started_at'] or '(not stamped yet)'}")
+    L.append(f"  baseline version: my-error {m['shadow_v3_baseline_version']}")
+    L.append(f"  start:            {m['shadow_v3_started_at'] or '(not stamped yet)'}")
     L.append(f"  day:              {m['shadow_day']} of {SHADOW_EXPERIMENT_DAYS}"
              if m["shadow_day"] is not None else "  day:              (not started)")
     L.append("")
-    L.append("  Natural usage (THE verdict dataset):")
-    L.append(f"    would_block: {m['natural_would_block']}")
-    L.append(f"    confirmed: {m['shadow_verdict_confirmed']}")
-    L.append(f"    refuted: {m['shadow_verdict_refuted']}")
-    L.append(f"    pending: {m['shadow_verdict_pending']}")
+    L.append("  Natural usage, CANONICAL dataset (THE verdict dataset):")
+    L.append("    all projects. Not filtered by cwd -- this block is identical from any directory.")
+    L.append(f"    would_block:          {canon['would_block']}")
+    L.append(f"    causally_confirmed:   {canon['causally_confirmed']}")
+    L.append(f"    causally_refuted:     {canon['causally_refuted']}")
+    L.append(f"    unverified:           {canon['unverified']}   (cause not establishable; NOT a confirmation)")
+    L.append(f"    pending:              {canon['pending']}")
+    L.append(f"    missed_relevant_recall: {canon['missed_relevant_recall']}   (recall metric, NOT in the verdict)")
+    if canon["by_project"]:
+        L.append("")
+        L.append("    per project (a reported dimension, never a filter on the verdict):")
+        for row in canon["by_project"]:
+            L.append(f"      {row['project']}: would_block {row['would_block']}, "
+                     f"confirmed {row['confirmed']}, refuted {row['refuted']}, unverified {row['unverified']}")
+    if canon["by_guard_class"]:
+        L.append("")
+        L.append("    per guard class (which observable decides each one):")
+        for row in canon["by_guard_class"]:
+            note = "" if row["guard_class"] in GUARD_CLASSES_OBSERVABLE else "  <- harm not observable here"
+            L.append(f"      {row['guard_class']}: events {row['events']}, confirmed {row['confirmed']}, "
+                     f"refuted {row['refuted']}, unverified {row['unverified']}{note}")
     L.append("")
     L.append("  Controlled tests in this window (EXCLUDED from the verdict):")
-    L.append(f"    would_block: {m['controlled_would_block']}")
-    L.append(f"    confirmed: {m['controlled_confirmed']}")
-    L.append(f"    refuted: {m['controlled_refuted']}")
+    L.append(f"    would_block: {ctrl['would_block']}, confirmed: {ctrl['causally_confirmed']}, "
+             f"refuted: {ctrl['causally_refuted']}, unverified: {ctrl['unverified']}")
     L.append("")
     L.append("Verdict dataset:")
-    L.append(f"  V{SHADOW_GENERATION} NATURAL USAGE ONLY")
-    L.append("  excluded: controlled_test, v1 natural usage, anything before the baseline")
+    L.append(f"  V{SHADOW_GENERATION} NATURAL USAGE, ALL PROJECTS, CAUSAL OUTCOMES ONLY")
+    L.append("  excluded: controlled_test, v1 and v2 rows, and anything whose cause is unverified")
+    L.append("")
+    rc = m["recall"]
+    kn = m["knowledge"]
+    L.append("Recall path (measured separately; never feeds the guard verdict)")
+    L.append(f"  deliveries before the action: {rc['deliveries_before_action']}  (prompt / session-start)")
+    L.append(f"  deliveries after the action:  {rc['deliveries_after_action']}  (failure hook; prevents nothing)")
+    L.append(f"  MISSED_RELEVANT_RECALL:      {rc['missed_relevant_recall_total']} "
+             f"({rc['missed_relevant_recall_natural']} natural)")
+    L.append("    a guard pattern proved the lesson applied, and it was not in context beforehand")
+    L.append(f"  recall pool: {rc['pool_eligible_global']} global + {rc['pool_eligible_project']} project eligible; "
+             f"{rc['pool_excluded_auto_source']} excluded by auto source (unrecallable at ANY k)")
+    L.append(f"  below-cut sample rows:        {rc['below_cut_sampled']}"
+             + ("" if rc["below_cut_sampled"] else "   (instrumentation starts in 0.5.0; 0 is no evidence)"))
+    L.append("")
+    L.append("Knowledge store (historical total is NOT a measure of useful knowledge)")
+    L.append(f"  lessons ever recorded:  {kn['lessons_ever']}")
+    L.append(f"  lessons active:         {kn['lessons_active']}")
+    L.append(f"  fixtures retired:       {kn['fixtures_retired']}")
     if origin_backfilled_at:
         L.append("")
         L.append(f"Origin migration:   pre-existing rows backfilled as controlled_test at {origin_backfilled_at}")
@@ -2334,7 +3378,18 @@ def build_parser() -> argparse.ArgumentParser:
     l.add_argument("--scope-reason", default="", help="Why that scope. Recorded with the lesson.")
     l.add_argument("--tags", default="")
     l.add_argument("--guard-tool", choices=["Bash","Write","Edit"]); l.add_argument("--guard-field")
-    l.add_argument("--guard-match", choices=["exact","contains","regex"], default="exact"); l.add_argument("--guard-pattern")
+    # `shell_cmd` is the right choice for any pattern naming a command: it fires
+    # only where the shell would run it, never on the same text quoted inside a
+    # heredoc, a rule body or a payload for another interpreter.
+    l.add_argument("--guard-match", choices=list(MATCH_TYPES), default="exact")
+    l.add_argument("--guard-pattern")
+    l.add_argument("--guard-class", choices=list(GUARD_CLASSES), default=GUARD_CLASS_EXECUTION,
+                   help="Which observable decides this guard's prediction. `execution_error` when the "
+                        "harm IS the command failing; `side_effect` when it exits 0 and damages state; "
+                        "`destructive` when the effect is irreversible.")
+    l.add_argument("--confirm-evidence",
+                   help="Regex over the failure output that PROVES the predicted harm occurred. "
+                        "Without it a failure can only ever be unverified, never confirmed.")
     l.add_argument("--replacement"); l.add_argument("--guard-reason"); l.add_argument("--guard-ttl-days", type=int, default=0)
     l.add_argument("--origin", choices=sorted(VALID_ORIGINS),
                     help="Explicit, temporary override for the SHADOW experiment population. "
@@ -2353,6 +3408,15 @@ def build_parser() -> argparse.ArgumentParser:
     dd = sub.add_parser("datadir"); dd.add_argument("--compact", action="store_true"); dd.set_defaults(func=cmd_datadir)
     mt = sub.add_parser("metrics"); mt.add_argument("--compact", action="store_true"); mt.set_defaults(func=cmd_metrics)
     md = sub.add_parser("mode"); md.add_argument("--set"); md.set_defaults(func=cmd_mode)
+    rf = sub.add_parser("retire-fixtures",
+                        help="Retire controlled-test scaffolding lessons, preserving rows and audit trail.")
+    rf.add_argument("--apply", action="store_true", help="Actually retire. Without it, dry run.")
+    rf.add_argument("--lesson", action="append",
+                    help="Additionally retire this lesson by id (ERR-0010 or 10). Repeatable.")
+    rf.add_argument("--reason", default="", help="Reason recorded for --lesson targets.")
+    rf.set_defaults(func=cmd_retire_fixtures)
+    ra = sub.add_parser("recall-audit", help="Report the recall path, including missed_relevant_recall.")
+    ra.set_defaults(func=cmd_recall_audit)
     return p
 
 

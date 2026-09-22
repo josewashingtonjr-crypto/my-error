@@ -1,4 +1,4 @@
-> **Generations:** the verdict population is now scoped to SHADOW **v2** (natural usage on or after `meta.shadow_v2_started_at`). v1 is closed as `INCONCLUSIVE_DUE_TO_MATERIAL_SYSTEM_CHANGES`, preserved in full, and excluded from the verdict. See [SHADOW-V2.md](SHADOW-V2.md).
+> **Generations:** the verdict population is the CANONICAL v3 dataset — natural usage stamped `experiment = v3`, **across all projects**, judged by `causal_outcome` rather than by an exit code. `project_id` is a reported dimension, never a filter: a verdict that changes when you `cd` was defect #1 of v2. v1 is closed as `INCONCLUSIVE_DUE_TO_MATERIAL_SYSTEM_CHANGES` and v2 as `INCONCLUSIVE_DUE_TO_MEASUREMENT_DEFECTS`; both are preserved in full and excluded from the verdict by their `experiment` stamp. `missed_relevant_recall` measures the recall path and never feeds the guard verdict. See [SHADOW-V3.md](SHADOW-V3.md).
 
 # Metrics
 

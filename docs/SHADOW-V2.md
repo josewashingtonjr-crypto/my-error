@@ -1,5 +1,13 @@
 # SHADOW v2
 
+> **CLOSED 2026-09-22, day 19 of 30, as `INCONCLUSIVE_DUE_TO_MEASUREMENT_DEFECTS`.**
+> Not a success and not a failure: four defects in the *instrument* meant the
+> verdict this window would have produced could not have been supported. The
+> reasons, and what replaced them, are in [SHADOW-V3.md](SHADOW-V3.md).
+> Every v2 row is preserved with its original `outcome`, excluded from the v3
+> verdict by its `experiment` stamp rather than by deletion.
+> The rest of this page describes v2 as it ran, and is history.
+
 ## Why v1 was closed instead of extended
 
 SHADOW v1 ran **2026-08-18T14:24:26Z → 2026-09-02**. Its final status is:

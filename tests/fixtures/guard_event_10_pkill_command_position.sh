@@ -1,0 +1,1 @@
+cd /tmp/scratchpad && cp planilha.ods planilha.xlsx /tmp/destino/ && ls -la /tmp/destino/planilha.* && pkill -f "port=2202" ; echo "listener encerrado"

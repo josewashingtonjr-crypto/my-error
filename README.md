@@ -12,7 +12,7 @@ verifiable. That path is the *cheapest* source of evidence, not the definition o
 A logic defect, a wrong assumption, a badly sized task or an unsafe judgment produces no
 failing command and is recorded deliberately, through the same verification bar.
 
-> ### ⚠️ EXPERIMENTAL — v0.4.4
+> ### ⚠️ EXPERIMENTAL — v0.5.0
 >
 > Ships in **SHADOW mode**: the guard records what it *would* have blocked and **blocks
 > nothing**. The automatic guard is on a 30-day probation while its real base rate is
@@ -111,15 +111,35 @@ the behaviour it is measuring.
 
 ## The experiment
 
-The automatic guard is on probation. The decision rule was fixed **before any data
-existed**, and lives in the code as a constant marked `DO NOT EDIT BEFORE 2026-09-17`:
+The automatic guard is on probation. This is **SHADOW v3**; v1 and v2 are both closed as
+inconclusive and preserved in full. v2 was closed early, on day 19, because its instrument
+could not support the verdict it was about to produce — see [docs/SHADOW-V3.md](docs/SHADOW-V3.md).
+
+The rule is fixed before any v3 data exists, and reads the **canonical dataset**: natural
+usage, all projects, judged by cause rather than by exit code.
 
 | Outcome | Verdict |
 |---|---|
-| `predictions_confirmed == 0` | **REMOVE** the auto-guard from the codebase |
-| `refuted > confirmed` | **REMOVE** |
+| `unverified > 2x(confirmed + refuted)` | **INSTRUMENT_INSUFFICIENT** — no guard verdict |
+| `confirmed == 0` and `refuted == 0` | **EXTEND** — absence of evidence |
+| `causally_confirmed == 0` | **REMOVE** the auto-guard from the codebase |
+| `causally_refuted > causally_confirmed` | **REMOVE** |
 | `confirmed >= 3` and `refuted == 0` | **PROMOTE** to ENFORCE |
 | anything else | **EXTEND** another 30 days |
+
+Three properties the rule depends on:
+
+- **The verdict cannot depend on your working directory.** Counting was filtered by project
+  in v2, which made the same database answer EXTEND from one directory and REMOVE from
+  another. A test now runs the doctor from two project directories and requires an identical
+  verdict.
+- **A failed command is not a confirmation.** A guard is confirmed only when the failure is
+  tied to the harm it predicted; otherwise the row is `unverified`, never a confirmation.
+- **The instrument is judged before the guard.** If most firings could not be tied to an
+  outcome either way, the honest report is that we still cannot measure.
+
+`missed_relevant_recall` — a lesson a guard proved was relevant, absent from context before
+the action — is measured and reported **separately**, and never feeds this verdict.
 
 `doctor` computes the verdict itself and refuses to state one before day 30. The rule is
 written down in advance precisely so that the numbers cannot be argued with after the fact.
@@ -157,7 +177,7 @@ the plugin is healthy.
 cross-project recalls:
 
 ```
-▊ sua barra atual  │  🧠 ME ✅ 0.4.4 · SHADOW · L8 · X2
+▊ sua barra atual  │  🧠 ME ✅ 0.5.0 · SHADOW · L8 · X2
 ```
 
 Claude Code runs exactly one `statusLine` command, so if you already have a bar this

@@ -20,7 +20,7 @@ def me_version() -> str:
 
 
 # Bumped with SCHEMA_VERSION in my_error.py; named so a schema bump touches one line.
-SCHEMA_VERSION_EXPECTED = 5
+SCHEMA_VERSION_EXPECTED = 6
 
 
 class MyErrorTest(unittest.TestCase):
@@ -88,10 +88,19 @@ class MyErrorTest(unittest.TestCase):
         return out1, out2
 
     def confirm_prediction(self, bad, sid, origin=None, mode="SHADOW"):
-        """Guard fires, then the same command fails again: a confirmed prediction."""
+        """Guard fires, then the same command fails again: a confirmed prediction.
+
+        The error text must NAME the failing command, because from 0.5.0 that is
+        what a confirmation means: a failure whose output cannot be tied to the
+        guarded pattern is `unverified`, not a confirmation. The old fixture used
+        a generic "same failure again", which under the causal model is exactly
+        the correlation-without-causation case -- see
+        `test_generic_failure_is_unverified_not_confirmed`.
+        """
         repeat = {"session_id": sid, "cwd": str(self.project), "tool_name": "Bash", "tool_input": {"command": bad}}
         self.hook("guard", repeat, mode=mode, origin=origin)
-        self.hook("failure", {**repeat, "error": "same failure again", "is_interrupt": False}, mode=mode, origin=origin)
+        self.hook("failure", {**repeat, "error": f"{bad}: same failure again", "is_interrupt": False},
+                  mode=mode, origin=origin)
 
     def refute_prediction(self, bad, sid, origin=None, mode="SHADOW"):
         """Guard fires, then the same command succeeds: a refuted (false-positive) prediction."""
@@ -770,8 +779,8 @@ class MyErrorTest(unittest.TestCase):
         m = self.metrics()
         self.assertEqual(m["predictions_confirmed_total"], 1)
         self.assertEqual(m["predictions_refuted_total"], 0)
-        self.assertEqual(m["shadow_verdict_confirmed"], 1)   # natural_usage by default
-        self.assertEqual(m["shadow_verdict_refuted"], 0)
+        self.assertEqual(m["canonical"]["causally_confirmed"], 1)   # natural_usage by default
+        self.assertEqual(m["canonical"]["causally_refuted"], 0)
 
     def test_shadow_measures_a_false_positive(self):
         """The point of SHADOW: a guard that lets a command run and sees it
@@ -784,8 +793,8 @@ class MyErrorTest(unittest.TestCase):
         m = self.metrics()
         self.assertEqual(m["predictions_refuted_total"], 1)
         self.assertEqual(m["predictions_confirmed_total"], 0)
-        self.assertEqual(m["shadow_verdict_refuted"], 1)     # natural_usage by default
-        self.assertEqual(m["shadow_verdict_confirmed"], 0)
+        self.assertEqual(m["canonical"]["causally_refuted"], 1)     # natural_usage by default
+        self.assertEqual(m["canonical"]["causally_confirmed"], 0)
 
     def test_enforce_blocks_and_is_counted_separately(self):
         self.train_pair("git sttaus", "git: 'sttaus' is not a git command.", "git status")
@@ -1025,16 +1034,16 @@ class MyErrorTest(unittest.TestCase):
                              f"git status{i}", sid=sid, origin="controlled_test")
             self.confirm_prediction(f"git sttaus{i}", sid=sid, origin="controlled_test")
         m = self.metrics()
-        self.assertEqual(m["shadow_verdict_confirmed"], 0)
-        self.assertEqual(m["controlled_confirmed"], 5)
+        self.assertEqual(m["canonical"]["causally_confirmed"], 0)
+        self.assertEqual(m["canonical_controlled"]["causally_confirmed"], 5)
         self.assertEqual(m["predictions_confirmed_total"], 5)
 
     def test_B_natural_prediction_counts(self):
         self.train_pair("git sttaus", "git: 'sttaus' is not a git command.", "git status", sid="orig-b0")
         self.confirm_prediction("git sttaus", sid="orig-b0")  # no marker => natural_usage
         m = self.metrics()
-        self.assertEqual(m["shadow_verdict_confirmed"], 1)
-        self.assertEqual(m["controlled_confirmed"], 0)
+        self.assertEqual(m["canonical"]["causally_confirmed"], 1)
+        self.assertEqual(m["canonical_controlled"]["causally_confirmed"], 0)
 
     def test_C_mixed_population_verdict_sees_natural_only(self):
         for i in range(6):
@@ -1048,8 +1057,8 @@ class MyErrorTest(unittest.TestCase):
                              f"npm run build{i}", sid=sid)
             self.confirm_prediction(f"npm run buil{i}", sid=sid)
         m = self.metrics()
-        self.assertEqual(m["shadow_verdict_confirmed"], 2)         # not 8
-        self.assertEqual(m["controlled_confirmed"], 6)
+        self.assertEqual(m["canonical"]["causally_confirmed"], 2)         # not 8
+        self.assertEqual(m["canonical_controlled"]["causally_confirmed"], 6)
         self.assertEqual(m["predictions_confirmed_total"], 8)
 
     def test_D_controlled_refuted_does_not_contaminate_natural_population(self):
@@ -1060,13 +1069,13 @@ class MyErrorTest(unittest.TestCase):
             self.refute_prediction(f"git sttaus{i}", sid=sid, origin="controlled_test")
         m = self.metrics()
         # The 10 controlled false positives are real and recorded...
-        self.assertEqual(m["controlled_refuted"], 10)
+        self.assertEqual(m["canonical_controlled"]["causally_refuted"], 10)
         self.assertEqual(m["predictions_refuted_total"], 10)
         # ...but the natural population -- what REMOVE (refuted > confirmed)
         # actually reads -- stays exactly empty. Controlled data cannot trip
         # that rule for a population it never touched.
-        self.assertEqual(m["shadow_verdict_refuted"], 0)
-        self.assertEqual(m["shadow_verdict_confirmed"], 0)
+        self.assertEqual(m["canonical"]["causally_refuted"], 0)
+        self.assertEqual(m["canonical"]["causally_confirmed"], 0)
 
     def test_E_propagation_controlled_candidate_flows_to_guard_and_prediction(self):
         self.train_pair("git sttaus", "git: 'sttaus' is not a git command.", "git status",
@@ -1083,8 +1092,8 @@ class MyErrorTest(unittest.TestCase):
         self.assertEqual(guard_origin, "controlled_test")
         self.confirm_prediction("git sttaus", sid="orig-e0", origin="controlled_test")
         m = self.metrics()
-        self.assertEqual(m["controlled_confirmed"], 1)
-        self.assertEqual(m["shadow_verdict_confirmed"], 0)
+        self.assertEqual(m["canonical_controlled"]["causally_confirmed"], 1)
+        self.assertEqual(m["canonical"]["causally_confirmed"], 0)
 
     def test_F_default_without_marker_is_natural_usage(self):
         self.train_pair("npm run buil", "Exit code 1\nnpm ERR! Missing script: buil", "npm run build",
@@ -1121,7 +1130,12 @@ class MyErrorTest(unittest.TestCase):
 
     def test_doctor_reports_verdict_dataset_is_natural_only(self):
         d = json.loads(self.run_cli("doctor", "--json").stdout)
-        self.assertEqual(d["verdict_dataset"], "V2 NATURAL USAGE ONLY")
+        self.assertEqual(d["verdict_dataset"],
+                         "V3 NATURAL USAGE, ALL PROJECTS, CAUSAL OUTCOMES ONLY")
+        self.assertIn("canonical", d)
+        self.assertIn("canonical_controlled", d)
+        # The legacy v2 series stays exposed: closing a generation must not make
+        # its numbers unreadable, only non-authoritative.
         self.assertIn("shadow_verdict_confirmed", d)
         self.assertIn("controlled_confirmed", d)
 
@@ -1494,24 +1508,52 @@ class ShadowGenerationTest(unittest.TestCase):
         finally:
             db.close()
 
-    def _event(self, created_at, origin, outcome, mode="SHADOW"):
-        """Insert one guard_event with an explicit timestamp and provenance."""
+    def _event(self, created_at, origin, outcome, mode="SHADOW", experiment=None,
+               causal=None, project=None, guard_class="execution_error"):
+        """Insert one guard_event with an explicit timestamp and provenance.
+
+        `experiment` and `causal` are explicit because the v3 verdict selects on
+        them rather than on a timestamp comparison. Passing them keeps each test
+        honest about which generation and which causal claim it is asserting.
+        """
         db = self._db()
         try:
-            pid = db.execute("select id from projects limit 1").fetchone()
-            if not pid:
-                db.execute("insert into projects(id,root,created_at,last_seen,kind) "
-                           "values('p1',?,?,?,'path')",
-                           (str(self.project), created_at, created_at))
-                pid = ("p1",)
+            if project:
+                db.execute("insert or ignore into projects(id,root,created_at,last_seen,kind) "
+                           "values(?,?,?,?,'path')",
+                           (project, f"{self.project}-{project}", created_at, created_at))
+                pid = (project,)
+            else:
+                pid = db.execute("select id from projects limit 1").fetchone()
+                if not pid:
+                    db.execute("insert into projects(id,root,created_at,last_seen,kind) "
+                               "values('p1',?,?,?,'path')",
+                               (str(self.project), created_at, created_at))
+                    pid = ("p1",)
+            if experiment is None:
+                experiment = "v3" if created_at >= "2026-09-22" else (
+                    "v2" if created_at >= "2026-09-02" else "v1")
+            if causal is None:
+                # Rows from a closed generation default to not_evaluated, which is
+                # what they actually are: recorded before the causal model existed.
+                # Only a v3 row gets a causal verdict by default.
+                causal = "not_evaluated" if experiment != "v3" else {
+                    "true_positive": "causally_confirmed",
+                    "false_positive": "causally_refuted"}.get(outcome, "unverified")
             db.execute(
                 "insert into guard_events(guard_id,lesson_id,project_id,session_id,tool_name,"
-                "action,mode,created_at,outcome,origin) values(1,1,?,'s','Bash','cmd',?,?,?,?)",
-                (pid[0], mode, created_at, outcome, origin))
+                "action,mode,created_at,outcome,origin,experiment,causal_outcome,guard_class) "
+                "values(1,1,?,'s','Bash','cmd',?,?,?,?,?,?,?)",
+                (pid[0], mode, created_at, outcome, origin, experiment, causal, guard_class))
             db.commit()
             return pid[0]
         finally:
             db.close()
+
+    def _open_v3(self, at="2026-09-22T00:00:00+00:00"):
+        """Force a known v3 boundary so the window is deterministic."""
+        self._set_meta("shadow_v3_started_at", at)
+        return at
 
     def _doctor(self):
         p = self.run_cli("doctor", "--json")
@@ -1524,77 +1566,105 @@ class ShadowGenerationTest(unittest.TestCase):
         return at
 
     # --- A ---------------------------------------------------------------
-    def test_A_v1_data_never_enters_the_v2_verdict(self):
-        self._bootstrap()
-        v2 = self._open_v2()
-        # natural v1 rows: real natural usage, but from the previous generation
-        self._event("2026-08-20T10:00:00+00:00", "natural_usage", "true_positive")
-        self._event("2026-08-21T10:00:00+00:00", "natural_usage", "false_positive")
-        d = self._doctor()
-        self.assertEqual(d["shadow_verdict_confirmed"], 0,
-                         "a v1 true_positive leaked into the v2 verdict")
-        self.assertEqual(d["shadow_verdict_refuted"], 0,
-                         "a v1 false_positive leaked into the v2 verdict")
-        self.assertEqual(d["shadow_v2_started_at"], v2)
-
-    # --- B ---------------------------------------------------------------
-    def test_B_controlled_tests_in_the_v2_window_are_excluded(self):
+    def test_A_v1_and_v2_data_never_enter_the_v3_verdict(self):
         self._bootstrap()
         self._open_v2()
-        self._event("2026-09-05T10:00:00+00:00", "controlled_test", "true_positive")
-        self._event("2026-09-06T10:00:00+00:00", "controlled_test", "true_positive")
+        v3 = self._open_v3()
+        # real natural usage, but from the two closed generations
+        self._event("2026-08-20T10:00:00+00:00", "natural_usage", "true_positive", experiment="v1")
+        self._event("2026-09-05T10:00:00+00:00", "natural_usage", "true_positive", experiment="v2")
+        self._event("2026-09-06T10:00:00+00:00", "natural_usage", "false_positive", experiment="v2")
         d = self._doctor()
-        self.assertEqual(d["shadow_verdict_confirmed"], 0,
+        canon = d["canonical"]
+        self.assertEqual(canon["causally_confirmed"], 0,
+                         "a closed generation's confirmation leaked into the v3 verdict")
+        self.assertEqual(canon["causally_refuted"], 0,
+                         "a closed generation's refutation leaked into the v3 verdict")
+        self.assertEqual(d["shadow_v3_started_at"], v3)
+
+    # --- B ---------------------------------------------------------------
+    def test_B_controlled_tests_in_the_v3_window_are_excluded(self):
+        self._bootstrap()
+        self._open_v3()
+        self._event("2026-09-25T10:00:00+00:00", "controlled_test", "true_positive", experiment="v3")
+        self._event("2026-09-26T10:00:00+00:00", "controlled_test", "true_positive", experiment="v3")
+        d = self._doctor()
+        self.assertEqual(d["canonical"]["causally_confirmed"], 0,
                          "controlled_test reached the verdict")
         # ...but they are reported, not hidden: exclusion must be auditable.
-        self.assertEqual(d["controlled_confirmed"], 2)
+        self.assertEqual(d["canonical_controlled"]["causally_confirmed"], 2)
 
     # --- C ---------------------------------------------------------------
-    def test_C_natural_usage_before_v2_start_is_excluded(self):
+    def test_C_a_closed_generations_row_is_excluded_but_still_counted(self):
+        """Exclusion from the verdict must never mean disappearance."""
         self._bootstrap()
         self._open_v2("2026-09-02T12:00:00+00:00")
-        # one second before the boundary
-        self._event("2026-09-02T11:59:59+00:00", "natural_usage", "true_positive")
+        self._open_v3("2026-09-22T00:00:00+00:00")
+        # A real natural confirmation, but recorded under v2's instrument.
+        self._event("2026-09-21T23:59:59+00:00", "natural_usage", "true_positive", experiment="v2")
         d = self._doctor()
-        self.assertEqual(d["shadow_verdict_confirmed"], 0)
-        self.assertEqual(d["v1_natural_confirmed"], 1, "the row must still be counted under v1")
+        self.assertEqual(d["canonical"]["causally_confirmed"], 0,
+                         "a v2 row reached the v3 verdict")
+        self.assertEqual(d["shadow_verdict_confirmed"], 1,
+                         "the row must still be readable under the legacy v2 series")
 
     # --- D ---------------------------------------------------------------
-    def test_D_natural_usage_after_v2_start_is_counted(self):
+    def test_D_natural_usage_in_v3_is_counted_by_causal_outcome(self):
         self._bootstrap()
-        self._open_v2("2026-09-02T12:00:00+00:00")
-        self._event("2026-09-02T12:00:00+00:00", "natural_usage", "true_positive")  # inclusive
-        self._event("2026-09-03T09:00:00+00:00", "natural_usage", "true_positive")
-        self._event("2026-09-04T09:00:00+00:00", "natural_usage", "false_positive")
+        self._open_v3()
+        self._event("2026-09-23T09:00:00+00:00", "natural_usage", "true_positive",
+                    experiment="v3", causal="causally_confirmed")
+        self._event("2026-09-23T10:00:00+00:00", "natural_usage", "true_positive",
+                    experiment="v3", causal="causally_confirmed")
+        self._event("2026-09-24T09:00:00+00:00", "natural_usage", "false_positive",
+                    experiment="v3", causal="causally_refuted")
+        # A command that failed, but not for the guarded reason. The v2 instrument
+        # would have scored this a confirmation; v3 must not.
+        self._event("2026-09-24T10:00:00+00:00", "natural_usage", "true_positive",
+                    experiment="v3", causal="unverified")
         d = self._doctor()
-        self.assertEqual(d["shadow_verdict_confirmed"], 2)
-        self.assertEqual(d["shadow_verdict_refuted"], 1)
+        canon = d["canonical"]
+        self.assertEqual(canon["causally_confirmed"], 2)
+        self.assertEqual(canon["causally_refuted"], 1)
+        self.assertEqual(canon["unverified"], 1,
+                         "an unverified failure was counted as evidence")
 
     # --- E ---------------------------------------------------------------
-    def test_E_doctor_reports_v1_and_v2_separately(self):
+    def test_E_doctor_reports_all_three_generations_separately(self):
         self._bootstrap()
         self._set_meta("shadow_started_at", "2026-08-18T14:24:26+00:00")
         self._set_meta("shadow_v1_started_at", "2026-08-18T14:24:26+00:00")
         self._set_meta("shadow_v1_ended_at", "2026-09-02T00:00:00+00:00")
         self._set_meta("shadow_v1_status", "INCONCLUSIVE_DUE_TO_MATERIAL_SYSTEM_CHANGES")
         self._open_v2()
-        self._event("2026-08-20T10:00:00+00:00", "natural_usage", "true_positive")
-        self._event("2026-09-05T10:00:00+00:00", "natural_usage", "true_positive")
+        self._set_meta("shadow_v2_ended_at", "2026-09-22T00:00:00+00:00")
+        self._set_meta("shadow_v2_status", "INCONCLUSIVE_DUE_TO_MEASUREMENT_DEFECTS")
+        self._open_v3()
+        self._event("2026-08-20T10:00:00+00:00", "natural_usage", "true_positive", experiment="v1")
+        self._event("2026-09-05T10:00:00+00:00", "natural_usage", "true_positive", experiment="v2")
+        self._event("2026-09-25T10:00:00+00:00", "natural_usage", "true_positive", experiment="v3")
         d = self._doctor()
         self.assertEqual(d["v1_natural_confirmed"], 1)
-        self.assertEqual(d["shadow_verdict_confirmed"], 1)
+        self.assertEqual(d["canonical"]["causally_confirmed"], 1,
+                         "only the v3 row may reach the canonical dataset")
         self.assertEqual(d["shadow_v1_status"], "INCONCLUSIVE_DUE_TO_MATERIAL_SYSTEM_CHANGES")
+        self.assertEqual(d["shadow_v2_status"], "INCONCLUSIVE_DUE_TO_MEASUREMENT_DEFECTS")
         p = self.run_cli("doctor")
         self.assertEqual(p.returncode, 0, p.stderr)
         out = p.stdout
         self.assertIn("SHADOW v1 -- CLOSED, PRESERVED, NOT A VERDICT", out)
-        self.assertIn("SHADOW v2 -- ACTIVE", out)
-        self.assertIn("V2 NATURAL USAGE ONLY", out)
+        self.assertIn("SHADOW v2 -- CLOSED, PRESERVED, NOT A VERDICT", out)
+        self.assertIn("SHADOW v3 -- ACTIVE", out)
+        self.assertIn("V3 NATURAL USAGE, ALL PROJECTS, CAUSAL OUTCOMES ONLY", out)
         # the scope of the verdict must be stated, not implied
         self.assertIn("does not judge the value of my-error as a whole", out)
-        # v1 must be labelled neither success nor failure
-        self.assertNotIn("v1: SUCCESS", out)
-        self.assertNotIn("v1: FAILURE", out)
+        # neither closed generation may be labelled a success or a failure
+        for gen in ("v1", "v2"):
+            self.assertNotIn(f"{gen}: SUCCESS", out)
+            self.assertNotIn(f"{gen}: FAILURE", out)
+        # the recall metric must be reported, and reported apart from the verdict
+        self.assertIn("MISSED_RELEVANT_RECALL", out)
+        self.assertIn("recall metric, NOT in the verdict", out)
 
     # --- F ---------------------------------------------------------------
     def test_F_precommitted_rule_is_byte_identical(self):
@@ -1610,16 +1680,29 @@ class ShadowGenerationTest(unittest.TestCase):
             self.assertEqual(me.SHADOW_EXPERIMENT_DAYS, 30)
             self.assertEqual(me.SHADOW_PROMOTE_THRESHOLD, 3)
             day = me.SHADOW_EXPERIMENT_DAYS
-            v = lambda c, r: me.shadow_verdict(  # noqa: E731
-                {"shadow_verdict_confirmed": c, "shadow_verdict_refuted": r, "shadow_day": day})[0]
-            self.assertEqual(v(0, 0), "REMOVE")
+            # u=0 keeps these cases on the guard branch. The instrument branch is
+            # exercised separately below, because it must PRE-EMPT a guard verdict.
+            v = lambda c, r, u=0: me.shadow_verdict(  # noqa: E731
+                {"canonical": {"causally_confirmed": c, "causally_refuted": r, "unverified": u},
+                 "shadow_day": day})[0]
             self.assertEqual(v(0, 5), "REMOVE")
             self.assertEqual(v(2, 3), "REMOVE")
             self.assertEqual(v(3, 0), "PROMOTE")
             self.assertEqual(v(2, 0), "EXTEND")
             self.assertEqual(v(5, 1), "EXTEND")
+            # v3 addition: no causally decided firing is NOT a removal. v2 read
+            # zero-confirmed as "the mechanism has no base rate", but with a causal
+            # model zero-and-zero means the guard never fired decisively at all,
+            # which is an absence of evidence rather than evidence of absence.
+            self.assertEqual(v(0, 0), "EXTEND")
+            # v3 addition: the instrument is judged before the guard.
+            self.assertEqual(v(1, 0, 10), me.VERDICT_INSTRUMENT)
+            self.assertEqual(v(0, 0, 4), me.VERDICT_INSTRUMENT)
+            # ...but a decisive majority still yields a guard verdict.
+            self.assertEqual(v(6, 0, 2), "PROMOTE")
             self.assertEqual(
-                me.shadow_verdict({"shadow_verdict_confirmed": 9, "shadow_verdict_refuted": 0,
+                me.shadow_verdict({"canonical": {"causally_confirmed": 9, "causally_refuted": 0,
+                                                 "unverified": 0},
                                    "shadow_day": day - 1})[0], "RUNNING")
         finally:
             sys.path.remove(str(ROOT / "scripts"))
@@ -1642,12 +1725,18 @@ class ShadowGenerationTest(unittest.TestCase):
             db.commit()
         finally:
             db.close()
-        self._doctor()   # triggers ensure_schema -> migrate to 5
+        self._doctor()   # triggers ensure_schema -> migrate to 6
         db = self._db()
         try:
             after = db.execute(
                 "select id,created_at,origin,outcome from guard_events order by id").fetchall()
-            self.assertEqual(int(db.execute("PRAGMA user_version").fetchone()[0]), 5)
+            self.assertEqual(int(db.execute("PRAGMA user_version").fetchone()[0]), 6)
+            # The causal column must NOT be backfilled as if these rows had been
+            # evaluated under a model that did not exist when they were recorded.
+            evaluated = db.execute(
+                "select count(*) from guard_events where causal_outcome<>'not_evaluated'").fetchone()[0]
+            self.assertEqual(evaluated, 0,
+                             "pre-v3 rows were retroactively given a causal verdict")
         finally:
             db.close()
         self.assertEqual(before, after, "the generation migration rewrote or dropped history")
@@ -1672,7 +1761,8 @@ class ShadowGenerationTest(unittest.TestCase):
         self.assertEqual(d["shadow_verdict_confirmed"], 0)
         self.assertIsNone(d["shadow_v2_started_at"])
 
-    def test_migration_stamps_v1_closure_and_v2_start(self):
+    def test_migration_stamps_every_generation_boundary(self):
+        """v1 closed, v2 closed on measurement grounds, v3 opened -- in one pass."""
         self._bootstrap()
         db = self._db()
         try:
@@ -1689,15 +1779,549 @@ class ShadowGenerationTest(unittest.TestCase):
                          "INCONCLUSIVE_DUE_TO_MATERIAL_SYSTEM_CHANGES")
         self.assertIsNotNone(self._meta("shadow_v2_started_at"))
         self.assertEqual(self._meta("shadow_v2_baseline_version"), "0.4.4")
-        snap = json.loads(self._meta("shadow_v2_baseline_snapshot"))
-        self.assertEqual(snap["baseline_version"], "0.4.4")
-        self.assertEqual(snap["schema_version"], 5)
+        # v2 is closed, and closed for measurement reasons, with the reasons stored
+        # rather than left to a commit message.
+        self.assertIsNotNone(self._meta("shadow_v2_ended_at"))
+        self.assertEqual(self._meta("shadow_v2_status"),
+                         "INCONCLUSIVE_DUE_TO_MEASUREMENT_DEFECTS")
+        defects = json.loads(self._meta("shadow_v2_defects"))
+        self.assertGreaterEqual(len(defects), 4, "every closure reason must be recorded")
+        self.assertTrue(any("project_id" in d for d in defects))
+        self.assertTrue(any("caused by" in d for d in defects))
+        # v3 is open, with its own baseline.
+        self.assertIsNotNone(self._meta("shadow_v3_started_at"))
+        self.assertEqual(self._meta("shadow_v3_baseline_version"), "0.4.5")
+        snap = json.loads(self._meta("shadow_v3_baseline_snapshot"))
+        self.assertEqual(snap["schema_version"], 6)
         self.assertIn("cross_project_recalls", snap)
 
-    def test_fresh_database_has_no_v1_to_close(self):
-        """A new install starts at v2 without inventing a v1 that never ran."""
+    def test_fresh_database_has_no_closed_generation_to_report(self):
+        """A new install starts at v3 without inventing generations that never ran."""
         self._bootstrap()
         self.assertIsNone(self._meta("shadow_v1_status"))
+        self.assertIsNone(self._meta("shadow_v2_status"))
         p = self.run_cli("doctor")
         self.assertNotIn("SHADOW v1 --", p.stdout)
-        self.assertIn("SHADOW v2 -- ACTIVE", p.stdout)
+        self.assertNotIn("SHADOW v2 --", p.stdout)
+        self.assertIn("SHADOW v3 -- ACTIVE", p.stdout)
+
+
+class ShellContextMatcherTest(unittest.TestCase):
+    """The `shell_cmd` matcher: an invocation is not a mention.
+
+    Fixtures are the REAL commands from the live database, not invented ones:
+    `guard_events` id=10 (a genuine `pkill -f` that killed its own shell, exit
+    144) and id=8 (the same token appearing inside a quoted Python heredoc while
+    recording the lesson about it, which the old regex matcher scored as a hit).
+
+    Two personal details in id=10 -- a home directory and a private spreadsheet
+    name -- are replaced in the stored fixture because this repository has a
+    public remote. Every shell construct under test is verbatim: the `&&` chain,
+    the `;`, and the quoted argument to pkill.
+    """
+
+    PATTERN = r"\b(pkill|killall)\s+(-[a-zA-Z]+\s+)*-f\b"
+    FIXTURES = ROOT / "tests" / "fixtures"
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import importlib
+        self.me = importlib.import_module("my_error")
+        importlib.reload(self.me)
+
+    def tearDown(self):
+        sys.path.remove(str(ROOT / "scripts"))
+
+    def _fixture(self, name):
+        return (self.FIXTURES / name).read_text(encoding="utf-8")
+
+    # POSITIVE FIRST. A negative assertion written before its positive twin can
+    # pass forever by testing nothing -- if the pattern stopped matching real
+    # invocations, only this test would notice.
+    def test_A_real_event_10_matches_in_command_position(self):
+        cmd = self._fixture("guard_event_10_pkill_command_position.sh")
+        self.assertEqual(self.me.shell_cmd_match(self.PATTERN, cmd), "command_position")
+        self.assertTrue(self.me.guard_matches("shell_cmd", self.PATTERN, cmd),
+                        "the guard must still catch a genuine pkill -f invocation")
+
+    def test_B_real_event_08_does_not_match_inside_a_heredoc(self):
+        cmd = self._fixture("guard_event_08_pkill_inside_heredoc.sh")
+        self.assertEqual(self.me.shell_cmd_match(self.PATTERN, cmd), "data_only")
+        self.assertFalse(self.me.guard_matches("shell_cmd", self.PATTERN, cmd),
+                         "the measured false positive came back")
+
+    def test_C_the_old_matcher_fired_on_both_which_is_the_regression(self):
+        """Proof the fix is a fix: the previous matcher could not tell them apart."""
+        for name in ("guard_event_10_pkill_command_position.sh",
+                     "guard_event_08_pkill_inside_heredoc.sh"):
+            self.assertTrue(self.me.guard_matches("regex", self.PATTERN, self._fixture(name)),
+                            f"{name}: the old regex matcher is expected to fire on both")
+
+    def test_masking_preserves_offsets_and_newlines(self):
+        """Masking may not shift anything: a shifted offset is a changed command."""
+        for name in self.FIXTURES.iterdir():
+            raw = name.read_text(encoding="utf-8")
+            masked = self.me.mask_shell_data(raw)
+            self.assertEqual(len(masked), len(raw), f"{name.name}: length changed")
+            self.assertEqual(masked.count("\n"), raw.count("\n"), f"{name.name}: line count changed")
+
+    def test_boundary_cases(self):
+        cases = [
+            ("pkill -f foo", "command_position"),
+            ("sudo pkill -f foo", "command_position"),
+            ("echo a; pkill -f foo", "command_position"),
+            ("echo a && pkill -f foo", "command_position"),
+            ("FOO=1 nohup pkill -f foo", "command_position"),
+            # Command substitution runs, quotes or not. Masking it would trade
+            # this false positive for a false negative, which is worse.
+            ("x=$(pkill -f foo)", "command_position"),
+            ('echo "$(pkill -f foo)"', "command_position"),
+            # ...and a terminator restores code context for what follows.
+            ("cat <<'EOF'\ntexto\nEOF\npkill -f foo", "command_position"),
+            ("echo 'nunca use pkill -f'", "data_only"),
+            ('echo "nunca use pkill -f"', "data_only"),
+            ("cat <<'EOF'\nnunca use pkill -f\nEOF", "data_only"),
+            ("cat <<EOF\nnunca use pkill -f\nEOF", "data_only"),
+            ("grep pkill -f arquivo", "data_only"),
+            ("ls", None),
+        ]
+        for cmd, expected in cases:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.me.shell_cmd_match(self.PATTERN, cmd), expected)
+
+
+class CausalOutcomeTest(unittest.TestCase):
+    """`command failed` is not `the guard was right`."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import importlib
+        self.me = importlib.import_module("my_error")
+        importlib.reload(self.me)
+
+    def tearDown(self):
+        sys.path.remove(str(ROOT / "scripts"))
+
+    def _guard(self, **kw):
+        base = {"pattern": r"\bpkill\s+-f\b", "eval_class": "execution_error",
+                "confirm_evidence": None}
+        base.update(kw)
+        return base
+
+    def test_declared_evidence_present_confirms(self):
+        g = self._guard(confirm_evidence=r"[Ee]xit code (137|143|144)\b")
+        out, basis = self.me.causal_outcome(g, True, "Exit code 144\nfoo", None)
+        self.assertEqual(out, self.me.CAUSAL_CONFIRMED)
+        self.assertIn("declared evidence", basis)
+
+    def test_failure_without_declared_evidence_is_unverified(self):
+        """The exact defect that closed v2, as a unit test.
+
+        guard_events id=7: the guard matched, the command failed, and the cause
+        was an unrelated bash syntax error. v2 scored that a confirmation.
+        """
+        g = self._guard(confirm_evidence=r"[Ee]xit code (137|143|144)\b")
+        out, basis = self.me.causal_outcome(
+            g, True, "Exit code 127\n/bin/bash: eval: linha 9: erro de sintaxe", None)
+        self.assertEqual(out, self.me.CAUSAL_UNVERIFIED)
+        self.assertNotEqual(out, self.me.CAUSAL_CONFIRMED)
+        self.assertIn("different cause", basis)
+
+    def test_generic_failure_is_unverified_not_confirmed(self):
+        g = self._guard()
+        out, _ = self.me.causal_outcome(g, True, "some unrelated failure", None)
+        self.assertEqual(out, self.me.CAUSAL_UNVERIFIED)
+
+    def test_failure_naming_the_guarded_token_confirms(self):
+        g = self._guard(pattern="git sttaus")
+        out, basis = self.me.causal_outcome(g, True, "git: 'sttaus' is not a git command.", None)
+        self.assertEqual(out, self.me.CAUSAL_CONFIRMED)
+        self.assertIn("sttaus", basis)
+
+    def test_success_refutes(self):
+        out, _ = self.me.causal_outcome(self._guard(), False, "", None)
+        self.assertEqual(out, self.me.CAUSAL_REFUTED)
+
+    def test_side_effect_guard_is_never_confirmed_by_exit_code(self):
+        """Guard 9's category. The regex may be perfectly correct while this
+        experiment remains unable to judge it, and saying so is the output."""
+        g = self._guard(pattern=r"git\s+add\s+-A\b", eval_class="side_effect")
+        for failed in (True, False):
+            out, basis = self.me.causal_outcome(g, failed, "Exit code 1\nanything", None)
+            self.assertEqual(out, self.me.CAUSAL_UNVERIFIED)
+            self.assertIn("cannot observe", basis)
+
+    def test_data_only_match_is_refuted_regardless_of_outcome(self):
+        g = self._guard()
+        for failed in (True, False):
+            out, basis = self.me.causal_outcome(g, failed, "Exit code 144", "data_only")
+            self.assertEqual(out, self.me.CAUSAL_REFUTED)
+            self.assertIn("quoted data", basis)
+
+
+class CanonicalVerdictTest(unittest.TestCase):
+    """The verdict may not depend on the working directory."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.data = base / "data"; self.data.mkdir()
+        self.a = base / "projeto-a"; self.a.mkdir()
+        self.b = base / "projeto-b"; self.b.mkdir()
+        self.env = os.environ.copy()
+        self.env["MY_ERROR_DATA_DIR"] = str(self.data)
+        self.env["MY_ERROR_MODE"] = "SHADOW"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, project, *args):
+        env = dict(self.env, CLAUDE_PROJECT_DIR=str(project))
+        p = subprocess.run([sys.executable, str(SCRIPT), *args], text=True,
+                           capture_output=True, env=env, cwd=str(project))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return p
+
+    def _doctor(self, project):
+        return json.loads(self._run(project, "doctor", "--json").stdout)
+
+    def test_canonical_verdict_is_identical_from_any_directory(self):
+        # Register both projects through the product's own path.
+        self._doctor(self.a); self._doctor(self.b)
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            db.execute("insert or replace into meta(key,value) "
+                       "values('shadow_v3_started_at','2026-09-22T00:00:00+00:00')")
+            pids = [r[0] for r in db.execute("select id from projects order by id")]
+            self.assertEqual(len(pids), 2, "both projects must exist for this to prove anything")
+            # The exact asymmetry that produced two different v2 verdicts: one
+            # project holds the only confirmation, the other holds the refutation.
+            db.execute(
+                "insert into guard_events(guard_id,lesson_id,project_id,session_id,tool_name,action,"
+                "mode,created_at,outcome,origin,experiment,causal_outcome,guard_class) "
+                "values(1,1,?,'s','Bash','c1','SHADOW','2026-09-23T10:00:00+00:00','true_positive',"
+                "'natural_usage','v3','causally_confirmed','execution_error')", (pids[0],))
+            db.execute(
+                "insert into guard_events(guard_id,lesson_id,project_id,session_id,tool_name,action,"
+                "mode,created_at,outcome,origin,experiment,causal_outcome,guard_class) "
+                "values(1,1,?,'s','Bash','c2','SHADOW','2026-09-23T11:00:00+00:00','false_positive',"
+                "'natural_usage','v3','causally_refuted','execution_error')", (pids[1],))
+            db.commit()
+        finally:
+            db.close()
+        da, db_ = self._doctor(self.a), self._doctor(self.b)
+        # Under v2 this was the bug: project A saw 1 confirmed / 0 refuted and
+        # project B saw 0 confirmed / 1 refuted, so `confirmed == 0 -> REMOVE`
+        # fired from one directory and not the other.
+        self.assertEqual(da["canonical"]["causally_confirmed"], 1)
+        self.assertEqual(da["canonical"]["causally_refuted"], 1)
+        self.assertEqual(da["canonical"], db_["canonical"],
+                         "the canonical dataset changed with the working directory")
+        self.assertEqual(da["shadow_verdict"], db_["shadow_verdict"],
+                         "the verdict changed with the working directory")
+        self.assertEqual(da["shadow_verdict_reason"], db_["shadow_verdict_reason"],
+                         "the verdict rationale changed with the working directory")
+        self.assertEqual(da["verdict_dataset"], db_["verdict_dataset"])
+        # project_id survives as a reported dimension, which is the point: the
+        # breakdown stays available, it just no longer decides anything.
+        self.assertEqual(len(da["canonical"]["by_project"]), 2)
+
+    def test_per_project_breakdown_is_reported_in_text_output(self):
+        self._doctor(self.a)
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            pid = db.execute("select id from projects limit 1").fetchone()[0]
+            db.execute("insert or replace into meta(key,value) "
+                       "values('shadow_v3_started_at','2026-09-22T00:00:00+00:00')")
+            db.execute(
+                "insert into guard_events(guard_id,lesson_id,project_id,session_id,tool_name,action,"
+                "mode,created_at,outcome,origin,experiment,causal_outcome,guard_class) "
+                "values(1,1,?,'s','Bash','c','SHADOW','2026-09-23T10:00:00+00:00','true_positive',"
+                "'natural_usage','v3','causally_confirmed','execution_error')", (pid,))
+            db.commit()
+        finally:
+            db.close()
+        out = self._run(self.a, "doctor").stdout
+        self.assertIn("Not filtered by cwd", out)
+        self.assertIn("a reported dimension, never a filter on the verdict", out)
+
+
+class MissedRecallTest(unittest.TestCase):
+    """`missed_relevant_recall`: the lesson existed and did not arrive in time."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.data = base / "data"; self.data.mkdir()
+        self.project = base / "project"; self.project.mkdir()
+        self.env = os.environ.copy()
+        self.env["MY_ERROR_DATA_DIR"] = str(self.data)
+        self.env["CLAUDE_PROJECT_DIR"] = str(self.project)
+        self.env["MY_ERROR_MODE"] = "SHADOW"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _cli(self, *args, event=None):
+        p = subprocess.run([sys.executable, str(SCRIPT), *args], text=True,
+                           input=json.dumps(event) if event is not None else None,
+                           capture_output=True, env=self.env, cwd=str(self.project))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return p
+
+    def _teach(self):
+        """A human-reviewed lesson with a guard -- i.e. one recall can deliver."""
+        self._cli("learn", "--scope", "global", "--confidence", "0.9",
+                  "--title", "pkill -f mata o proprio shell do agente",
+                  "--cause", "O padrao esta na argv do shell que roda o comando.",
+                  "--rule", "Mate por PID resolvido da porta ou do pidfile.",
+                  "--tags", "bash,processos",
+                  "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "shell_cmd", "--guard-pattern", r"\bpkill\s+-f\b",
+                  "--guard-class", "execution_error",
+                  "--confirm-evidence", r"[Ee]xit code (137|143|144)\b")
+
+    def _misses(self):
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            return db.execute(
+                "select lesson_id,session_id,basis,experiment from missed_recalls").fetchall()
+        finally:
+            db.close()
+
+    def test_recorded_when_the_lesson_was_not_delivered_first(self):
+        """The real case: ERR-0039 arrived from the failure hook, one second late."""
+        self._teach()
+        self._cli("hook", "guard", event={
+            "session_id": "s1", "cwd": str(self.project), "tool_name": "Bash",
+            "tool_input": {"command": 'pkill -f "port=2202"'}})
+        misses = self._misses()
+        self.assertEqual(len(misses), 1, "a provably relevant lesson was missed and not recorded")
+        self.assertEqual(misses[0][1], "s1")
+        self.assertIn("guard pattern matched", misses[0][2])
+        self.assertEqual(misses[0][3], "v3")
+
+    def test_not_recorded_when_the_lesson_arrived_before_the_action(self):
+        self._teach()
+        # A prompt whose words reach the lesson, delivered BEFORE the action.
+        self._cli("hook", "prompt", event={
+            "session_id": "s1", "cwd": str(self.project),
+            "prompt": "preciso matar um processo pkill shell agente argv"})
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            delivered = db.execute(
+                "select count(*) from recall_events where session_id='s1' and phase='prompt'"
+            ).fetchone()[0]
+        finally:
+            db.close()
+        self.assertGreater(delivered, 0, "the fixture failed to deliver the lesson first")
+        self._cli("hook", "guard", event={
+            "session_id": "s1", "cwd": str(self.project), "tool_name": "Bash",
+            "tool_input": {"command": 'pkill -f "port=2202"'}})
+        self.assertEqual(self._misses(), [],
+                         "a lesson already in context was counted as missed")
+
+    def test_delivery_after_the_action_does_not_count_as_prevention(self):
+        """A lesson shown by the failure hook cannot have prevented the failure."""
+        self._teach()
+        self._cli("hook", "guard", event={
+            "session_id": "s2", "cwd": str(self.project), "tool_name": "Bash",
+            "tool_input": {"command": 'pkill -f "port=2202"'}})
+        self._cli("hook", "failure", event={
+            "session_id": "s2", "cwd": str(self.project), "tool_name": "Bash",
+            "tool_input": {"command": 'pkill -f "port=2202"'},
+            "error": "Exit code 144", "is_interrupt": False})
+        self.assertEqual(len(self._misses()), 1, "the late delivery cancelled the miss")
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            phases = dict(db.execute(
+                "select phase,count(*) from recall_events where session_id='s2' group by phase"))
+            causal = db.execute("select causal_outcome from guard_events").fetchall()
+        finally:
+            db.close()
+        self.assertNotIn("prompt", phases)
+        # ...and the guard itself is causally confirmed here: exit 144 IS the harm.
+        self.assertEqual(causal, [("causally_confirmed",)])
+
+    def test_auto_lessons_are_not_counted_as_recall_misses(self):
+        """Their text is excluded from recall by policy, so no ranking change
+        could ever deliver them. Counting them would inflate the metric."""
+        self._cli("hook", "failure", event={
+            "session_id": "t1", "cwd": str(self.project), "tool_name": "Bash",
+            "tool_input": {"command": "git sttaus"},
+            "error": "git: 'sttaus' is not a git command.", "is_interrupt": False})
+        self._cli("hook", "success", event={
+            "session_id": "t1", "cwd": str(self.project), "tool_name": "Bash",
+            "tool_input": {"command": "git status"}, "tool_response": {"stdout": "ok"}})
+        self._cli("hook", "guard", event={
+            "session_id": "t2", "cwd": str(self.project), "tool_name": "Bash",
+            "tool_input": {"command": "git sttaus"}})
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            fired = db.execute("select count(*) from guard_events").fetchone()[0]
+        finally:
+            db.close()
+        self.assertEqual(fired, 1, "the auto guard did not fire, so this proves nothing")
+        self.assertEqual(self._misses(), [])
+
+    def test_session_start_delivery_is_recorded(self):
+        """Before 0.5.0 this path wrote nothing, so lessons it injected looked
+        to the audit as though they had never reached the agent."""
+        self._teach()
+        self._cli("hook", "session-start", event={
+            "session_id": "s3", "cwd": str(self.project)})
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            rows = db.execute(
+                "select phase,rank from recall_events where session_id='s3'").fetchall()
+        finally:
+            db.close()
+        self.assertTrue(rows, "session-start delivered a lesson without recording it")
+        self.assertEqual(rows[0][0], "session-start")
+        self.assertEqual(rows[0][1], 1)
+
+    def test_recall_audit_command_separates_before_and_after(self):
+        self._teach()
+        self._cli("hook", "guard", event={
+            "session_id": "s4", "cwd": str(self.project), "tool_name": "Bash",
+            "tool_input": {"command": 'pkill -f "x"'}})
+        out = self._cli("recall-audit").stdout
+        self.assertIn("MISSED_RELEVANT_RECALL:    1", out)
+        self.assertIn("before the action", out)
+        self.assertIn("cannot have prevented it", out)
+        self.assertIn("never recallable at any k", out)
+
+
+class FixtureRetirementTest(unittest.TestCase):
+    """Retiring scaffolding must preserve history and report the three totals apart."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.data = base / "data"; self.data.mkdir()
+        self.project = base / "project"; self.project.mkdir()
+        self.env = os.environ.copy()
+        self.env["MY_ERROR_DATA_DIR"] = str(self.data)
+        self.env["CLAUDE_PROJECT_DIR"] = str(self.project)
+        self.env["MY_ERROR_MODE"] = "SHADOW"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _cli(self, *args, event=None, origin=None):
+        env = dict(self.env)
+        if origin:
+            env["MY_ERROR_EVENT_ORIGIN"] = origin
+        p = subprocess.run([sys.executable, str(SCRIPT), *args], text=True,
+                           input=json.dumps(event) if event is not None else None,
+                           capture_output=True, env=env, cwd=str(self.project))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return p
+
+    def _make_fixture_lesson(self, bad="git sttaus", good="git status", sid="s1"):
+        """An auto lesson born inside a controlled test -- exactly ERR-0002..0007."""
+        self._cli("hook", "failure", origin="controlled_test", event={
+            "session_id": sid, "cwd": str(self.project), "tool_name": "Bash",
+            "tool_input": {"command": bad},
+            "error": f"git: '{bad.split()[-1]}' is not a git command.", "is_interrupt": False})
+        self._cli("hook", "success", origin="controlled_test", event={
+            "session_id": sid, "cwd": str(self.project), "tool_name": "Bash",
+            "tool_input": {"command": good}, "tool_response": {"stdout": "ok"}})
+
+    def _lessons(self):
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            return db.execute("select id,status,source,origin from lessons order by id").fetchall()
+        finally:
+            db.close()
+
+    def test_dry_run_is_the_default_and_changes_nothing(self):
+        self._make_fixture_lesson()
+        before = self._lessons()
+        out = self._cli("retire-fixtures").stdout
+        self.assertIn("DRY RUN", out)
+        self.assertIn("Re-run with --apply", out)
+        self.assertEqual(self._lessons(), before, "a dry run mutated the store")
+
+    def test_apply_preserves_the_row_and_writes_an_audit_trail(self):
+        self._make_fixture_lesson()
+        before = self._lessons()
+        self.assertEqual(len(before), 1)
+        lid = before[0][0]
+        self._cli("retire-fixtures", "--apply")
+        after = self._lessons()
+        self.assertEqual(len(after), 1, "the row was deleted instead of retired")
+        self.assertEqual(after[0][0], lid, "the id changed")
+        self.assertEqual(after[0][1], "retired_fixture")
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            audit = db.execute(
+                "select lesson_id,previous_status,new_status,reason,guards_deactivated "
+                "from lesson_retirements").fetchall()
+            guards = db.execute("select active from guards where lesson_id=?", (lid,)).fetchall()
+            # The lesson text itself must survive: retiring is not forgetting.
+            text = db.execute("select rule_text from lessons where id=?", (lid,)).fetchone()[0]
+        finally:
+            db.close()
+        self.assertEqual(len(audit), 1)
+        self.assertEqual(audit[0][:3], (lid, "active", "retired_fixture"))
+        self.assertIn("controlled_test scaffolding", audit[0][3])
+        self.assertEqual(audit[0][4], 1, "the deactivated-guard count was not recorded")
+        self.assertTrue(all(a == 0 for (a,) in guards), "guards stayed active")
+        self.assertTrue(text)
+
+    def test_natural_auto_lessons_are_not_swept_up_by_the_criterion(self):
+        """The criterion is structural, and must not catch a natural-usage lesson.
+
+        ERR-0010 was an auto lesson from real use, not from a controlled test;
+        retiring it is a separate, explicit decision.
+        """
+        self._make_fixture_lesson(sid="controlled")
+        self._cli("hook", "failure", event={   # no origin marker => natural_usage
+            "session_id": "nat", "cwd": str(self.project), "tool_name": "Bash",
+            "tool_input": {"command": "cat presnte.txt"},
+            "error": "cat: presnte.txt: No such file or directory", "is_interrupt": False})
+        self._cli("hook", "success", event={
+            "session_id": "nat", "cwd": str(self.project), "tool_name": "Bash",
+            "tool_input": {"command": "cat presente.txt"}, "tool_response": {"stdout": "ok"}})
+        out = self._cli("retire-fixtures").stdout
+        natural = [r for r in self._lessons() if r[3] == "natural_usage"]
+        self.assertEqual(len(natural), 1, "the natural fixture was not created")
+        self.assertNotIn(f"ERR-{natural[0][0]:04d}", out,
+                         "a natural-usage lesson was swept up by the fixture criterion")
+
+    def test_explicit_lesson_can_be_retired_with_its_own_reason(self):
+        self._cli("hook", "failure", event={
+            "session_id": "nat", "cwd": str(self.project), "tool_name": "Bash",
+            "tool_input": {"command": "cat presnte.txt"},
+            "error": "cat: presnte.txt: No such file or directory", "is_interrupt": False})
+        self._cli("hook", "success", event={
+            "session_id": "nat", "cwd": str(self.project), "tool_name": "Bash",
+            "tool_input": {"command": "cat presente.txt"}, "tool_response": {"stdout": "ok"}})
+        lid = self._lessons()[0][0]
+        self._cli("retire-fixtures", "--lesson", f"ERR-{lid:04d}",
+                  "--reason", "literal path pair; not reusable knowledge", "--apply")
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            reason = db.execute("select reason from lesson_retirements where lesson_id=?",
+                                (lid,)).fetchone()[0]
+            scope = db.execute("select scope from lessons where id=?", (lid,)).fetchone()[0]
+        finally:
+            db.close()
+        self.assertIn("literal path pair", reason)
+        # Retiring must not silently promote. A lesson whose reach was wrong is a
+        # separate decision, made by `scope`, with its own audit trail.
+        self.assertEqual(scope, "project")
+
+    def test_doctor_reports_the_three_totals_apart(self):
+        self._make_fixture_lesson()
+        self._cli("retire-fixtures", "--apply")
+        d = json.loads(self._cli("doctor", "--json").stdout)
+        kn = d["knowledge"]
+        self.assertEqual(kn["lessons_ever"], 1)
+        self.assertEqual(kn["lessons_active"], 0)
+        self.assertEqual(kn["fixtures_retired"], 1)
+        out = self._cli("doctor").stdout
+        self.assertIn("historical total is NOT a measure of useful knowledge", out)
+        self.assertIn("lessons ever recorded:", out)
+        self.assertIn("fixtures retired:", out)

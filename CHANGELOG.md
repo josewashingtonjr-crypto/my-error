@@ -1,3 +1,105 @@
+# 0.5.0 — SHADOW v3: measure prevention and recall as two different things
+
+SHADOW v2 (2026-09-02 -> 2026-09-22) is closed on **day 19 of 30** as
+`INCONCLUSIVE_DUE_TO_MEASUREMENT_DEFECTS`. Not a success, not a failure. v1
+closed because the system changed under it; v2 closes because the instrument
+could not support the claim its verdict would have made. Waiting for day 30
+would have produced a number that outlived the memory of the defect.
+
+Four defects, each independently sufficient, all found by auditing rows:
+
+1. **The verdict depended on the working directory.** The event counter filtered
+   `project_id = <cwd's project>`, so the pre-committed rule answered EXTEND from
+   `/home/w-jr` and REMOVE from `/home/w-jr/fidren` — same database, same
+   instant. The reported dataset was also short: 3 natural firings shown, 4
+   stored.
+2. **`command failed` was recorded as `the guard was right`**, with no check that
+   the failure was caused by the guarded pattern.
+3. **Some guards predict harm no exit code can express.** `git add -A` stages the
+   wrong paths and exits 0, so that guard could only ever be refuted.
+4. **At least one confirmation was spurious.** `guard_events` id=7 matched
+   `pkill -f` inside a quoted lesson body and then died of an unrelated bash
+   syntax error (exit 127 on `|`). Reclassifying that one row moves the canonical
+   v2 outcome from EXTEND to REMOVE.
+
+## Canonical dataset
+
+`canonical_dataset()` selects on `experiment` + `origin` with **no project
+filter**. `project_id` stays as a reported dimension — the doctor prints a
+per-project breakdown — but never decides which rows count. A test runs the
+doctor from two project directories against one database and requires the
+canonical block, the verdict and its rationale to be identical.
+
+## Causal outcomes replace the exit-code proxy
+
+`causally_confirmed` / `causally_refuted` / `unverified` / `not_evaluated`, in
+new columns beside the untouched `outcome`. `unverified` is the default, so
+silence cannot read as success. Guards declare `eval_class` and optionally
+`confirm_evidence` (a regex over the failure output proving the harm occurred).
+`side_effect` and `destructive` guards are never confirmed by proxy: they are
+honestly marked not-on-trial.
+
+Pre-v3 rows are stamped `not_evaluated`, never retroactively rescored.
+
+## Guard 8: an invocation is not a mention
+
+New `shell_cmd` matcher. It masks quoted spans and heredoc bodies **without
+changing offsets or token boundaries** (data bytes become NUL; newlines survive),
+keeps command substitution as code because `"$(pkill -f x)"` really does run,
+steps over transparent wrappers like `sudo`, and requires the match to sit in
+command position.
+
+Across all six real firings in the live database the old matcher fires 6 times
+and the new one once — on the genuine self-kill (exit 144). Events 11-13 were
+generated *by this investigation*, writing heredocs that mention the token: the
+defect reproduced three more times while being diagnosed. Both real commands are
+committed as fixtures under `tests/fixtures/`, with the positive assertion
+written before the negative one.
+
+`git add -A`'s regex is **unchanged**. Loosening it to improve a statistic would
+be fitting the guard to the instrument; it is reclassified `side_effect` instead.
+
+## missed_relevant_recall
+
+A new metric, reported apart from every guard number and excluded from the
+verdict. It records that a lesson a guard pattern **proved** applied to an action
+was not in context before that action ran.
+
+The case it exists for: on 2026-09-21 a guard matched `pkill -f "port=2202"`, the
+command died with exit 144, and ERR-0039 reached the agent one second later from
+the *failure* hook. The structural cause is that in SHADOW the only hook that sees
+an action before it runs emits nothing by design, so pre-action recall is keyed on
+the prompt text and never on the command. v3 measures that gap instead of guessing
+at a fix.
+
+`recall_events` gains `session_id`, `rank`, `phase`, `top_k`, `pool_size`, and all
+delivery paths now write through one function — including SessionStart, which
+previously injected lessons while recording nothing.
+
+## Retired fixtures, and three totals instead of one
+
+`retire-fixtures` (dry run by default) retires controlled-test scaffolding by a
+structural criterion, not an id list. Rows are preserved as `retired_fixture`,
+guards deactivated, `lesson_retirements` holds the audit trail. The doctor now
+reports **lessons ever recorded / lessons active / fixtures retired** separately,
+because a single total invites reading history as useful knowledge.
+
+## top_k stays at 5
+
+Unchanged, deliberately. The evidence that already exists says the cut was not
+the binding constraint for the project lessons with zero recalls: every
+project-scope lesson in the live database has `source = auto-verified-recovery`,
+which `lesson_rows()` excludes from recall entirely — they never competed at any
+`k`. `recall_misses` now samples below-cut lessons so the question becomes
+answerable from real traffic; until then a reported 0 means no evidence, and the
+doctor says so.
+
+## Still SHADOW
+
+Nothing is blocked. Mode is unchanged.
+
+Schema 6. 133 tests (108 before), zero skipped.
+
 # 0.4.5 — SHADOW v2: the experiment restarts from a known baseline
 
 SHADOW v1 (2026-08-18 -> 2026-09-02) is closed as
