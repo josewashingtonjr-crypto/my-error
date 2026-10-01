@@ -1913,8 +1913,9 @@ def contextual_recall(db: sqlite3.Connection, pid: str, event: dict[str, Any], s
     """Stage A of the PreToolUse execution gate: recall, never a block.
 
     `recall()` is already generic -- it scores an arbitrary query string. This
-    is a new call site, not a new engine: the query is built from the tool
-    name, the redacted action, cwd and any parsed paths, exactly the way
+    is a new call site, not a new engine: the query is built from the
+    redacted action and any paths parsed from it (see below for why the tool
+    name and `cwd` are deliberately excluded), broadly the shape
     docs/ACTIVE-PREVENTION.md section 4 specifies.
 
     PreToolUse fires on every Bash/Write/Edit, so the budget here is much
@@ -1946,13 +1947,33 @@ def contextual_recall(db: sqlite3.Connection, pid: str, event: dict[str, Any], s
     segments, regardless of how many segments agree. Segment evidence breaks
     ties among themselves and contributes to score at a fraction (0.5x) of a
     whole-token hit's weight (2.0x) -- "fractional", not absent.
+
+    The query is built from the action and any paths parsed from it ONLY --
+    deliberately NOT the tool name and NOT the raw `cwd`. Both are constant
+    for every event in a session (every Bash call carries the literal token
+    "Bash"; `cwd` rarely changes mid-session), so either one in the free-text
+    query is not evidence about *this* action, it is noise that happens to be
+    the same noise every time. Measured against a real ~20-lesson pool: a
+    lesson tagged `bash,git,rtk,cwd` (true of a real lesson) cleared the floor
+    via `tag_hit` on the word "bash" alone on the FIRST Bash call of a
+    session, whatever that call was -- then `lesson_seen_in_session` dedup
+    correctly suppressed it on a LATER call where it was genuinely relevant,
+    because its one per-session slot had already been spent on noise. Tool
+    awareness, if wanted, belongs as a structured eligibility filter (a
+    lesson tagged for a tool is only a candidate for that tool), never as a
+    free-text token that can single-handedly clear the relevance floor.
+    Dropping both sources also satisfies the "dedup must be proportional to
+    the evidence that earned the delivery" requirement structurally, rather
+    than needing a second bookkeeping mechanism: a delivery is now only ever
+    recorded (and so only ever burns the session's one slot for that lesson)
+    when the floor was cleared by something derived from THIS action, which
+    is exactly the evidence allowed to count at all.
     """
     tool = str(event.get("tool_name", ""))
     inp = event.get("tool_input") or {}
-    cwd = str(event.get("cwd") or "")
     action = extract_action(tool, inp)
     paths = " ".join(_candidate_paths(event))
-    query = f"{tool} {action} {cwd} {paths}"
+    query = f"{action} {paths}"
     q_whole = base_tokens(query)
     q_seg = segment_tokens(q_whole)
     q_all = q_whole | q_seg
