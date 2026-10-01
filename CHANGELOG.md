@@ -20,9 +20,26 @@ freeze is untouched by this release.
   and a relevance floor (token overlap >= 2 or a tag hit).
 - Read-only observational commands (`metrics`, `status`, `doctor`,
   `recall-audit`, `review`, `mode` without `--set`) now open the database
-  through `connect_readonly()`: no schema migration, no experiment-window
-  creation, `PRAGMA query_only=1` as a hard backstop. A schema version
-  mismatch is reported, never silently fixed.
+  through `connect_readonly()`: never the migrating `connect()`, so an
+  EXISTING database at an older or newer schema is reported via
+  `schema_compat_note()` rather than silently migrated (bootstrapping a
+  database that does not exist yet is unaffected -- there is no history for
+  it to rotate). Project registration (`ensure_project`) stays reachable on
+  this connection: it is an idempotent, already-throttled bookkeeping write
+  with no bearing on schema or experiment state, not the mutation the live
+  incident was about.
+- Every query that needs a v6 or v7 column/table (`guard_events.experiment`/
+  `causal_outcome`, `recall_events.phase`, the `missed_recalls`/
+  `recall_misses`/`lesson_retirements` tables, `guards.severity`, the new
+  v7 tables) checks for it first and reports `SCHEMA_INSUFFICIENT` with a
+  reason instead of crashing -- this was a real, reproducible crash on the
+  live installation's own schema-6 database (`doctor`/`metrics` both raised
+  `OperationalError` and exited 1). `SCHEMA_INSUFFICIENT` is deliberately a
+  DIFFERENT sentinel from `NOT_MEASURABLE`: one means "this database
+  predates the thing being asked for", the other means "the schema is
+  current and there is simply no active guard" -- collapsing them into one
+  value would reintroduce exactly the kind of single-number-standing-for-
+  two-situations defect this release exists to stop.
 - A new SHADOW v3 window will not open while the running code, the beacon's
   declared version, the installed `plugin.json` version, the schema the code
   expects, and the hooks the manifest declares do not all agree --
@@ -34,6 +51,34 @@ freeze is untouched by this release.
   failure / not-mechanically-verifiable.
 - Every prevention metric reports `NOT_MEASURABLE` with a reason when
   `guards_active == 0`, never `0`.
+- Contextual recall at PreToolUse can now reach a path or a dotted/identifier
+  reference. A path tokenizes as ONE opaque blob under `base_tokens()`
+  (which includes `/` and `.`), so a lesson tagged `3mf,downloads` could
+  never match a command that reads exactly that kind of file -- the tokens
+  proving relevance did not exist, not merely scored low. `segment_tokens()`
+  additionally breaks a blob into its path/identifier segments on BOTH the
+  query and the lesson's own text, and a segment landing on a tag counts as
+  a tag hit. A bare segment-only overlap still needs
+  `PRETOOLUSE_SEGMENT_FLOOR` (3) independent segments to clear the floor on
+  its own, and ranking is a strict two-level order -- any whole-token hit
+  outranks any amount of segment-only evidence -- so this cannot turn into
+  noise on every tool call that happens to touch the home directory.
+  `_candidate_paths()` now extracts genuine path-shaped SUBSTRINGS from a
+  command (including inside a quoted argument) instead of returning an
+  entire shell token, which also fixes `path_missing`/`path_exists`
+  spuriously treating a whole quoted script as "a path".
+- **Behaviour change, not a tweak**: `make_auto_lesson()` (the verified-
+  recovery auto-learning pipeline) now creates its guard with
+  `severity=warn` by default, not `deny`. User decision, 2026-10-01: that
+  pipeline creates a guard with no human in the loop, and the user does not
+  want a blocking guard able to appear that way, regardless of how narrow
+  the verification gate is. `deny` is still available as an explicit opt-in
+  -- `MY_ERROR_AUTO_GUARD_SEVERITY=deny` (env, one invocation) or the
+  `auto_guard_severity` meta key (persistent) -- in the same style as
+  `MY_ERROR_WARN`. **If you were relying on an auto-learned correction to
+  block in ENFORCE, it no longer does, until you set this.** `learn
+  --guard-tool`'s CLI default is unchanged (`deny`): a human typing
+  `--guard-pattern` already IS the human this decision keeps in the loop.
 
 # 0.5.0 — SHADOW v3: measure prevention and recall as two different things
 

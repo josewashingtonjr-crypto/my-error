@@ -9,9 +9,11 @@ anything, and a live protocol that exercises the real hook pipeline inside Claud
 python3 -m unittest discover -s tests -v
 ```
 
-53 tests, no third-party dependencies. They cover the learning gate, secret redaction,
+168 tests, no third-party dependencies. They cover the learning gate, secret redaction,
 project isolation, guard expiry, concurrency, locale handling, shadow scoring, storage
-resolution, and the anti-superstition rules.
+resolution, the anti-superstition rules, and (0.6.0) active prevention: severity/
+condition/exceptions, contextual recall at PreToolUse, read-only observability on an
+older database, release coherence, and cross-version compatibility.
 
 ```bash
 python3 benchmarks/ab_benchmark.py && python3 benchmarks/heldout_live_benchmark.py && python3 benchmarks/fuzz_live_benchmark.py
@@ -22,7 +24,11 @@ correction prevents an exact recurrence. Each exits non-zero if it does not reac
 Results and their limits: [TEST_REPORT.md](TEST_REPORT.md).
 
 The benchmarks set `MY_ERROR_MODE=ENFORCE` explicitly, because they measure blocking and
-the product default blocks nothing.
+the product default blocks nothing. Since 0.6.0 they ALSO set
+`MY_ERROR_AUTO_GUARD_SEVERITY=deny` explicitly, for the same reason: the auto-learned
+guard's own default changed to `warn` (a verified correction with no human in the loop
+no longer blocks on its own), so a benchmark that measures blocking opts in to `deny`
+the same way it already opts in to `ENFORCE`.
 
 ## Live protocol
 

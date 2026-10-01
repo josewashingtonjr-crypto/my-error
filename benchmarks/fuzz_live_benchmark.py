@@ -50,6 +50,9 @@ def main():
     # Benchmarks measure the guard, so they must state the mode; the
     # product default is SHADOW, which deliberately blocks nothing.
     os.environ['MY_ERROR_MODE']='ENFORCE'
+    # The auto-learned guard defaults to `warn` since 2026-10-01; this
+    # benchmark measures BLOCKING, so it opts into `deny` explicitly.
+    os.environ['MY_ERROR_AUTO_GUARD_SEVERITY']='deny'
     os.environ['MY_ERROR_DATA_DIR']=str(data); os.environ['CLAUDE_PROJECT_DIR']=str(project)
     db=me.connect(); pid=me.ensure_project(db,str(project.resolve()))
     templates=[
