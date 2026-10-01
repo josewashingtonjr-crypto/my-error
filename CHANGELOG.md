@@ -1,3 +1,40 @@
+# 0.6.0 — active prevention: schema v7, severity, conditions, contextual recall
+
+Built per `docs/ACTIVE-PREVENTION.md`. Machinery only -- no guard is seeded for
+ERR-0001/0003/0017, and the WARN channel ships off by default so the SHADOW v3
+freeze is untouched by this release.
+
+- `guards.severity` (`warn`|`deny`), `guards.condition` (closed registry,
+  never `eval`), `guards.exceptions` (suppression regex), and
+  `lessons.prevention_class` -- schema v7, additive only.
+- Condition predicates can now return a third state, `unverifiable` (missing
+  `cwd`, a path check that raised), distinct from `False`. Neither it nor an
+  unknown condition name can ever produce a DENY; both are recorded in
+  `guard_condition_issues` for `doctor` to surface.
+- `guards.exceptions` is checked at shell *command position*
+  (`shell_cmd_match`), not as a raw substring -- a bare substring exception is
+  trivially bypassed by a trailing comment or a quoted mention of the escape
+  word, which the command-position check structurally cannot be.
+- Contextual recall at PreToolUse (`phase='pretooluse'`), under a strict noise
+  budget: at most 2 lessons, a same-session dedup against prior deliveries,
+  and a relevance floor (token overlap >= 2 or a tag hit).
+- Read-only observational commands (`metrics`, `status`, `doctor`,
+  `recall-audit`, `review`, `mode` without `--set`) now open the database
+  through `connect_readonly()`: no schema migration, no experiment-window
+  creation, `PRAGMA query_only=1` as a hard backstop. A schema version
+  mismatch is reported, never silently fixed.
+- A new SHADOW v3 window will not open while the running code, the beacon's
+  declared version, the installed `plugin.json` version, the schema the code
+  expects, and the hooks the manifest declares do not all agree --
+  `release_coherence_check()`, exercised as a fixture, not against the live
+  database.
+- Recurrence detection no longer requires a guard match: a failure whose
+  fingerprint already belongs to a promoted lesson is `recurrence_detected`
+  on its own, attributed to recall failure / guard failure / classification
+  failure / not-mechanically-verifiable.
+- Every prevention metric reports `NOT_MEASURABLE` with a reason when
+  `guards_active == 0`, never `0`.
+
 # 0.5.0 — SHADOW v3: measure prevention and recall as two different things
 
 SHADOW v2 (2026-09-02 -> 2026-09-22) is closed on **day 19 of 30** as
