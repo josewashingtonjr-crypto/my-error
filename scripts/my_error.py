@@ -180,13 +180,25 @@ class ConditionUnevaluable(Exception):
     """
 
 
-def _candidate_paths(event: dict[str, Any]) -> list[str]:
-    """Paths parsed out of an action, for the `path_missing` / `path_exists` conditions.
+# Genuine path-shaped SUBSTRINGS of a command, not whole shell tokens. A
+# shlex token that happens to contain a slash can be an entire quoted script
+# (`python3 -c "...zipfile.ZipFile(\"/home/w-jr/Downloads/star.3mf\")"` is ONE
+# shlex token), and treating that whole blob as "a path" meant `path_missing`/
+# `path_exists` were effectively checking whether a sentence is a file on
+# disk -- always False, and useless for both the conditions and (originally)
+# for building a recall query. Quotes and backslashes stop a match, so a path
+# embedded inside a quoted argument is still extracted correctly.
+_PATH_LIKE_RE = re.compile(r"""~?/[^\s"'()<>\\]+|\b[\w.-]+\.[A-Za-z0-9]{1,8}\b""")
 
-    Deliberately conservative: `file_path` from Write/Edit tool_input is exact;
-    for Bash, a shell token is treated as a path candidate only if it looks
-    like one (contains a slash, or is a bare `name.ext`). This is a heuristic,
-    not a shell parser -- see docs/ACTIVE-PREVENTION.md section 7 on limits.
+
+def _candidate_paths(event: dict[str, Any]) -> list[str]:
+    """Paths parsed out of an action, for `path_missing`/`path_exists` and
+    for the PreToolUse recall query (docs/ACTIVE-PREVENTION.md section 4/7).
+
+    Deliberately conservative: `file_path` from Write/Edit tool_input is
+    exact; for Bash, any `/`-rooted run or bare `name.ext` found anywhere in
+    the command text counts, including inside a quoted argument. This is a
+    heuristic, not a shell parser.
     """
     inp = event.get("tool_input") or {}
     paths: list[str] = []
@@ -195,15 +207,10 @@ def _candidate_paths(event: dict[str, Any]) -> list[str]:
         paths.append(str(fp))
     cmd = inp.get("command")
     if cmd:
-        try:
-            tokens = shlex.split(str(cmd))
-        except ValueError:
-            tokens = str(cmd).split()
-        for t in tokens:
-            if t.startswith("-") or not t:
-                continue
-            if "/" in t or re.match(r"^[\w.-]+\.[A-Za-z0-9]{1,8}$", t):
-                paths.append(t)
+        for m in _PATH_LIKE_RE.finditer(str(cmd)):
+            tok = m.group(0)
+            if tok and tok not in paths:
+                paths.append(tok)
     return paths
 
 
@@ -263,7 +270,13 @@ CONDITIONS = {
 # noise budget: this phase fires on every Bash/Write/Edit, so the ceiling is
 # much tighter than prompt-time recall's.
 PRETOOLUSE_RECALL_LIMIT = 2
-PRETOOLUSE_RELEVANCE_FLOOR = 2  # exact-token overlap, OR a tag hit
+PRETOOLUSE_RELEVANCE_FLOOR = 2  # whole-token overlap, OR a tag hit
+# A path/identifier segment is noisier and shorter than a real word (a path
+# under the user's home directory shares "home" with nearly everything), so
+# segment-only evidence needs more independent agreement than a whole-token
+# hit does before it can clear the floor on its own. It still contributes to
+# score (at a fraction of a whole-token hit's weight) once a lesson is in.
+PRETOOLUSE_SEGMENT_FLOOR = 3
 
 NOT_MEASURABLE = "NOT_MEASURABLE"
 NOT_MEASURABLE_REASON = (
@@ -291,6 +304,37 @@ def warn_channel_enabled(db: sqlite3.Connection | None) -> bool:
     except sqlite3.Error:
         return False
     return (val or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def auto_guard_severity(db: sqlite3.Connection | None) -> str:
+    """Severity `make_auto_lesson()` gives its guard. Default `warn`.
+
+    User decision (2026-10-01): the verified-recovery pipeline creates a guard
+    with no human in the loop, and a guard that can block without one is not
+    something that should appear by default -- regardless of how narrow the
+    verification gate (`narrow_command_correction`) is. `deny` remains
+    available as an explicit, auditable opt-in, in the same style as
+    `MY_ERROR_WARN`/`warn_channel_enabled`: an env var for one invocation
+    (benchmarks and tests that need to measure blocking set it explicitly),
+    a meta key for a persistent choice.
+
+    This does NOT affect `learn --guard-tool`'s CLI default, which stays
+    `deny` -- a human typing `--guard-pattern` at the CLI IS the human in the
+    loop this decision is about keeping in the loop for the AUTO path.
+    """
+    env = os.getenv("MY_ERROR_AUTO_GUARD_SEVERITY")
+    if env is not None:
+        v = env.strip().lower()
+        if v in GUARD_SEVERITIES:
+            return v
+    if db is not None:
+        try:
+            val = (meta_get(db, "auto_guard_severity") or "").strip().lower()
+        except sqlite3.Error:
+            val = ""
+        if val in GUARD_SEVERITIES:
+            return val
+    return SEVERITY_WARN
 
 
 # What the verdict does and does not judge. Printed by the doctor verbatim so
@@ -1575,6 +1619,30 @@ def tokenize(text: str) -> set[str]:
     return expanded
 
 
+# Path/identifier segmentation, for the PreToolUse recall query ONLY.
+# `base_tokens()` and `tokenize()` are untouched -- `fingerprint`,
+# `normalize_error` and every existing recall test (prompt-time recall is
+# prose and already tokenizes into words) depend on their current output.
+# A path or a dotted module reference tokenizes as ONE opaque blob under
+# `base_tokens()` (its character class includes '/' and '.'), so a lesson
+# about `~/Downloads/*.3mf` can never match a command that reads exactly
+# that path: the tokens proving relevance do not exist, not merely score
+# low. This is additive, recall-only context -- it only ever ADDS segments
+# to a token set, never removes or replaces the whole-token form.
+_SEGMENT_SPLIT = re.compile(r"[/._-]+")
+
+
+def segment_tokens(raw_tokens: set[str]) -> set[str]:
+    segments: set[str] = set()
+    for t in raw_tokens:
+        if len(t) < 4 or not any(c in t for c in "/._-"):
+            continue
+        parts = [p for p in _SEGMENT_SPLIT.split(t) if len(p) >= 2 and p not in STOPWORDS]
+        if len(parts) > 1:
+            segments.update(parts)
+    return segments
+
+
 def extract_action(tool_name: str, tool_input: dict[str, Any]) -> str:
     if tool_name == "Bash":
         return redact(tool_input.get("command", "")).strip()
@@ -1851,10 +1919,33 @@ def contextual_recall(db: sqlite3.Connection, pid: str, event: dict[str, Any], s
 
     PreToolUse fires on every Bash/Write/Edit, so the budget here is much
     stricter than prompt-time recall's: at most PRETOOLUSE_RECALL_LIMIT
-    lessons, a hard relevance floor (exact-token overlap, or a tag hit) BEFORE
-    scoring -- not a ranking tweak applied after the fact -- and a same-session
-    dedup against anything already delivered, so a lesson shown at the prompt
-    is not shown again one tool call later.
+    lessons, a hard relevance floor BEFORE scoring -- not a ranking tweak
+    applied after the fact -- and a same-session dedup against anything
+    already delivered, so a lesson shown at the prompt is not shown again
+    one tool call later.
+
+    The floor's MEANING is unchanged from the first cut of this feature:
+    "a whole-token overlap >= PRETOOLUSE_RELEVANCE_FLOOR, OR a tag hit".
+    What changed is what can REACH a tag hit. A command argument or a path
+    tokenizes as one opaque blob under `base_tokens()` (`/home/x/y.3mf` is a
+    single token), so a lesson tagged `3mf,downloads` could never match a
+    command that reads exactly that file -- the tag literally could not be
+    seen, not merely scored low. `segment_tokens()` additionally breaks a
+    blob into its path/identifier segments (`home`, `x`, `y`, `3mf`) on BOTH
+    sides (the query and the lesson's own haystack, so a lesson whose rule
+    text mentions `~/Downloads` is reachable the same way), and a segment
+    that lands on an actual tag counts as a tag hit exactly like a whole word
+    would. A bare segment overlap with no tag and no whole-token agreement
+    needs PRETOOLUSE_SEGMENT_FLOOR independent segments before it can clear
+    the floor on its own -- a single shared fragment like `home` is not
+    evidence of relevance, and letting one through would turn this feature
+    into noise on every tool call that happens to touch the home directory.
+
+    Ranking after the floor is a strict two-level order: any lesson with a
+    real whole-token hit outranks every lesson whose only evidence is
+    segments, regardless of how many segments agree. Segment evidence breaks
+    ties among themselves and contributes to score at a fraction (0.5x) of a
+    whole-token hit's weight (2.0x) -- "fractional", not absent.
     """
     tool = str(event.get("tool_name", ""))
     inp = event.get("tool_input") or {}
@@ -1862,30 +1953,68 @@ def contextual_recall(db: sqlite3.Connection, pid: str, event: dict[str, Any], s
     action = extract_action(tool, inp)
     paths = " ".join(_candidate_paths(event))
     query = f"{tool} {action} {cwd} {paths}"
-    q_raw = base_tokens(query)
-    q = tokenize(query)
+    q_whole = base_tokens(query)
+    q_seg = segment_tokens(q_whole)
+    q_all = q_whole | q_seg
+    q = tokenize(query) | q_seg
     now = utcnow()
-    scored: list[tuple[float, sqlite3.Row]] = []
+    scored: list[tuple[int, float, sqlite3.Row]] = []
+    # Every row that scored ANY overlap at all (segment or whole), whether or
+    # not it cleared the floor -- the instrumentation this function did not
+    # have before: it lets `recall-audit` tell "nothing in the pool shared so
+    # much as a segment" apart from "something shared a segment but not
+    # enough to clear the floor", which from the OUTSIDE both looked like a
+    # silent zero.
+    below_floor: list[tuple[float, sqlite3.Row]] = []
     for row in lesson_rows(db, pid):
         hay = f"{row['title']} {row['cause']} {row['rule_text']} {row['tags']}"
-        t_raw = base_tokens(hay)
+        t_whole = base_tokens(hay)
+        t_seg = segment_tokens(t_whole)
+        t_all = t_whole | t_seg
         tag_set = {t.strip() for t in (row["tags"] or "").split(",") if t.strip()}
-        exact_overlap = len(q_raw & t_raw)
-        tag_hit = bool(tag_set & q_raw)
-        if exact_overlap < PRETOOLUSE_RELEVANCE_FLOOR and not tag_hit:
+        whole_overlap = len(q_whole & t_whole)
+        all_overlap = len(q_all & t_all)
+        seg_only = max(0, all_overlap - whole_overlap)
+        # A tag matched via a segment counts exactly like a tag matched via a
+        # whole word: tags are short, deliberately-chosen identifiers, and
+        # segmentation is precisely what makes one reachable from inside a
+        # path or dotted reference.
+        tag_hit = bool(tag_set & q_all)
+        passes_floor = whole_overlap >= PRETOOLUSE_RELEVANCE_FLOOR or tag_hit or seg_only >= PRETOOLUSE_SEGMENT_FLOOR
+        if not all_overlap and not tag_hit:
+            continue  # zero shared evidence of any kind: not even a near miss
+        t = tokenize(hay) | t_seg
+        expanded_overlap = len(q & t)
+        semantic_only = max(0, expanded_overlap - all_overlap)
+        score = (whole_overlap * 2.0 + seg_only * 0.5 + semantic_only * 1.15
+                + row["confidence"] + (0.5 if tag_hit else 0.0))
+        if not passes_floor:
+            below_floor.append((score, row))
             continue
         if lesson_seen_in_session(db, row["id"], session, now):
             continue
-        t = tokenize(hay)
-        expanded_overlap = len(q & t)
-        semantic_only = max(0, expanded_overlap - exact_overlap)
-        score = exact_overlap * 2.0 + semantic_only * 1.15 + row["confidence"] + (0.5 if tag_hit else 0.0)
-        scored.append((score, row))
-    scored.sort(key=lambda x: (-x[0], -x[1]["confidence"], x[1]["id"]))
-    chosen = [r for _, r in scored[:PRETOOLUSE_RECALL_LIMIT]]
+        whole_bucket = 1 if whole_overlap > 0 else 0
+        scored.append((whole_bucket, score, row))
+    # Whole-token evidence always outranks segment-only evidence, by bucket;
+    # score (which already weighs segments fractionally) breaks ties within
+    # a bucket.
+    scored.sort(key=lambda x: (-x[0], -x[1], -x[2]["confidence"], x[2]["id"]))
+    chosen = [r for _, _, r in scored[:PRETOOLUSE_RECALL_LIMIT]]
     if chosen:
         record_recall_deliveries(db, pid, chosen, session, "pretooluse", PRETOOLUSE_RECALL_LIMIT, len(scored))
-        db.commit()
+    # Sampled into the SAME table prompt-time recall already uses for its own
+    # below-cut sample. A non-empty sample here, with real nonzero scores,
+    # proves the pool WAS reachable and simply did not clear the bar -- as
+    # opposed to no rows at all (neither here nor in `scored`), which means
+    # nothing in the pool shared so much as a segment with this action.
+    below_floor.sort(key=lambda x: -x[0])
+    if below_floor:
+        db.executemany(
+            "INSERT INTO recall_misses(lesson_id,lesson_scope,project_id,session_id,phase,score,rank,top_k,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            [(r["id"], r["scope"], pid, session, "pretooluse", float(s), i + 1, PRETOOLUSE_RECALL_LIMIT, now)
+             for i, (s, r) in enumerate(below_floor[:RECALL_MISS_SAMPLE])])
+    db.commit()
     return chosen
 
 
@@ -2040,13 +2169,13 @@ def make_auto_lesson(db: sqlite3.Connection, pid: str, candidate: sqlite3.Row, g
       VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?)
     """, (lesson_id, pid, "Bash", "command", "exact", candidate["bad_action"], good_action,
           f"my-error learned this exact command already failed; use `{good_action}` instead.", now, expires, origin,
-          # Explicit, not inherited from the schema default: this pipeline
-          # already gates on a verified narrow correction (narrow_command_correction),
-          # so it is the one path this release still lets auto-promote straight
-          # to a blocking severity -- see docs/ACTIVE-PREVENTION.md section 6,
-          # which forbids auto-promoting a bare RECURRENCE to a guard, not this
-          # pre-existing, already-verified pipeline.
-          SEVERITY_DENY))
+          # User decision 2026-10-01: warn by default (no human was in the
+          # loop when this guard was created, however narrow the gate that
+          # created it -- see auto_guard_severity()). `deny` is an explicit,
+          # auditable opt-in via MY_ERROR_AUTO_GUARD_SEVERITY or the
+          # `auto_guard_severity` meta key, the same pattern as the WARN
+          # channel switch. Benchmarks that measure blocking set it.
+          auto_guard_severity(db)))
     db.execute("UPDATE candidates SET status='learned',recovery_action=?,recovery_evidence=recovery_evidence+1,lesson_id=? WHERE id=?",
                (good_action, lesson_id, candidate["id"]))
     db.commit()
@@ -2692,6 +2821,42 @@ def _keys(row: sqlite3.Row | dict[str, Any]) -> set[str]:
         return set()
 
 
+# --- schema-aware degradation for read-only observational commands ---------
+# connect_readonly() deliberately never migrates an existing older database
+# (see its docstring -- that silent migration, with its experiment-rotation
+# side effect, is the exact live incident this release fixes). But several
+# metrics blocks query columns/tables that only exist from schema v6
+# (guard_events.experiment/causal_outcome, recall_events.phase, the
+# recall_misses/missed_recalls/lesson_retirements tables) or v7
+# (guards.severity, guard_suppressions, guard_condition_issues,
+# recurrence_events). Querying them against an older, unmigrated database
+# must report "this metric needs a newer schema" -- a DIFFERENT fact from
+# NOT_MEASURABLE ("no active guards"), never a crash, and never a silent 0.
+SCHEMA_INSUFFICIENT = "SCHEMA_INSUFFICIENT"
+
+
+def _table_exists(db: sqlite3.Connection, name: str) -> bool:
+    try:
+        return db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
+def _column_exists(db: sqlite3.Connection, table: str, column: str) -> bool:
+    try:
+        return any(r[1] == column for r in db.execute(f"PRAGMA table_info({table})"))
+    except sqlite3.Error:
+        return False
+
+
+def schema_insufficient_reason(required: int, actual: int, what: str) -> str:
+    return (f"{what} requires schema v{required}; this database is v{actual}. "
+            "Read-only commands never migrate -- run a hook, or a write command "
+            "(learn/forget/scope/mode --set), to bring it current.")
+
+
 def resolve_guard_events(db: sqlite3.Connection, pid: str, event: dict[str, Any], failed: bool) -> None:
     """Score a shadow guard against what the command actually did.
 
@@ -3130,7 +3295,24 @@ def canonical_dataset(db: sqlite3.Connection, experiment: str, origin: str = ORI
 
     `project_id` is kept, as a reported dimension. Breaking the numbers down per
     project is useful; letting the cwd silently pick which rows count is not.
+
+    Requires schema v6 (`guard_events.causal_outcome`/`experiment`,
+    `missed_recalls`). A read-only command must never migrate to get it --
+    see `connect_readonly()` -- so an older database gets an explicit
+    SCHEMA_INSUFFICIENT dataset instead of a crash or a silent 0.
     """
+    if not (_column_exists(db, "guard_events", "causal_outcome") and _table_exists(db, "missed_recalls")):
+        reason = schema_insufficient_reason(6, _user_version(db), "the canonical v3 verdict dataset")
+        return {
+            "experiment": experiment, "origin": origin,
+            "would_block": SCHEMA_INSUFFICIENT, "causally_confirmed": SCHEMA_INSUFFICIENT,
+            "causally_refuted": SCHEMA_INSUFFICIENT, "unverified": SCHEMA_INSUFFICIENT,
+            "not_evaluated": SCHEMA_INSUFFICIENT, "pending": SCHEMA_INSUFFICIENT,
+            "missed_relevant_recall": SCHEMA_INSUFFICIENT,
+            "by_project": [], "by_guard_class": [],
+            "schema_insufficient_reason": reason,
+        }
+
     def count(where: str, args: tuple = ()) -> int:
         return int(db.execute(
             f"SELECT COUNT(*) FROM guard_events WHERE experiment=? AND origin=? {where}",
@@ -3190,6 +3372,33 @@ def recall_metrics(db: sqlite3.Connection) -> dict[str, Any]:
     (only that a deterministic pattern later proved it applied).
     """
     one = lambda q, a=(): int(db.execute(q, a).fetchone()[0])  # noqa: E731
+    # Structural facts about the recall pool only ever need `lessons`, which
+    # has existed since schema v1 -- these stay real numbers on any schema.
+    pool = {
+        "pool_excluded_auto_source": one(
+            f"SELECT COUNT(*) FROM lessons WHERE status='active' AND source IN "
+            f"({','.join('?' * len(AUTO_LESSON_SOURCES))})", tuple(sorted(AUTO_LESSON_SOURCES))),
+        "pool_eligible_global": one(
+            "SELECT COUNT(*) FROM lessons WHERE status='active' AND scope='global' AND source NOT IN "
+            f"({','.join('?' * len(AUTO_LESSON_SOURCES))})", tuple(sorted(AUTO_LESSON_SOURCES))),
+        "pool_eligible_project": one(
+            "SELECT COUNT(*) FROM lessons WHERE status='active' AND scope='project' AND source NOT IN "
+            f"({','.join('?' * len(AUTO_LESSON_SOURCES))})", tuple(sorted(AUTO_LESSON_SOURCES))),
+    }
+    # Everything else here needs schema v6: `recall_events.phase` and the
+    # `missed_recalls`/`recall_misses` tables. A read-only command must not
+    # migrate to get them -- report the gap explicitly instead.
+    if not (_column_exists(db, "recall_events", "phase") and _table_exists(db, "missed_recalls")
+            and _table_exists(db, "recall_misses")):
+        reason = schema_insufficient_reason(6, _user_version(db), "phase-aware recall metrics")
+        return {
+            "deliveries_total": SCHEMA_INSUFFICIENT, "deliveries_by_phase": {},
+            "deliveries_before_action": SCHEMA_INSUFFICIENT, "deliveries_after_action": SCHEMA_INSUFFICIENT,
+            "missed_relevant_recall_total": SCHEMA_INSUFFICIENT, "missed_relevant_recall_natural": SCHEMA_INSUFFICIENT,
+            "missed_by_lesson": [], "below_cut_sampled": SCHEMA_INSUFFICIENT, "below_cut_by_scope": {},
+            "schema_insufficient_reason": reason,
+            **pool,
+        }
     by_phase = {r[0] or "(unrecorded)": r[1] for r in db.execute(
         "SELECT phase, COUNT(*) FROM recall_events GROUP BY phase ORDER BY 2 DESC")}
     missed_by_lesson = [
@@ -3214,18 +3423,7 @@ def recall_metrics(db: sqlite3.Connection) -> dict[str, Any]:
         "missed_by_lesson": missed_by_lesson,
         "below_cut_sampled": one("SELECT COUNT(*) FROM recall_misses"),
         "below_cut_by_scope": miss_scope,
-        # Structural facts about the recall pool, which explain more than any
-        # ranking tweak could. A lesson excluded by source can never be recalled
-        # at any k, so counting it as a ranking loss would be wrong.
-        "pool_excluded_auto_source": one(
-            f"SELECT COUNT(*) FROM lessons WHERE status='active' AND source IN "
-            f"({','.join('?' * len(AUTO_LESSON_SOURCES))})", tuple(sorted(AUTO_LESSON_SOURCES))),
-        "pool_eligible_global": one(
-            "SELECT COUNT(*) FROM lessons WHERE status='active' AND scope='global' AND source NOT IN "
-            f"({','.join('?' * len(AUTO_LESSON_SOURCES))})", tuple(sorted(AUTO_LESSON_SOURCES))),
-        "pool_eligible_project": one(
-            "SELECT COUNT(*) FROM lessons WHERE status='active' AND scope='project' AND source NOT IN "
-            f"({','.join('?' * len(AUTO_LESSON_SOURCES))})", tuple(sorted(AUTO_LESSON_SOURCES))),
+        **pool,
     }
 
 
@@ -3247,6 +3445,22 @@ def prevention_metrics(db: sqlite3.Connection, guards_active: int) -> dict[str, 
     Database-wide, like `canonical_dataset` -- a count that moved when you
     `cd` was defect #1 of SHADOW v2.
     """
+    # This whole block is a 0.6.0 concept: guards.severity and the three new
+    # tables all land in schema v7 together. An older database simply does not
+    # have the columns/tables these queries need -- that is a SCHEMA fact, a
+    # different situation from "schema is current but no guard is active",
+    # and the two must never collapse into the same sentinel.
+    if not (_table_exists(db, "guard_suppressions") and _table_exists(db, "guard_condition_issues")
+            and _table_exists(db, "recurrence_events") and _column_exists(db, "guards", "severity")):
+        reason = schema_insufficient_reason(7, _user_version(db), "active-prevention metrics (severity/conditions/exceptions)")
+        return {
+            "guard_matched": SCHEMA_INSUFFICIENT, "would_block": SCHEMA_INSUFFICIENT,
+            "actually_blocked": SCHEMA_INSUFFICIENT, "false_positive": SCHEMA_INSUFFICIENT,
+            "suppressed_by_exception": SCHEMA_INSUFFICIENT, "missed_relevant_recall": SCHEMA_INSUFFICIENT,
+            "recurrence_detected": SCHEMA_INSUFFICIENT, "recurrence_by_attribution": {},
+            "condition_unknown_total": SCHEMA_INSUFFICIENT, "condition_unverifiable_total": SCHEMA_INSUFFICIENT,
+            "schema_insufficient_reason": reason,
+        }
     one = lambda q, a=(): int(db.execute(q, a).fetchone()[0])  # noqa: E731
     issues_by_kind = {r[0]: r[1] for r in db.execute(
         "SELECT kind, COUNT(*) FROM guard_condition_issues GROUP BY kind")}
@@ -3283,12 +3497,19 @@ def retired_fixture_counts(db: sqlite3.Connection) -> dict[str, Any]:
     most of the gap was controlled-test scaffolding.
     """
     one = lambda q, a=(): int(db.execute(q, a).fetchone()[0])  # noqa: E731
-    return {
+    out = {
         "lessons_ever": one("SELECT COUNT(*) FROM lessons"),
         "lessons_active": one("SELECT COUNT(*) FROM lessons WHERE status='active'"),
-        "fixtures_retired": one("SELECT COUNT(*) FROM lesson_retirements"),
         "retired_now": one(f"SELECT COUNT(*) FROM lessons WHERE status='{STATUS_RETIRED_FIXTURE}'"),
     }
+    # `lesson_retirements` is a schema v6 table; a read-only command must not
+    # migrate to get it.
+    if _table_exists(db, "lesson_retirements"):
+        out["fixtures_retired"] = one("SELECT COUNT(*) FROM lesson_retirements")
+    else:
+        out["fixtures_retired"] = SCHEMA_INSUFFICIENT
+        out["schema_insufficient_reason"] = schema_insufficient_reason(6, _user_version(db), "fixture-retirement history")
+    return out
 
 
 def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
@@ -3382,20 +3603,39 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
         win, wa = "AND 1=0", ()
         v1win, v1a = "", ()
 
+    # The columns these filter on (`experiment`, and the causal columns
+    # `canonical_dataset` reads separately) are schema v6. A read-only command
+    # must not migrate an older database to get them -- SCHEMA_INSUFFICIENT
+    # instead of a crash, distinct from NOT_MEASURABLE (schema is fine, there
+    # is simply no active guard).
+    has_experiment_col = _column_exists(db, "guard_events", "experiment")
+
     # The LEGACY v2 series, kept readable but no longer authoritative. It selects
     # on experiment='v2' rather than on a timestamp window, because the window it
     # used to derive now belongs to v3. These are the numbers the defective v2
     # instrument produced, project-scoped exactly as it produced them -- which is
     # the point: the defect stays visible instead of being quietly corrected.
-    natural_would_block = ev("AND mode='SHADOW' AND origin=? AND experiment='v2'", (ORIGIN_NATURAL,))
-    natural_confirmed = ev("AND outcome='true_positive' AND origin=? AND experiment='v2'", (ORIGIN_NATURAL,))
-    natural_refuted = ev("AND outcome='false_positive' AND origin=? AND experiment='v2'", (ORIGIN_NATURAL,))
-    natural_pending = ev("AND outcome='pending' AND origin=? AND experiment='v2'", (ORIGIN_NATURAL,))
+    if has_experiment_col:
+        natural_would_block = ev("AND mode='SHADOW' AND origin=? AND experiment='v2'", (ORIGIN_NATURAL,))
+        natural_confirmed = ev("AND outcome='true_positive' AND origin=? AND experiment='v2'", (ORIGIN_NATURAL,))
+        natural_refuted = ev("AND outcome='false_positive' AND origin=? AND experiment='v2'", (ORIGIN_NATURAL,))
+        natural_pending = ev("AND outcome='pending' AND origin=? AND experiment='v2'", (ORIGIN_NATURAL,))
 
-    controlled_would_block = ev("AND mode='SHADOW' AND origin=? AND experiment='v2'", (ORIGIN_CONTROLLED,))
-    controlled_confirmed = ev("AND outcome='true_positive' AND origin=? AND experiment='v2'", (ORIGIN_CONTROLLED,))
-    controlled_refuted = ev("AND outcome='false_positive' AND origin=? AND experiment='v2'", (ORIGIN_CONTROLLED,))
-    controlled_pending = ev("AND outcome='pending' AND origin=? AND experiment='v2'", (ORIGIN_CONTROLLED,))
+        controlled_would_block = ev("AND mode='SHADOW' AND origin=? AND experiment='v2'", (ORIGIN_CONTROLLED,))
+        controlled_confirmed = ev("AND outcome='true_positive' AND origin=? AND experiment='v2'", (ORIGIN_CONTROLLED,))
+        controlled_refuted = ev("AND outcome='false_positive' AND origin=? AND experiment='v2'", (ORIGIN_CONTROLLED,))
+        controlled_pending = ev("AND outcome='pending' AND origin=? AND experiment='v2'", (ORIGIN_CONTROLLED,))
+
+        v1_natural_confirmed = ev("AND outcome='true_positive' AND origin=? AND experiment='v1'", (ORIGIN_NATURAL,))
+        v1_natural_refuted = ev("AND outcome='false_positive' AND origin=? AND experiment='v1'", (ORIGIN_NATURAL,))
+        v1_controlled_would_block = ev("AND mode='SHADOW' AND origin=? AND experiment='v1'", (ORIGIN_CONTROLLED,))
+        v1_controlled_confirmed = ev("AND outcome='true_positive' AND origin=? AND experiment='v1'", (ORIGIN_CONTROLLED,))
+        v1_controlled_refuted = ev("AND outcome='false_positive' AND origin=? AND experiment='v1'", (ORIGIN_CONTROLLED,))
+    else:
+        (natural_would_block, natural_confirmed, natural_refuted, natural_pending,
+         controlled_would_block, controlled_confirmed, controlled_refuted, controlled_pending,
+         v1_natural_confirmed, v1_natural_refuted, v1_controlled_would_block,
+         v1_controlled_confirmed, v1_controlled_refuted) = (SCHEMA_INSUFFICIENT,) * 13
 
     # SHADOW v1, preserved and queryable. Closed as INCONCLUSIVE: the system
     # underneath it changed materially mid-window, so these numbers judge
@@ -3404,12 +3644,9 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
     # re-deriving a window from whichever generation happens to be active. That
     # derivation broke the moment a third generation existed: `started` moved to
     # v3, and every v2 row silently became "before the start" -- i.e. v1.
+    # (Unlike the block above, this one needs only `created_at`/`mode`/`origin`,
+    # present since schema v2/v3, so it stays a real number on any schema.)
     v1_natural_would_block = ev(f"AND mode='SHADOW' AND origin=? {v1win}", (ORIGIN_NATURAL,) + v1a)
-    v1_natural_confirmed = ev("AND outcome='true_positive' AND origin=? AND experiment='v1'", (ORIGIN_NATURAL,))
-    v1_natural_refuted = ev("AND outcome='false_positive' AND origin=? AND experiment='v1'", (ORIGIN_NATURAL,))
-    v1_controlled_would_block = ev("AND mode='SHADOW' AND origin=? AND experiment='v1'", (ORIGIN_CONTROLLED,))
-    v1_controlled_confirmed = ev("AND outcome='true_positive' AND origin=? AND experiment='v1'", (ORIGIN_CONTROLLED,))
-    v1_controlled_refuted = ev("AND outcome='false_positive' AND origin=? AND experiment='v1'", (ORIGIN_CONTROLLED,))
 
     out = {
         "mode": mode,
@@ -3504,6 +3741,8 @@ def shadow_verdict(m: dict[str, Any]) -> tuple[str, str]:
     docs/METRICS.md for why mixing the two would invalidate the experiment.
     """
     canon = m.get("canonical") or {}
+    if any(canon.get(k) == SCHEMA_INSUFFICIENT for k in ("causally_confirmed", "causally_refuted", "unverified")):
+        return SCHEMA_INSUFFICIENT, canon.get("schema_insufficient_reason", "database schema is older than this release's verdict dataset requires")
     confirmed = int(canon.get("causally_confirmed", 0))
     refuted = int(canon.get("causally_refuted", 0))
     unverified = int(canon.get("unverified", 0))
