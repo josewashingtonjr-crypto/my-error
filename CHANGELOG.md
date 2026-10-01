@@ -4,6 +4,22 @@ Built per `docs/ACTIVE-PREVENTION.md`. Machinery only -- no guard is seeded for
 ERR-0001/0003/0017, and the WARN channel ships off by default so the SHADOW v3
 freeze is untouched by this release.
 
+- Contextual recall at PreToolUse dropped the tool name and the raw `cwd`
+  from its query. Both are constant for every event in a session (every Bash
+  call carries the literal token "Bash"; `cwd` rarely changes mid-session),
+  so either one could single-handedly clear the relevance floor via
+  `tag_hit` on an unrelated lesson -- found against a replica of a real
+  ~20-lesson pool: a lesson tagged `bash,git,rtk,cwd` was delivered on the
+  FIRST Bash call of a session regardless of what that call was, and
+  `lesson_seen_in_session` dedup then correctly suppressed it on a LATER
+  call where it was genuinely relevant, because its one per-session slot
+  had already been spent on noise. The query is now built from the action
+  and any paths parsed from it only; this also makes dedup proportional to
+  the evidence that earned the delivery, without a second bookkeeping
+  mechanism, since a delivery can now only be recorded when something
+  derived from the actual action cleared the floor. Guards (Stage B) were
+  never affected -- this was a recall/WARN-channel-only defect.
+
 - `guards.severity` (`warn`|`deny`), `guards.condition` (closed registry,
   never `eval`), `guards.exceptions` (suppression regex), and
   `lessons.prevention_class` -- schema v7, additive only.

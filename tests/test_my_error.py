@@ -2690,6 +2690,80 @@ class ActivePreventionTest(unittest.TestCase):
         if "Confirm the target before deleting" in ctx:
             self.assertLess(ctx.index("Run alembic migrations"), ctx.index("Confirm the target before deleting"))
 
+    # --- tool name / cwd must not count as evidence --------------------------
+    # Regression coverage for a real finding against the user's actual
+    # ~20-lesson pool (a single-lesson fixture cannot observe this class of
+    # bug -- the tool name/cwd only look like evidence once something else in
+    # the pool happens to share a tag with them). Reproduced here with a
+    # multi-lesson pool that has genuinely colliding tags, not a synthetic
+    # one-lesson fixture.
+    def _learn_realistic_pool_with_colliding_tags(self):
+        # The real lesson: tagged bash,git,rtk,cwd -- "bash" and "cwd" are
+        # BOTH words that used to leak into every query as constant noise
+        # (the tool name, and the literal word "cwd" was never the problem;
+        # the problem was the tool name token and the raw cwd PATH -- this
+        # tag is deliberately named to prove the fix isn't accidentally
+        # keying off the word "cwd" in a tag, which is legitimate evidence).
+        self.learn("--scope", "project", "--title", "git log precisa de -C fora de um repo",
+                  "--cause", "bare git fora de um repo: fatal: not a git repository",
+                  "--rule", ("Nunca dependa de um 'cd' de uma chamada Bash anterior; para git, "
+                            "passe sempre o repo explicitamente com -C."),
+                  "--confidence", "verified", "--tags", "bash,git,rtk,cwd")
+        # A handful of other real-shaped lessons sharing the SAME tool-name
+        # tag, so "bash" alone being evidence would spuriously clear more
+        # than one lesson's floor.
+        self.learn("--scope", "project", "--title", "npm script typo",
+                  "--cause", "npm run buil typo", "--rule", "Run npm run build, not buil.",
+                  "--confidence", "high", "--tags", "bash,npm,scripts")
+        self.learn("--scope", "project", "--title", "Secret redaction",
+                  "--cause", "a command logged a raw token", "--rule", "Never print api_key or token values to stdout.",
+                  "--confidence", "high", "--tags", "bash,secrets,redaction")
+
+    def test_echo_hello_first_does_not_burn_the_later_relevant_delivery(self):
+        """The exact A/B pair: clean session delivers; a prior unrelated call
+        must not suppress the later, genuinely relevant one."""
+        self._learn_realistic_pool_with_colliding_tags()
+        bad = "rtk git log --oneline HEAD..origin/main"
+        event = lambda cmd: {"cwd": str(self.project), "tool_name": "Bash", "tool_input": {"command": cmd}}  # noqa: E731
+
+        # CENARIO A: clean session, straight to the matching command.
+        out_a = self.hook("guard", {**event(bad), "session_id": "A"}, warn="1")
+        self.assertIsNotNone(out_a, "clean session must deliver the relevant lesson")
+        self.assertIn("ERR-", out_a["hookSpecificOutput"]["additionalContext"])
+
+        # CENARIO B: an unrelated Bash call first, SAME session, THEN the
+        # matching command. The relevant delivery must still happen.
+        out_echo = self.hook("guard", {**event("echo hello"), "session_id": "B"}, warn="1")
+        self.assertIsNone(out_echo, "an unrelated command must not itself inject anything")
+        out_b = self.hook("guard", {**event(bad), "session_id": "B"}, warn="1")
+        self.assertIsNotNone(out_b, "a prior unrelated Bash call must not have burned this "
+                                    "lesson's one per-session delivery on noise")
+        self.assertIn("ERR-", out_b["hookSpecificOutput"]["additionalContext"])
+
+    def test_bash_tagged_lesson_not_delivered_on_unrelated_bash_command(self):
+        self._learn_realistic_pool_with_colliding_tags()
+        for cmd in ("echo hello", "ls -la", "pwd", "date"):
+            out = self.hook("guard", {"session_id": f"s-{hash(cmd)}", "cwd": str(self.project),
+                                      "tool_name": "Bash", "tool_input": {"command": cmd}}, warn="1")
+            self.assertIsNone(out, f"a lesson tagged for the tool alone must not fire on "
+                                  f"an unrelated command: {cmd!r}")
+
+    def test_deny_guard_unaffected_by_recall_dedup(self):
+        """Stage B (guard match/deny) is independent of Stage A (recall)
+        delivery bookkeeping -- an unrelated call must not affect whether a
+        later matching command is denied."""
+        self.learn("--scope", "global", "--title", "git needs -C outside a repo",
+                  "--cause", "bare git run from a non-repo cwd", "--rule", "Pass -C explicitly.",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "shell_cmd", "--guard-pattern", r"git\b",
+                  "--condition", "cwd_not_git_repo")
+        self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                            "tool_input": {"command": "echo hello"}}, warn="1")
+        out = self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                  "tool_input": {"command": "git log --oneline HEAD..origin/main"}}, warn="1")
+        self.assertIsNotNone(out)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
     # --- auto-learned guard severity default (user decision 2026-10-01) ----
     def _train_pair(self, bad, error, good, sid="auto-sev"):
         fail = {"session_id": sid, "cwd": str(self.project), "tool_name": "Bash",

@@ -9,7 +9,7 @@ anything, and a live protocol that exercises the real hook pipeline inside Claud
 python3 -m unittest discover -s tests -v
 ```
 
-168 tests, no third-party dependencies. They cover the learning gate, secret redaction,
+171 tests, no third-party dependencies. They cover the learning gate, secret redaction,
 project isolation, guard expiry, concurrency, locale handling, shadow scoring, storage
 resolution, the anti-superstition rules, and (0.6.0) active prevention: severity/
 condition/exceptions, contextual recall at PreToolUse, read-only observability on an
