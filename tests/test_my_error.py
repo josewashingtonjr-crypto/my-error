@@ -20,7 +20,7 @@ def me_version() -> str:
 
 
 # Bumped with SCHEMA_VERSION in my_error.py; named so a schema bump touches one line.
-SCHEMA_VERSION_EXPECTED = 6
+SCHEMA_VERSION_EXPECTED = 7
 
 
 class MyErrorTest(unittest.TestCase):
@@ -831,7 +831,12 @@ class MyErrorTest(unittest.TestCase):
         db.execute("DROP TABLE guard_events")
         db.execute("PRAGMA user_version=1")
         db.commit(); db.close()
-        m = self.metrics()          # reopening must migrate all the way to current
+        # `metrics` is read-only since 0.6.0 and must NOT migrate an existing,
+        # older database (that silent migration -- with its experiment-rotation
+        # side effect -- is the exact live incident active prevention fixes).
+        # A write path (any hook) still migrates, same as always.
+        self.hook("cleanup", {"session_id": "s", "cwd": str(self.project)})
+        m = self.metrics()          # read-only here only reports the now-current state
         self.assertEqual(m["lessons_active"], 1)
         db = sqlite3.connect(self.data / "my-error.db")
         try:
@@ -1725,12 +1730,15 @@ class ShadowGenerationTest(unittest.TestCase):
             db.commit()
         finally:
             db.close()
-        self._doctor()   # triggers ensure_schema -> migrate to 6
+        # `doctor` is read-only since 0.6.0 and must not migrate an existing
+        # older database on its own; a write command still does.
+        self.run_cli("mode", "--set", "SHADOW")   # triggers ensure_schema -> migrate to current
+        self._doctor()
         db = self._db()
         try:
             after = db.execute(
                 "select id,created_at,origin,outcome from guard_events order by id").fetchall()
-            self.assertEqual(int(db.execute("PRAGMA user_version").fetchone()[0]), 6)
+            self.assertEqual(int(db.execute("PRAGMA user_version").fetchone()[0]), SCHEMA_VERSION_EXPECTED)
             # The causal column must NOT be backfilled as if these rows had been
             # evaluated under a model that did not exist when they were recorded.
             evaluated = db.execute(
@@ -1773,6 +1781,9 @@ class ShadowGenerationTest(unittest.TestCase):
             db.commit()
         finally:
             db.close()
+        # Same as above: the migration must be triggered by a write command,
+        # not by the read-only `doctor` observing the database.
+        self.run_cli("mode", "--set", "SHADOW")
         self._doctor()
         self.assertEqual(self._meta("shadow_v1_started_at"), "2026-08-18T14:24:26+00:00")
         self.assertEqual(self._meta("shadow_v1_status"),
@@ -1792,7 +1803,7 @@ class ShadowGenerationTest(unittest.TestCase):
         self.assertIsNotNone(self._meta("shadow_v3_started_at"))
         self.assertEqual(self._meta("shadow_v3_baseline_version"), "0.4.5")
         snap = json.loads(self._meta("shadow_v3_baseline_snapshot"))
-        self.assertEqual(snap["schema_version"], 6)
+        self.assertEqual(snap["schema_version"], SCHEMA_VERSION_EXPECTED)
         self.assertIn("cross_project_recalls", snap)
 
     def test_fresh_database_has_no_closed_generation_to_report(self):
@@ -2325,3 +2336,574 @@ class FixtureRetirementTest(unittest.TestCase):
         self.assertIn("historical total is NOT a measure of useful knowledge", out)
         self.assertIn("lessons ever recorded:", out)
         self.assertIn("fixtures retired:", out)
+
+
+class ActivePreventionTest(unittest.TestCase):
+    """0.6.0: severity, conditions, exceptions, contextual recall at PreToolUse,
+    the WARN channel switch, and the NOT_MEASURABLE hard rule.
+
+    Same harness shape as MyErrorTest: a fresh tmp project/data dir per test,
+    MY_ERROR_MODE pinned explicitly (ENFORCE unless a test needs SHADOW), and
+    the WARN channel left OFF unless a test is specifically about it -- the
+    freeze guarantee means "off" must be indistinguishable from 0.5.0.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self.tmp.name) / "project"
+        self.data = Path(self.tmp.name) / "data"
+        self.project.mkdir(); self.data.mkdir()
+        self.env = os.environ.copy()
+        self.env["MY_ERROR_DATA_DIR"] = str(self.data)
+        self.env["CLAUDE_PROJECT_DIR"] = str(self.project)
+        self.env["MY_ERROR_MODE"] = "ENFORCE"
+        self.env.pop("MY_ERROR_WARN", None)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_cli(self, *args, event=None, project=None, mode=None, warn=None):
+        env = self.env.copy()
+        if project is not None:
+            env["CLAUDE_PROJECT_DIR"] = str(project)
+        if mode is not None:
+            env["MY_ERROR_MODE"] = mode
+        if warn is not None:
+            env["MY_ERROR_WARN"] = warn
+        p = subprocess.run(
+            [sys.executable, str(SCRIPT), *args],
+            input=(json.dumps(event) if event is not None else None),
+            text=True, capture_output=True, env=env, cwd=str(project or self.project),
+        )
+        return p
+
+    def hook(self, kind, event, project=None, mode=None, warn=None):
+        p = self.run_cli("hook", kind, event=event, project=project, mode=mode, warn=warn)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return json.loads(p.stdout) if p.stdout.strip() else None
+
+    def learn(self, *args):
+        p = self.run_cli("learn", *args)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return p.stdout
+
+    def db(self):
+        return sqlite3.connect(self.data / "my-error.db")
+
+    def doctor_json(self, mode=None, warn=None):
+        p = self.run_cli("doctor", "--json", mode=mode, warn=warn)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return json.loads(p.stdout)
+
+    # --- schema v7 migration ---------------------------------------------
+    def test_v6_to_v7_migration_preserves_rows_and_lessons(self):
+        self.learn("--scope", "project", "--title", "T", "--cause", "C", "--rule", "R",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit")
+        db = self.db()
+        try:
+            before_lessons = db.execute("select id,title,rule_text from lessons order by id").fetchall()
+            before_guards = db.execute("select id,lesson_id,pattern from guards order by id").fetchall()
+            db.execute("update meta set value='6' where key='schema_version'")
+            db.execute("PRAGMA user_version=6")
+            # Simulate a v6 row: no v7 columns exist yet at the SQL level is not
+            # representable (ALTER TABLE already ran), but the row's severity/
+            # condition/exceptions/prevention_class were never set explicitly by
+            # anything written under v6 -- which `make_auto_lesson`/`learn` of
+            # this release always do. This asserts the DEFAULT a genuinely
+            # pre-0.6.0 row gets, by forcing the columns back to NULL/absent-shape.
+            db.execute("update guards set severity='warn', condition=NULL, exceptions=NULL")
+            db.execute("update lessons set prevention_class='WARNABLE'")
+            db.commit()
+        finally:
+            db.close()
+        self.run_cli("mode", "--set", "ENFORCE")  # a write path: triggers the v7 migration
+        db = self.db()
+        try:
+            self.assertEqual(int(db.execute("PRAGMA user_version").fetchone()[0]), SCHEMA_VERSION_EXPECTED)
+            after_lessons = db.execute("select id,title,rule_text from lessons order by id").fetchall()
+            after_guards = db.execute("select id,lesson_id,pattern from guards order by id").fetchall()
+            cols_g = {r[1] for r in db.execute("PRAGMA table_info(guards)")}
+            cols_l = {r[1] for r in db.execute("PRAGMA table_info(lessons)")}
+        finally:
+            db.close()
+        self.assertEqual(before_lessons, after_lessons, "migration touched lesson rows")
+        self.assertEqual(before_guards, after_guards, "migration touched guard rows")
+        self.assertIn("severity", cols_g); self.assertIn("condition", cols_g); self.assertIn("exceptions", cols_g)
+        self.assertIn("prevention_class", cols_l)
+
+    # --- condition registry -----------------------------------------------
+    def test_condition_predicates_true_and_false_branches(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import importlib
+        me = importlib.import_module("my_error"); importlib.reload(me)
+        try:
+            repo = Path(self.tmp.name) / "repo"; repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+            not_repo = Path(self.tmp.name) / "not_repo"; not_repo.mkdir()
+            self.assertTrue(me.cond_cwd_not_git_repo({"cwd": str(not_repo)}))
+            self.assertFalse(me.cond_cwd_not_git_repo({"cwd": str(repo)}))
+            present = repo / "exists.txt"; present.write_text("x")
+            self.assertTrue(me.cond_path_exists({"cwd": str(repo), "tool_input": {"file_path": str(present)}}))
+            self.assertFalse(me.cond_path_exists({"cwd": str(repo), "tool_input": {"file_path": str(repo / "absent.txt")}}))
+            self.assertTrue(me.cond_path_missing({"cwd": str(repo), "tool_input": {"file_path": str(repo / "absent.txt")}}))
+            self.assertFalse(me.cond_path_missing({"cwd": str(repo), "tool_input": {"file_path": str(present)}}))
+            self.assertTrue(me.cond_always({}))
+        finally:
+            sys.path.remove(str(ROOT / "scripts"))
+
+    def test_cwd_not_git_repo_is_unverifiable_without_a_cwd(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import importlib
+        me = importlib.import_module("my_error"); importlib.reload(me)
+        try:
+            with self.assertRaises(me.ConditionUnevaluable):
+                me.cond_cwd_not_git_repo({})
+        finally:
+            sys.path.remove(str(ROOT / "scripts"))
+
+    def test_unknown_condition_name_is_inert_and_reported(self):
+        self.learn("--scope", "project", "--title", "T", "--cause", "C", "--rule", "R",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit")
+        db = self.db()
+        try:
+            db.execute("update guards set condition='no_such_condition'")
+            db.commit()
+        finally:
+            db.close()
+        out = self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                  "tool_input": {"command": "doit"}})
+        self.assertIsNone(out, "an unknown condition must never let the guard deny")
+        db = self.db()
+        try:
+            row = db.execute("select kind,condition_name from guard_condition_issues").fetchone()
+        finally:
+            db.close()
+        self.assertEqual(row[0], "unknown")
+        self.assertEqual(row[1], "no_such_condition")
+        d = self.doctor_json()
+        self.assertEqual(d["prevention"]["condition_unknown_total"], 1)
+
+    def test_unverifiable_condition_never_denies_and_is_recorded(self):
+        self.learn("--scope", "project", "--title", "T", "--cause", "C", "--rule", "R",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit", "--condition", "cwd_not_git_repo")
+        # No "cwd" key at all: cond_cwd_not_git_repo cannot decide.
+        out = self.hook("guard", {"session_id": "s", "tool_name": "Bash", "tool_input": {"command": "doit"}})
+        self.assertIsNone(out, "an unevaluable condition must never let the guard deny")
+        db = self.db()
+        try:
+            row = db.execute("select kind,condition_name from guard_condition_issues").fetchone()
+        finally:
+            db.close()
+        self.assertEqual(row[0], "unverifiable")
+        self.assertEqual(row[1], "cwd_not_git_repo")
+
+    # --- exceptions: precedence and anti-bypass ----------------------------
+    def _learn_getpid_guard(self):
+        self.learn("--scope", "project", "--title", "No os.path.getpid", "--cause", "posixpath has no getpid",
+                  "--rule", "Use os.getpid(), not os.path.getpid().", "--confidence", "verified",
+                  "--guard-tool", "Bash", "--guard-field", "command", "--guard-match", "regex",
+                  "--guard-pattern", r"os\.path\.getpid",
+                  "--exceptions", r"(grep|rg|ag|ack|sed|awk)\b")
+
+    def test_exceptions_suppress_a_would_be_match_and_are_counted(self):
+        self._learn_getpid_guard()
+        out = self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                  "tool_input": {"command": 'grep -rn "os.path.getpid" .'}})
+        self.assertIsNone(out, "a legitimate grep must not be denied")
+        db = self.db()
+        try:
+            n_suppressed = db.execute("select count(*) from guard_suppressions").fetchone()[0]
+            n_hits = db.execute("select hit_count from guards").fetchone()[0]
+        finally:
+            db.close()
+        self.assertEqual(n_suppressed, 1, "the suppression must be recorded, never a silent pass")
+        self.assertEqual(n_hits, 0, "a suppressed match must not count as a guard hit")
+
+    def test_exceptions_cannot_be_bypassed_by_a_comment_noop_or_quoted_mention(self):
+        self._learn_getpid_guard()
+        bypass_attempts = [
+            'python3 -c "os.path.getpid()"  # grep',
+            'python3 -c "os.path.getpid()" ; : grep',
+            'python3 -c "something grep os.path.getpid something"',
+        ]
+        for cmd in bypass_attempts:
+            out = self.hook("guard", {"session_id": f"s-{hash(cmd)}", "cwd": str(self.project),
+                                      "tool_name": "Bash", "tool_input": {"command": cmd}},
+                            mode="ENFORCE")
+            self.assertIsNotNone(out, f"bypass succeeded for: {cmd!r}")
+            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny",
+                             f"bypass succeeded for: {cmd!r}")
+
+    def test_malformed_exception_pattern_never_widens_suppression(self):
+        self.learn("--scope", "project", "--title", "T", "--cause", "C", "--rule", "R",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit", "--exceptions", "(unclosed")
+        out = self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                  "tool_input": {"command": "doit"}})
+        self.assertIsNotNone(out)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    # --- severity gate -------------------------------------------------------
+    def test_severity_warn_never_denies_in_enforce(self):
+        self.learn("--scope", "project", "--title", "T", "--cause", "C", "--rule", "R",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit", "--severity", "warn")
+        out = self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                  "tool_input": {"command": "doit"}}, mode="ENFORCE", warn="1")
+        self.assertIsNotNone(out)
+        self.assertNotIn("permissionDecision", out["hookSpecificOutput"])
+        self.assertIn("WARNING", out["hookSpecificOutput"]["additionalContext"])
+        # And with the WARN channel off: recorded, but silent.
+        out2 = self.hook("guard", {"session_id": "s2", "cwd": str(self.project), "tool_name": "Bash",
+                                   "tool_input": {"command": "doit"}}, mode="ENFORCE")
+        self.assertIsNone(out2)
+
+    def test_severity_deny_denies_in_enforce_not_in_shadow(self):
+        self.learn("--scope", "project", "--title", "T", "--cause", "C", "--rule", "R",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit", "--severity", "deny")
+        out = self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                  "tool_input": {"command": "doit"}}, mode="ENFORCE")
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        out2 = self.hook("guard", {"session_id": "s2", "cwd": str(self.project), "tool_name": "Bash",
+                                   "tool_input": {"command": "doit"}}, mode="SHADOW")
+        self.assertIsNone(out2)
+
+    # --- contextual recall at PreToolUse -------------------------------------
+    def _learn_relevant_lesson(self):
+        return self.learn("--scope", "project", "--title", "Migration ordering",
+                          "--cause", "A database migration ran before its dependency",
+                          "--rule", "Run database migrations in dependency order; check schema version first.",
+                          "--confidence", "verified", "--tags", "database,migration,schema")
+
+    def test_contextual_recall_delivers_at_pretooluse_and_counts_before_action(self):
+        self._learn_relevant_lesson()
+        out = self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                  "tool_input": {"command": "alembic upgrade head  # database migration schema"}},
+                        warn="1")
+        self.assertIsNotNone(out, "a relevant lesson must be injected when the WARN channel is on")
+        self.assertIn("possibly relevant", out["hookSpecificOutput"]["additionalContext"])
+        d = self.doctor_json()
+        self.assertEqual(d["recall"]["deliveries_by_phase"].get("pretooluse"), 1)
+        self.assertGreaterEqual(d["recall"]["deliveries_before_action"], 1)
+
+    def test_lesson_delivered_at_prompt_is_not_redelivered_at_pretooluse(self):
+        self._learn_relevant_lesson()
+        prompt_out = self.hook("prompt", {"session_id": "s", "cwd": str(self.project),
+                                          "prompt": "run the database migration schema now"})
+        self.assertIsNotNone(prompt_out, "the prompt-time recall fixture must actually deliver")
+        out = self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                  "tool_input": {"command": "alembic upgrade head  # database migration schema"}},
+                        warn="1")
+        self.assertIsNone(out, "a lesson already shown this session must not be shown again at PreToolUse")
+
+    def test_relevance_floor_blocks_an_irrelevant_command(self):
+        self._learn_relevant_lesson()
+        out = self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                  "tool_input": {"command": "ls -la /tmp"}}, warn="1")
+        self.assertIsNone(out, "an unrelated command must inject nothing, regardless of pool size")
+
+    def test_pretooluse_noise_budget_caps_at_two_lessons(self):
+        for i in range(4):
+            self.learn("--scope", "project", "--title", f"Migration rule {i}",
+                      "--cause", "database migration schema issue",
+                      "--rule", f"database migration schema rule number {i}",
+                      "--confidence", "verified", "--tags", "database,migration,schema")
+        out = self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                  "tool_input": {"command": "run database migration schema now please"}},
+                        warn="1")
+        self.assertIsNotNone(out)
+        self.assertEqual(out["hookSpecificOutput"]["additionalContext"].count("ERR-"), 2)
+
+    # --- WARN channel off: the freeze guarantee ------------------------------
+    def test_warn_channel_off_is_byte_identical_to_pre_0_6_0_output(self):
+        self._learn_relevant_lesson()
+        self.learn("--scope", "project", "--title", "T2", "--cause", "C2", "--rule", "R2",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit", "--severity", "warn")
+        event = {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                 "tool_input": {"command": "doit  # database migration schema"}}
+        p_off = self.run_cli("hook", "guard", event=event, mode="ENFORCE")
+        self.assertEqual(p_off.returncode, 0, p_off.stderr)
+        self.assertEqual(p_off.stdout, "", "WARN off must produce NO output at all on this path")
+        env_explicit_off = self.env.copy(); env_explicit_off["MY_ERROR_WARN"] = "0"
+        p_off2 = subprocess.run([sys.executable, str(SCRIPT), "hook", "guard"], input=json.dumps(event),
+                                text=True, capture_output=True, env=env_explicit_off, cwd=str(self.project))
+        self.assertEqual(p_off2.stdout, p_off.stdout, "explicit MY_ERROR_WARN=0 must match the default")
+
+    # --- NOT_MEASURABLE -------------------------------------------------------
+    def test_guards_active_zero_gives_not_measurable_never_zero(self):
+        # No guard ever created in this fresh project.
+        d = self.doctor_json()
+        self.assertEqual(d["guards_active"], 0)
+        pv = d["prevention"]
+        for k in ("guard_matched", "would_block", "actually_blocked", "false_positive",
+                 "suppressed_by_exception", "missed_relevant_recall"):
+            self.assertEqual(pv[k], "NOT_MEASURABLE", f"{k} reported a number with zero active guards")
+        # recurrence_detected is guard-independent and MUST still be a real number.
+        self.assertIsInstance(pv["recurrence_detected"], int)
+
+    def test_guards_active_nonzero_reports_real_numbers(self):
+        self.learn("--scope", "project", "--title", "T", "--cause", "C", "--rule", "R",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit")
+        d = self.doctor_json()
+        self.assertGreaterEqual(d["guards_active"], 1)
+        self.assertIsInstance(d["prevention"]["would_block"], int)
+
+    # --- legitimate-equivalent false-positive guards -------------------------
+    def test_erl0017_shaped_guard_catches_bare_git_outside_a_repo_not_inside_one(self):
+        # Global scope: `cwd_not_git_repo` is what must decide applicability
+        # here, not which project the guard happens to be scoped to. A
+        # project-scoped guard would simply never reach a cwd outside that
+        # project's identity, which would make the "legitimate" assertions
+        # below pass for the wrong reason (out of scope, not condition=False).
+        self.learn("--scope", "global", "--title", "git needs -C outside a repo",
+                  "--cause", "bare git run from a non-repo cwd: fatal: not a git repository",
+                  "--rule", "Pass -C <repo> (or cd first) when cwd is not a git repository.",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "shell_cmd", "--guard-pattern", r"git\b",
+                  "--condition", "cwd_not_git_repo")
+        # self.project is deliberately not a git repository (no `git init` ran
+        # on it), so it stands in for the real ERR-0017 scene: a non-repo cwd.
+        # The real ERR-0017 command ran through an `rtk` wrapper; `rtk` is not a
+        # transparent shell prefix (unlike `sudo`/`env`), so the shell's actual
+        # command word there is `rtk`, not `git` -- shell_cmd_match correctly
+        # does not treat that as a git invocation at command position. The bare
+        # `git` invocation underneath is what the guard targets.
+        bad = self.run_cli("hook", "guard",
+                           event={"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                  "tool_input": {"command": "git log --oneline HEAD..origin/main"}})
+        out = json.loads(bad.stdout)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        repo = Path(self.tmp.name) / "repo"; repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+        legit_commands = [
+            "git status",
+            f"git -C {repo} log",
+            "git --version",
+            "git init",
+        ]
+        for cmd in legit_commands:
+            p = self.run_cli("hook", "guard",
+                             event={"session_id": "s", "cwd": str(repo), "tool_name": "Bash",
+                                    "tool_input": {"command": cmd}})
+            self.assertEqual(p.returncode, 0, p.stderr)
+            out = json.loads(p.stdout) if p.stdout.strip() else None
+            self.assertIsNone(out, f"legitimate command wrongly denied: {cmd!r}")
+
+    def test_erl0001_shaped_guard_catches_heredoc_not_grep_mention(self):
+        self._learn_getpid_guard()
+        bad_cmd = "python3 <<'PYTHON'\nimport os\nos.path.getpid()\nPYTHON\n"
+        p = self.run_cli("hook", "guard",
+                         event={"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                "tool_input": {"command": bad_cmd}})
+        out = json.loads(p.stdout)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        legit = [
+            'grep -rn "os.path.getpid" .',
+            "python3 <<'PYTHON'\nimport os\nos.getpid()\nPYTHON\n",
+        ]
+        for cmd in legit:
+            p = self.run_cli("hook", "guard",
+                             event={"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                    "tool_input": {"command": cmd}})
+            out = json.loads(p.stdout) if p.stdout.strip() else None
+            self.assertIsNone(out, f"legitimate command wrongly denied: {cmd!r}")
+
+    def test_err0003_shaped_guard_catches_bad_candidate_id_not_the_fixed_form(self):
+        self.learn("--scope", "project", "--title", "candidate-id must be an int",
+                  "--cause", "argparse exit 2: invalid int value: 'CAND-0001'",
+                  "--rule", "Pass the bare integer to --candidate-id, e.g. 1, not CAND-0001.",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "regex", "--guard-pattern", r"--candidate-id[= ]+CAND-")
+        bad = "python3 scripts/my_error.py learn --candidate-id CAND-0001 --title t --cause c --rule r --scope project"
+        p = self.run_cli("hook", "guard",
+                         event={"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                "tool_input": {"command": bad}})
+        out = json.loads(p.stdout)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        legit = "python3 scripts/my_error.py learn --candidate-id 1 --title t --cause c --rule r --scope project"
+        p = self.run_cli("hook", "guard",
+                         event={"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                "tool_input": {"command": legit}})
+        out = json.loads(p.stdout) if p.stdout.strip() else None
+        self.assertIsNone(out, "the corrected form must not be denied")
+
+    # --- malformed input / failure containment --------------------------------
+    def test_malformed_stdin_does_not_crash_or_block(self):
+        p = subprocess.run([sys.executable, str(SCRIPT), "hook", "guard"], input="{not json",
+                           text=True, capture_output=True, env=self.env, cwd=str(self.project))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), "")
+
+    def test_empty_stdin_does_not_crash_or_block(self):
+        p = subprocess.run([sys.executable, str(SCRIPT), "hook", "failure"], input="",
+                           text=True, capture_output=True, env=self.env, cwd=str(self.project))
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_unwritable_data_dir_degrades_without_crashing_or_blocking(self):
+        locked = Path(self.tmp.name) / "locked"; locked.mkdir(mode=0o500)
+        env = self.env.copy(); env["MY_ERROR_DATA_DIR"] = str(locked / "nested")
+        try:
+            p = subprocess.run([sys.executable, str(SCRIPT), "hook", "guard"],
+                               input=json.dumps({"session_id": "s", "cwd": str(self.project),
+                                                 "tool_name": "Bash", "tool_input": {"command": "doit"}}),
+                               text=True, capture_output=True, env=env, cwd=str(self.project))
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(p.stdout.strip(), "", "a hook failure must never deny the tool call")
+        finally:
+            locked.chmod(0o700)
+
+
+class ReleaseCoherenceAndContaminationTest(unittest.TestCase):
+    """Fixtures only -- never touches the live installation or database."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self.tmp.name) / "project"
+        self.data = Path(self.tmp.name) / "data"
+        self.project.mkdir(); self.data.mkdir()
+        self.env = os.environ.copy()
+        self.env["MY_ERROR_DATA_DIR"] = str(self.data)
+        self.env["CLAUDE_PROJECT_DIR"] = str(self.project)
+        self.env["MY_ERROR_MODE"] = "SHADOW"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_cli(self, *args, event=None):
+        return subprocess.run([sys.executable, str(SCRIPT), *args],
+                              input=(json.dumps(event) if event is not None else None),
+                              text=True, capture_output=True, env=self.env, cwd=str(self.project))
+
+    def _db(self):
+        return sqlite3.connect(self.data / "my-error.db")
+
+    def test_incoherent_release_refuses_to_open_a_new_shadow_window(self):
+        # Bootstrap the schema, then plant a beacon that declares a DIFFERENT
+        # version than the code about to run -- exactly the live incident
+        # (code 0.5.0, installed 0.4.5, db at schema 6).
+        self.run_cli("doctor", "--json")
+        (self.data / "runtime.json").write_text(json.dumps({"version": "9.9.9"}), encoding="utf-8")
+        p = self.run_cli("hook", "guard",
+                         event={"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                "tool_input": {"command": "anything"}})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        db = self._db()
+        try:
+            v3 = db.execute("select value from meta where key='shadow_v3_started_at'").fetchone()
+            mismatches = db.execute(
+                "select value from meta where key='release_incoherence_mismatches'").fetchone()
+        finally:
+            db.close()
+        self.assertIsNone(v3, "a new SHADOW window must not open while the release is incoherent")
+        self.assertIsNotNone(mismatches)
+        self.assertIn("9.9.9", mismatches[0])
+
+    def test_coherent_release_opens_the_window_normally(self):
+        self.run_cli("doctor", "--json")
+        p = self.run_cli("hook", "guard",
+                         event={"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                "tool_input": {"command": "anything"}})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        db = self._db()
+        try:
+            v3 = db.execute("select value from meta where key='shadow_v3_started_at'").fetchone()
+        finally:
+            db.close()
+        self.assertIsNotNone(v3, "a coherent release must be able to open the window")
+
+    def test_contamination_is_annotated_not_erased(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import importlib
+        me = importlib.import_module("my_error"); importlib.reload(me)
+        try:
+            self.run_cli("doctor", "--json")
+            db = sqlite3.connect(self.data / "my-error.db")
+            db.row_factory = me.sqlite3.Row
+            try:
+                db.execute("insert or replace into meta(key,value) values('shadow_v3_started_at',?)",
+                          ("2026-10-01T00:00:00+00:00",))
+                db.commit()
+                note = {"detected_at": "2026-10-01T12:00:00+00:00", "code_version": "0.5.0",
+                       "installed_version": "0.4.5", "reason": "CLI run with newer code against older install"}
+                me.annotate_shadow_v3_contamination(db, note)
+                history = json.loads(me.meta_get(db, "shadow_v3_contamination_note"))
+                self.assertEqual(len(history), 1)
+                self.assertEqual(history[0]["installed_version"], "0.4.5")
+                # The window itself must survive the annotation untouched.
+                self.assertEqual(me.meta_get(db, "shadow_v3_started_at"), "2026-10-01T00:00:00+00:00")
+            finally:
+                db.close()
+        finally:
+            sys.path.remove(str(ROOT / "scripts"))
+        d = json.loads(self.run_cli("doctor", "--json").stdout)
+        self.assertEqual(len(d["shadow_v3_contamination_note"]), 1)
+        out = self.run_cli("doctor").stdout
+        self.assertIn("CONTAMINATION NOTE", out)
+
+
+class CrossVersionCompatibilityTest(unittest.TestCase):
+    """Older code against a v7 database: forward-compat and rollback, proven.
+
+    Extracts 0.4.5 and 0.5.0 from this repo's own git history (the versions
+    named in docs/ARCHITECTURE.md and the live incident report) and runs them,
+    unmodified, against a database the CURRENT code has migrated to v7.
+    """
+
+    OLD_VERSIONS = {"0.4.5": "b9abf55", "0.5.0": "e3401dc"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self.tmp.name) / "project"
+        self.data = Path(self.tmp.name) / "data"
+        self.project.mkdir(); self.data.mkdir()
+        self.env = os.environ.copy()
+        self.env["MY_ERROR_DATA_DIR"] = str(self.data)
+        self.env["CLAUDE_PROJECT_DIR"] = str(self.project)
+        self.env["MY_ERROR_MODE"] = "SHADOW"
+        # Migrate to v7 through the CURRENT, real code first.
+        subprocess.run([sys.executable, str(SCRIPT), "doctor", "--json"],
+                       text=True, capture_output=True, env=self.env, cwd=str(self.project), check=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _extract(self, sha: str) -> Path:
+        out = subprocess.run(["git", "show", f"{sha}:scripts/my_error.py"], cwd=str(ROOT),
+                             text=True, capture_output=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        old = Path(self.tmp.name) / f"old_{sha}.py"
+        old.write_text(out.stdout, encoding="utf-8")
+        return old
+
+    def test_old_versions_operate_correctly_against_a_v7_database(self):
+        db_before = (self.data / "my-error.db").read_bytes()
+        for label, sha in self.OLD_VERSIONS.items():
+            old_script = self._extract(sha)
+            p = subprocess.run([sys.executable, str(old_script), "doctor", "--json"],
+                               text=True, capture_output=True, env=self.env, cwd=str(self.project))
+            self.assertEqual(p.returncode, 0, f"{label} ({sha}) failed against a v7 database: {p.stderr}")
+            d = json.loads(p.stdout)
+            self.assertIn("schema_version", d)
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            # Rollback proof: the old code's fast path (_user_version >= its own
+            # SCHEMA_VERSION) must have left the v7 database at v7 -- it has no
+            # reason to touch `user_version` at all, since its own constant is
+            # smaller. What is "lost" running old code: it cannot read or act on
+            # severity/condition/exceptions/prevention_class, the new tables
+            # (guard_suppressions, guard_condition_issues, recurrence_events), or
+            # any of the 0.6.0 metrics -- it simply never queries them. What is
+            # preserved: every column and table that existed at its own schema
+            # version, unchanged in shape and content.
+            self.assertEqual(int(db.execute("PRAGMA user_version").fetchone()[0]), SCHEMA_VERSION_EXPECTED)
+        finally:
+            db.close()
