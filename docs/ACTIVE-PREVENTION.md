@@ -249,3 +249,22 @@ The final report separates four things and does not blur them:
 Green tests mean the machinery behaves as specified. They are not evidence of
 preventive efficacy, which requires a controlled recurrence blocked before
 execution, measured as `actually_blocked` with a confirmed causal outcome.
+
+## 10. Correction (schema v8): metrics must read fire-time facts, never a live join
+
+Section 5's `actually_blocked` was specified, and implemented, as a join from
+`guard_events` to `guards.severity`. That is a defect this document inherited, not
+one it created: a guard's severity is mutable, so the join made a past event's
+meaning depend on the guard's state at READ time rather than at FIRE time. Editing a
+guard after it fired silently rewrote what every one of its past events meant.
+
+The fix, detailed in `CHANGELOG.md`: `guard_events.severity_at_fire`/`decision`/
+`guard_fingerprint`/`rule_fingerprint`, written once in `run_guard()` before the
+output is decided, and `actually_blocked` now reads `decision='denied'` directly --
+no join to `guards` for anything behavioural, ever. Pre-existing rows have none of
+this and are reported `unknown-at-fire`, never backfilled and never silently folded
+into either a "true" or "false" answer. `release_coherence_check()` also gained a
+check for hooks actually LOADED (evidenced by the beacon and the external watchdog's
+health file), not merely declared in the manifest, per the user's 2026-10-01
+requirement that a new window confirm coherence between the installed version, the
+hooks effectively loaded, the schema and the baseline before WARN is ever enabled.

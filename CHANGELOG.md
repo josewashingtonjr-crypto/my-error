@@ -4,6 +4,88 @@ Built per `docs/ACTIVE-PREVENTION.md`. Machinery only -- no guard is seeded for
 ERR-0001/0003/0017, and the WARN channel ships off by default so the SHADOW v3
 freeze is untouched by this release.
 
+## Correction: schema v8, frozen fire-time facts (mandatory, blocks ENFORCE)
+
+A reported defect, fixed before ENFORCE/WARN are ever authorized: `actually_blocked`
+joined `guard_events` to the guard's **current** `severity`, so editing a guard after
+it fired retroactively rewrote what that past event meant. Historical metrics must be
+immutable; a guard's definition may change, but what it DID the moment it fired may not.
+
+- `guard_events.severity_at_fire`, `.decision`, `.guard_fingerprint`, `.rule_fingerprint`,
+  and `guards.fingerprint` -- schema v8, additive only, same `_add_v8_columns()` /
+  `migrate()` pattern as v7. `guards.fingerprint` is backfilled for existing rows (a
+  pure function of columns already on the row -- not a fire-time fact); the four
+  `guard_events` columns are genuine fire-time facts with no reconstructible value and
+  are deliberately left NULL on every pre-existing row -- never backfilled from the
+  guard's current state, which is exactly the defect this release fixes. A NULL here is
+  reported as `unknown-at-fire`, a third reading distinct from both "true" and "false",
+  in the same spirit as `NOT_MEASURABLE` vs `SCHEMA_INSUFFICIENT`.
+- Closed `decision` vocabulary, written once at fire time, in `run_guard()`, before the
+  SHADOW/ENFORCE branch that used to compute severity runs: `denied`, `warn_emitted`,
+  `warn_suppressed_channel_off`, `silent_shadow`. (The full closed vocabulary also
+  names `suppressed_by_exception` and `condition_inert` -- both already recorded, at
+  fire time, in the pre-existing `guard_suppressions`/`guard_condition_issues` tables,
+  which never join back to a guard's live state either, so they already satisfy the
+  invariant without a new column; a `guard_events` row is only ever created once a
+  guard has matched, i.e. after both of those paths have already been ruled out.)
+- `guard_fingerprint()`: a stable identity for a guard's behavioural DEFINITION --
+  `tool_name`/`field_name`/`match_type`/`pattern`/`condition`/`exceptions`/`severity`/
+  `replacement`, deliberately excluding `reason` (prose) and bookkeeping columns.
+  Computed at guard creation (both `make_auto_lesson()` and `learn --guard-tool`) and
+  stored on `guards.fingerprint`; computed AGAIN, fresh, at fire time in `run_guard()`
+  and frozen onto the event, so a later edit to the guard changes the fingerprint of
+  its NEXT firing without ever touching the one already on disk.
+- `lessons.rule_text` is quoted verbatim in a DENY's message, so an edited lesson
+  changes what a past block appears to have said -- the same class of defect as
+  severity, one level down. Fixed with `text_fingerprint()` (`guard_events.
+  rule_fingerprint`) rather than freezing the full string into every firing of a hot
+  guard, which would duplicate data without adding a capability the fingerprint
+  doesn't already provide (detecting that the wording changed).
+- `prevention_metrics()`'s `actually_blocked` now reads `decision='denied'` directly off
+  `guard_events` -- no join to `guards` for anything behavioural, ever. A new
+  `actually_blocked_unknown_at_fire` counts ENFORCE events whose `decision` is NULL
+  (pre-v8 rows, or a v7 database read by this code before it migrates) and is never
+  folded into `actually_blocked` or any other bucket; `doctor` surfaces the count
+  explicitly so the gap is visible instead of implied.
+  **Audited and found clean** (no behavioural join to `guards`'s live state):
+  `canonical_dataset()` (already reads `causal_outcome`/`mode`/`guard_class` off
+  `guard_events` directly), `collect_metrics()` (`would_block`/`actual_blocks` are
+  `mode`-based, already frozen; the one `JOIN guards` it has is a current-state
+  descriptive count of `guards_active`, not an interpretation of a past event), and
+  `cmd_recall_audit()` (`recall_metrics()` never touches `guards` or `guard_events` at
+  all). **Found and deliberately NOT changed, out of this release's scope**:
+  `resolve_guard_events()` (causal-outcome resolution, run moments after a guard fires,
+  in the same hook pipeline) joins `guards` for `eval_class`/`confirm_evidence`/
+  `pattern` to score the firing it is resolving. This is a live re-read of the SAME
+  kind this release otherwise forbids; closing it fully would need its own frozen
+  snapshot of those three fields (there is no CLI to edit a guard today, so the risk
+  window is only "between PreToolUse and the matching PostToolUse/PostToolUseFailure
+  in the same session", not "across days"), tracked separately rather than folded into
+  this correction.
+- `release_coherence_check()` now also verifies hooks ACTUALLY LOADED, not merely
+  declared in the manifest: `hooks_evidence()` reads, read-only, my-error's own beacon
+  (`runtime.json`, `last_hook`/`last_seen` -- proof of the single most recently fired
+  hook) and the external watchdog's `.my-error-health.json` (a per-hook boolean map,
+  confirmed shape `{"at": <epoch ms>, "health": {"hooks_registered": bool, "hooks":
+  {...}}}`). A declared hook with no evidence in either source is reported
+  `unverified`, never silently folded into "present". Both paths are injectable
+  (`beacon_path`/`health_path` params; `MY_ERROR_HOOKS_HEALTH_PATH` env override for
+  the CLI path) so this is testable against fixtures, never against this machine's
+  real files. Absent or unreadable evidence degrades to "cannot verify" for that
+  source and is always a mismatch -- it must never read as `coherent: yes`. Evidence
+  older than `HOOKS_EVIDENCE_STALE_SECONDS` (24h) is reported stale, not current proof.
+- `CrossVersionCompatibilityTest`/`ReadOnlyOnOlderSchemaTest` extended to v8, including
+  a genuine v7 fixture built from this branch's own history (`c24127d`, this branch's
+  last pre-v8 commit) via `git show`, now that v7 commits exist on it: 0.4.5, 0.5.0 and
+  0.6.0-v7 all still operate correctly, read-only, against a v8 database (and never
+  migrate it), and a genuinely-v7 database read by current code is NOT
+  `SCHEMA_INSUFFICIENT` for v7-level metrics but reports every v8 fire-time fact on it
+  as unknown-at-fire.
+- `heldout_live_benchmark.py`'s 93.9% (31/33) result is now documented permanently in
+  `docs/TESTING.md`, with its established cause (no `pytest` binary on this machine,
+  3 pairs skip; `npm rn build`/`npm lss` fall outside the auto-eligible failure
+  families) stated plainly. The 100% threshold was not changed to manufacture a pass.
+
 - Contextual recall at PreToolUse dropped the tool name and the raw `cwd`
   from its query. Both are constant for every event in a session (every Bash
   call carries the literal token "Bash"; `cwd` rarely changes mid-session),
