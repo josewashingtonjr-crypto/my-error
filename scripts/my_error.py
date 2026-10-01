@@ -22,8 +22,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "0.5.0"
-SCHEMA_VERSION = 6
+VERSION = "0.6.0"
+SCHEMA_VERSION = 7
 MAX_TEXT = 4000
 AUTO_GUARD_TTL_DAYS = 90
 RECOVERY_WINDOW_MINUTES = 15
@@ -146,6 +146,152 @@ GUARD_CLASSES = (GUARD_CLASS_EXECUTION, GUARD_CLASS_SIDE_EFFECT, GUARD_CLASS_DES
 # yields UNVERIFIED rows by design; widening it requires writing a real probe,
 # not editing this tuple.
 GUARD_CLASSES_OBSERVABLE = (GUARD_CLASS_EXECUTION,)
+
+# --- 0.6.0: active prevention -----------------------------------------------
+# Decouples "a guard matched" from "a guard blocked". `warn` can only ever add
+# context; `deny` can block, and only in ENFORCE. The CLI default for a
+# hand-authored or auto-learned guard stays `deny` (see cmd_learn/
+# make_auto_lesson) so the 0.5.0 guard behaviour every existing test asserts
+# is unchanged -- the schema DEFAULT is `warn` because that is the safe
+# assumption for a guard this code did not itself create (a migrated row with
+# no declared intent).
+SEVERITY_WARN = "warn"
+SEVERITY_DENY = "deny"
+GUARD_SEVERITIES = (SEVERITY_WARN, SEVERITY_DENY)
+
+# Lesson classification (docs/ACTIVE-PREVENTION.md section 1). Stored and
+# reviewable; nothing in this release auto-converts a free-text rule into a
+# blocking guard on the strength of this column alone.
+PREVENTION_BLOCKABLE = "BLOCKABLE"
+PREVENTION_WARNABLE = "WARNABLE"
+PREVENTION_INFORMATIONAL = "INFORMATIONAL"
+PREVENTION_CLASSES = (PREVENTION_BLOCKABLE, PREVENTION_WARNABLE, PREVENTION_INFORMATIONAL)
+
+
+class ConditionUnevaluable(Exception):
+    """A condition predicate could not be decided -- not True, not False.
+
+    Raised by a condition function when the event does not carry enough
+    information (no `cwd`) or when deciding it raised (a path check hitting a
+    permissions error). The guard must treat this exactly like an unknown
+    condition name: inert for this firing, never a match, never a deny, and
+    recorded so `doctor` can show it rather than the guard silently never
+    firing for a reason nobody can see.
+    """
+
+
+def _candidate_paths(event: dict[str, Any]) -> list[str]:
+    """Paths parsed out of an action, for the `path_missing` / `path_exists` conditions.
+
+    Deliberately conservative: `file_path` from Write/Edit tool_input is exact;
+    for Bash, a shell token is treated as a path candidate only if it looks
+    like one (contains a slash, or is a bare `name.ext`). This is a heuristic,
+    not a shell parser -- see docs/ACTIVE-PREVENTION.md section 7 on limits.
+    """
+    inp = event.get("tool_input") or {}
+    paths: list[str] = []
+    fp = inp.get("file_path")
+    if fp:
+        paths.append(str(fp))
+    cmd = inp.get("command")
+    if cmd:
+        try:
+            tokens = shlex.split(str(cmd))
+        except ValueError:
+            tokens = str(cmd).split()
+        for t in tokens:
+            if t.startswith("-") or not t:
+                continue
+            if "/" in t or re.match(r"^[\w.-]+\.[A-Za-z0-9]{1,8}$", t):
+                paths.append(t)
+    return paths
+
+
+def _resolve_candidate_path(p: str, cwd: str) -> Path:
+    pp = Path(p).expanduser()
+    if not pp.is_absolute() and cwd:
+        pp = Path(cwd) / pp
+    return pp
+
+
+def cond_always(event: dict[str, Any]) -> bool:
+    return True
+
+
+def cond_cwd_not_git_repo(event: dict[str, Any]) -> bool:
+    cwd = str(event.get("cwd") or "")
+    if not cwd:
+        raise ConditionUnevaluable("event carries no cwd; cannot decide git-repo membership")
+    try:
+        return git_common_dir(cwd) is None
+    except Exception as exc:  # noqa: BLE001 - any failure here is "cannot decide", not "no"
+        raise ConditionUnevaluable(f"git_common_dir raised: {exc!r}") from exc
+
+
+def cond_path_missing(event: dict[str, Any]) -> bool:
+    cwd = str(event.get("cwd") or "")
+    paths = _candidate_paths(event)
+    if not paths:
+        return False  # nothing parsed: a legitimate False, not an unevaluable condition
+    try:
+        return any(not _resolve_candidate_path(p, cwd).exists() for p in paths)
+    except OSError as exc:
+        raise ConditionUnevaluable(f"path check raised: {exc!r}") from exc
+
+
+def cond_path_exists(event: dict[str, Any]) -> bool:
+    cwd = str(event.get("cwd") or "")
+    paths = _candidate_paths(event)
+    if not paths:
+        return False
+    try:
+        return any(_resolve_candidate_path(p, cwd).exists() for p in paths)
+    except OSError as exc:
+        raise ConditionUnevaluable(f"path check raised: {exc!r}") from exc
+
+
+# Closed registry. No `eval`, no dynamic import -- an unknown name must be
+# representable only as "not in this dict", never as a string to execute.
+CONDITIONS = {
+    "always": cond_always,
+    "cwd_not_git_repo": cond_cwd_not_git_repo,
+    "path_missing": cond_path_missing,
+    "path_exists": cond_path_exists,
+}
+
+# PreToolUse contextual recall (docs/ACTIVE-PREVENTION.md section 4). Strict
+# noise budget: this phase fires on every Bash/Write/Edit, so the ceiling is
+# much tighter than prompt-time recall's.
+PRETOOLUSE_RECALL_LIMIT = 2
+PRETOOLUSE_RELEVANCE_FLOOR = 2  # exact-token overlap, OR a tag hit
+
+NOT_MEASURABLE = "NOT_MEASURABLE"
+NOT_MEASURABLE_REASON = (
+    "no active guards exist, so this is structurally unmeasurable -- reporting 0 "
+    "would read as 'nothing happened' when the truth is 'nothing COULD be measured'"
+)
+
+
+def warn_channel_enabled(db: sqlite3.Connection | None) -> bool:
+    """The third, independent switch. Default OFF.
+
+    Gates contextual recall at PreToolUse and any `severity=warn` guard output.
+    It does not gate `severity=deny`: a deny is the pre-existing ENFORCE
+    blocking mechanism, not new context injection, and must keep meaning
+    exactly what it means today. Off by design until the SHADOW v3 freeze
+    (02/10) lifts -- see docs/ACTIVE-PREVENTION.md.
+    """
+    env = os.getenv("MY_ERROR_WARN")
+    if env is not None:
+        return env.strip().lower() in ("1", "true", "yes", "on")
+    if db is None:
+        return False
+    try:
+        val = meta_get(db, "warn_channel_enabled")
+    except sqlite3.Error:
+        return False
+    return (val or "").strip().lower() in ("1", "true", "yes", "on")
+
 
 # What the verdict does and does not judge. Printed by the doctor verbatim so
 # the scope cannot quietly widen between the code and the report.
@@ -937,6 +1083,64 @@ def _add_v6_columns(db: sqlite3.Connection) -> None:
     add_column(db, "recall_events", "pool_size", "INTEGER")
 
 
+SCHEMA_V7 = """
+CREATE TABLE IF NOT EXISTS guard_suppressions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guard_id INTEGER NOT NULL,
+  lesson_id INTEGER NOT NULL,
+  project_id TEXT NOT NULL,
+  session_id TEXT,
+  tool_name TEXT NOT NULL,
+  action TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  origin TEXT NOT NULL DEFAULT 'natural_usage',
+  experiment TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_guard_suppressions_guard ON guard_suppressions(guard_id, created_at);
+CREATE TABLE IF NOT EXISTS guard_condition_issues (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guard_id INTEGER NOT NULL,
+  lesson_id INTEGER NOT NULL,
+  project_id TEXT NOT NULL,
+  session_id TEXT,
+  condition_name TEXT,
+  kind TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_guard_condition_issues_guard ON guard_condition_issues(guard_id, created_at);
+CREATE TABLE IF NOT EXISTS recurrence_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  candidate_id INTEGER,
+  lesson_id INTEGER,
+  project_id TEXT NOT NULL,
+  session_id TEXT,
+  tool_name TEXT NOT NULL,
+  detected_at TEXT NOT NULL,
+  attribution TEXT NOT NULL,
+  origin TEXT NOT NULL DEFAULT 'natural_usage',
+  experiment TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recurrence_events_lesson ON recurrence_events(lesson_id, detected_at);
+"""
+
+
+def _add_v7_columns(db: sqlite3.Connection) -> None:
+    """Severity/condition/exceptions on guards; prevention_class on lessons.
+
+    Additive only, per docs/ACTIVE-PREVENTION.md section 2. A row that
+    predates this release keeps working: `severity` defaults to `warn` (never
+    denies on its own), `condition`/`exceptions` default to NULL (unconditional,
+    no suppression -- identical to pre-0.6.0 behaviour), and `prevention_class`
+    defaults to WARNABLE (the conservative classification; nothing is assumed
+    BLOCKABLE just because it predates the column).
+    """
+    add_column(db, "guards", "severity", f"TEXT NOT NULL DEFAULT '{SEVERITY_WARN}'")
+    add_column(db, "guards", "condition", "TEXT")
+    add_column(db, "guards", "exceptions", "TEXT")
+    add_column(db, "lessons", "prevention_class", f"TEXT NOT NULL DEFAULT '{PREVENTION_WARNABLE}'")
+
+
 def _experiment_for(started_v2: str | None, started_v3: str | None, created_at: str) -> str:
     """Which generation a row belongs to, from its timestamp alone.
 
@@ -1072,6 +1276,10 @@ def migrate(db: sqlite3.Connection, current: int) -> None:
             "UPDATE guards SET confirm_evidence=? WHERE match_type=? AND pattern LIKE '%pkill%'",
             (r"[Ee]xit code (137|143|144)\b", MATCH_SHELL_CMD))
         db.execute("PRAGMA user_version=6")
+    if current < 7:
+        _add_v7_columns(db)
+        _exec_script(db, SCHEMA_V7)
+        db.execute("PRAGMA user_version=7")
 
 
 def _baseline_snapshot(db: sqlite3.Connection, at: str) -> dict[str, Any]:
@@ -1110,6 +1318,121 @@ def meta_get(db: sqlite3.Connection, key: str) -> str | None:
     return str(row[0]) if row else None
 
 
+def connect_readonly() -> sqlite3.Connection:
+    """Open the store for an observational command, without changing it.
+
+    This is the fix for a real incident: running `my_error.py metrics` with a
+    newer checkout against an older installed database silently advanced the
+    schema and, as a side effect of `migrate()`'s generation-closing logic,
+    closed SHADOW v2 and opened v3 -- an observation that changed the thing it
+    was observing.
+
+    The hazard is specifically an EXISTING file at an older (or newer) schema
+    being touched by a read. A file that does not exist yet has no history to
+    rotate -- every generation-closing step in `migrate()` is gated on a meta
+    row that cannot exist in a database nothing has ever written to -- so
+    bootstrapping it once, here, is not the hazard this function exists to
+    prevent; it is what every `doctor`/`metrics` call has always done on a
+    fresh install, and tests rely on exactly that ("create the schema through
+    the product's own path, then read state").
+
+    Registering that a project exists (`ensure_project`) is deliberately still
+    allowed on this connection: it is an idempotent, already-throttled write to
+    the `projects` bookkeeping table with no bearing on schema version or
+    experiment state, existing behaviour depends on it, and it is not the
+    mutation the live incident was about. What this function removes is the
+    unconditional `ensure_schema()` call `connect()` makes on every open --
+    THAT is the mechanism that silently migrated an older installed database
+    and, as a side effect, rotated the experiment generation.
+    """
+    db_path = data_dir() / "my-error.db"
+    if not db_path.exists():
+        ensure_schema(db_path)
+    db = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_MS / 1000.0)
+    db.row_factory = sqlite3.Row
+    db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    return db
+
+
+def schema_compat_note(db: sqlite3.Connection) -> str | None:
+    """What a read-only command may say about a schema mismatch -- never fix it."""
+    try:
+        v = _user_version(db)
+    except sqlite3.Error:
+        return None
+    if v == SCHEMA_VERSION:
+        return None
+    if v < SCHEMA_VERSION:
+        return (f"database is schema v{v}; this code expects v{SCHEMA_VERSION}. "
+                "Read-only commands never migrate -- run a hook, or a write command "
+                "(learn/forget/scope/mode --set), to bring it current.")
+    return (f"database is schema v{v}, NEWER than this code's v{SCHEMA_VERSION} -- "
+            "an older binary is reading a newer database; columns it does not know "
+            "about are simply not read.")
+
+
+def release_coherence_check(db: sqlite3.Connection) -> tuple[bool, list[str]]:
+    """Do the running code, the beacon, the installed manifest, the schema and
+    the hooks manifest all name the SAME release?
+
+    This is the precondition for opening a new SHADOW experiment window
+    (`active_experiment_started(create=True)`): the live incident this guards
+    against is real, not hypothetical -- code 0.5.0 ran against an installed
+    0.4.5 and a database at schema 6, and that mismatch is exactly what let an
+    observational command silently advance the schema and rotate the
+    experiment. It never touches the live installation; it only reads files
+    already on disk next to this script and the database already open.
+    """
+    mismatches: list[str] = []
+    try:
+        beacon = json.loads((data_dir() / "runtime.json").read_text(encoding="utf-8"))
+        beacon_version = beacon.get("version")
+    except Exception:
+        beacon_version = None
+    if beacon_version and beacon_version != VERSION:
+        mismatches.append(f"code is {VERSION} but the last beacon (runtime.json) declared {beacon_version}")
+    try:
+        plugin_json = Path(__file__).resolve().parents[1] / ".claude-plugin" / "plugin.json"
+        installed_version = json.loads(plugin_json.read_text(encoding="utf-8")).get("version")
+    except Exception:
+        installed_version = None
+    if installed_version and installed_version != VERSION:
+        mismatches.append(f"code is {VERSION} but the installed plugin.json declares {installed_version}")
+    try:
+        db_schema = _user_version(db)
+    except sqlite3.Error:
+        db_schema = None
+    if db_schema is not None and db_schema != SCHEMA_VERSION:
+        mismatches.append(f"code expects schema v{SCHEMA_VERSION} but the database is v{db_schema}")
+    hooks = hooks_declared()
+    expected_hooks = {"SessionStart", "UserPromptSubmit", "PreToolUse",
+                      "PostToolUseFailure", "PostToolUse", "Stop", "SessionEnd"}
+    declared = {ev for ev, ok in hooks.items() if ok}
+    missing = expected_hooks - declared
+    if missing:
+        mismatches.append(f"hooks manifest is missing: {sorted(missing)}")
+    return (not mismatches, mismatches)
+
+
+def annotate_shadow_v3_contamination(db: sqlite3.Connection, note: dict[str, Any]) -> None:
+    """Record that the CURRENT v3 window's bookkeeping is contaminated, without
+    erasing it.
+
+    Append-only history under one meta key, never an overwrite: deleting the
+    contaminated timestamps to manufacture a clean baseline is exactly the
+    failure mode this project keeps dying of (see SHADOW v1 and v2's own
+    closures, which preserve rather than discard). A window stays open; the
+    annotation travels beside it and `doctor` surfaces it.
+    """
+    existing = meta_get(db, "shadow_v3_contamination_note")
+    history = json.loads(existing) if existing else []
+    history.append(note)
+    with_retry(lambda: db.execute(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES('shadow_v3_contamination_note',?)",
+        (json.dumps(history, ensure_ascii=False),)), db)
+    with_retry(db.commit, db)
+
+
 def active_experiment_started(db: sqlite3.Connection, create: bool = False) -> str | None:
     """Start of the experiment generation currently being judged (v3).
 
@@ -1117,11 +1440,30 @@ def active_experiment_started(db: sqlite3.Connection, create: bool = False) -> s
     v2's; neither is ever rewritten -- they are the historical record. This is
     the clock the pre-committed rule runs on, and it moves to a new key each time
     a generation closes rather than being reset in place.
+
+    A NEW window will not open while `release_coherence_check` disagrees with
+    itself (see that function's docstring for the incident that motivated it).
+    An already-open window is never touched by this check -- it only gates the
+    moment a window would be CREATED, which is the only moment a mismatch can
+    do silent harm.
     """
     val = meta_get(db, "shadow_v3_started_at")
     if val:
         return val
     if not create:
+        return None
+    coherent, mismatches = release_coherence_check(db)
+    if not coherent:
+        now = utcnow()
+        try:
+            with_retry(lambda: db.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES('release_incoherence_detected_at',?)", (now,)), db)
+            with_retry(lambda: db.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES('release_incoherence_mismatches',?)",
+                (json.dumps(mismatches, ensure_ascii=False),)), db)
+            with_retry(db.commit, db)
+        except sqlite3.Error:
+            pass
         return None
     now = utcnow()
     try:
@@ -1499,6 +1841,54 @@ def recall(db: sqlite3.Connection, pid: str, query: str, limit: int = 5,
     return chosen
 
 
+def contextual_recall(db: sqlite3.Connection, pid: str, event: dict[str, Any], session: str) -> list[sqlite3.Row]:
+    """Stage A of the PreToolUse execution gate: recall, never a block.
+
+    `recall()` is already generic -- it scores an arbitrary query string. This
+    is a new call site, not a new engine: the query is built from the tool
+    name, the redacted action, cwd and any parsed paths, exactly the way
+    docs/ACTIVE-PREVENTION.md section 4 specifies.
+
+    PreToolUse fires on every Bash/Write/Edit, so the budget here is much
+    stricter than prompt-time recall's: at most PRETOOLUSE_RECALL_LIMIT
+    lessons, a hard relevance floor (exact-token overlap, or a tag hit) BEFORE
+    scoring -- not a ranking tweak applied after the fact -- and a same-session
+    dedup against anything already delivered, so a lesson shown at the prompt
+    is not shown again one tool call later.
+    """
+    tool = str(event.get("tool_name", ""))
+    inp = event.get("tool_input") or {}
+    cwd = str(event.get("cwd") or "")
+    action = extract_action(tool, inp)
+    paths = " ".join(_candidate_paths(event))
+    query = f"{tool} {action} {cwd} {paths}"
+    q_raw = base_tokens(query)
+    q = tokenize(query)
+    now = utcnow()
+    scored: list[tuple[float, sqlite3.Row]] = []
+    for row in lesson_rows(db, pid):
+        hay = f"{row['title']} {row['cause']} {row['rule_text']} {row['tags']}"
+        t_raw = base_tokens(hay)
+        tag_set = {t.strip() for t in (row["tags"] or "").split(",") if t.strip()}
+        exact_overlap = len(q_raw & t_raw)
+        tag_hit = bool(tag_set & q_raw)
+        if exact_overlap < PRETOOLUSE_RELEVANCE_FLOOR and not tag_hit:
+            continue
+        if lesson_seen_in_session(db, row["id"], session, now):
+            continue
+        t = tokenize(hay)
+        expanded_overlap = len(q & t)
+        semantic_only = max(0, expanded_overlap - exact_overlap)
+        score = exact_overlap * 2.0 + semantic_only * 1.15 + row["confidence"] + (0.5 if tag_hit else 0.0)
+        scored.append((score, row))
+    scored.sort(key=lambda x: (-x[0], -x[1]["confidence"], x[1]["id"]))
+    chosen = [r for _, r in scored[:PRETOOLUSE_RECALL_LIMIT]]
+    if chosen:
+        record_recall_deliveries(db, pid, chosen, session, "pretooluse", PRETOOLUSE_RECALL_LIMIT, len(scored))
+        db.commit()
+    return chosen
+
+
 def format_lessons(rows: Iterable[sqlite3.Row], heading: str = "Relevant learned rules") -> str:
     rows = list(rows)
     if not rows:
@@ -1520,6 +1910,15 @@ def upsert_candidate(db: sqlite3.Connection, pid: str, event: dict[str, Any]) ->
     fp = fingerprint(err)
     now = utcnow()
     session = str(event.get("session_id", ""))
+    # Checked BEFORE the upsert, because the upsert's ON CONFLICT path is what
+    # erases the distinction between "first sighting" and "this exact mistake
+    # already became a lesson". A failure recurring against an already-learned
+    # candidate is `recurrence_detected` on its own -- docs/ACTIVE-PREVENTION.md
+    # section 6 -- independent of whether any guard matched or any recall fired.
+    prior = db.execute(
+        "SELECT status, lesson_id FROM candidates WHERE project_id=? AND tool_name=? AND bad_action=? AND error_fingerprint=?",
+        (pid, tool, action, fp),
+    ).fetchone()
     # Origin is captured only on first sighting and never touched by the
     # ON CONFLICT branch: a candidate's classification is decided the moment
     # it is first observed and does not flip on a later repeat.
@@ -1534,8 +1933,50 @@ def upsert_candidate(db: sqlite3.Connection, pid: str, event: dict[str, Any]) ->
         "SELECT id FROM candidates WHERE project_id=? AND tool_name=? AND bad_action=? AND error_fingerprint=?",
         (pid, tool, action, fp),
     ).fetchone()
+    if prior and prior["status"] == "learned" and prior["lesson_id"]:
+        attribution = classify_recurrence_attribution(db, pid, session, int(prior["lesson_id"]), tool, action, now)
+        def _write_recurrence() -> None:
+            db.execute(
+                "INSERT INTO recurrence_events(candidate_id,lesson_id,project_id,session_id,tool_name,"
+                "detected_at,attribution,origin,experiment) VALUES(?,?,?,?,?,?,?,?,?)",
+                (int(row["id"]), int(prior["lesson_id"]), pid, session, tool, now,
+                 attribution, origin, current_experiment(db)))
+            db.commit()
+        with_retry(_write_recurrence, db)
     db.commit()
     return int(row["id"]), family, eligible, ignored
+
+
+def classify_recurrence_attribution(db: sqlite3.Connection, pid: str, session: str, lesson_id: int,
+                                    tool: str, action: str, now: str) -> str:
+    """Attribute a recurrence to exactly one failure mode -- a heuristic, not a proof.
+
+    docs/ACTIVE-PREVENTION.md section 6 asks for recall failure / guard
+    failure / classification failure / not-mechanically-verifiable. In order
+    of strength:
+
+    1. No active guard at all for this lesson/tool: the lesson was never given
+       the capacity to block -- `classification_failure`.
+    2. The lesson WAS delivered to this session before the action (recall
+       worked) and the mistake still happened: nothing mechanical explains
+       that -- `not_mechanically_verifiable`.
+    3. An active guard exists and its pattern matches this exact action: the
+       mechanism that should have caught it existed and applied --
+       `guard_failure` (in SHADOW this is expected and recorded elsewhere as
+       `would_block`; here it is scored as a guard-side explanation for the
+       recurrence regardless of mode).
+    4. Otherwise: recall never surfaced it and no guard applied --
+       `recall_failure`.
+    """
+    guards_for_lesson = [g for g in active_guards(db, pid, tool) if g["lesson_id"] == lesson_id]
+    if not guards_for_lesson:
+        return "classification_failure"
+    if lesson_seen_in_session(db, lesson_id, session, now):
+        return "not_mechanically_verifiable"
+    matched = any(guard_matches(g["match_type"], g["pattern"], action) for g in guards_for_lesson)
+    if matched:
+        return "guard_failure"
+    return "recall_failure"
 
 
 def command_similarity(a: str, b: str) -> float:
@@ -1588,16 +2029,24 @@ def make_auto_lesson(db: sqlite3.Connection, pid: str, candidate: sqlite3.Row, g
     )
     rule = f"For this project, do not retry `{candidate['bad_action']}` for this operation; use `{good_action}` instead."
     cur = db.execute("""
-      INSERT INTO lessons(project_id,scope,created_at,updated_at,title,cause,rule_text,confidence,status,source,source_candidate_id,tags,origin)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (pid, "project", now, now, title, cause, rule, 0.95, "active", sorted(AUTO_LESSON_SOURCES)[0], candidate["id"], candidate["error_family"], origin))
+      INSERT INTO lessons(project_id,scope,created_at,updated_at,title,cause,rule_text,confidence,status,source,source_candidate_id,tags,origin,prevention_class)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (pid, "project", now, now, title, cause, rule, 0.95, "active", sorted(AUTO_LESSON_SOURCES)[0], candidate["id"], candidate["error_family"], origin,
+          PREVENTION_BLOCKABLE))  # a narrow, verified one-token correction is exactly the deterministic case BLOCKABLE describes
     lesson_id = int(cur.lastrowid)
     expires = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=AUTO_GUARD_TTL_DAYS)).isoformat(timespec="seconds")
     db.execute("""
-      INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at,origin)
-      VALUES(?,?,?,?,?,?,?,?,1,?,?,?)
+      INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at,origin,severity)
+      VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?)
     """, (lesson_id, pid, "Bash", "command", "exact", candidate["bad_action"], good_action,
-          f"my-error learned this exact command already failed; use `{good_action}` instead.", now, expires, origin))
+          f"my-error learned this exact command already failed; use `{good_action}` instead.", now, expires, origin,
+          # Explicit, not inherited from the schema default: this pipeline
+          # already gates on a verified narrow correction (narrow_command_correction),
+          # so it is the one path this release still lets auto-promote straight
+          # to a blocking severity -- see docs/ACTIVE-PREVENTION.md section 6,
+          # which forbids auto-promoting a bare RECURRENCE to a guard, not this
+          # pre-existing, already-verified pipeline.
+          SEVERITY_DENY))
     db.execute("UPDATE candidates SET status='learned',recovery_action=?,recovery_evidence=recovery_evidence+1,lesson_id=? WHERE id=?",
                (good_action, lesson_id, candidate["id"]))
     db.commit()
@@ -1973,18 +2422,101 @@ def record_missed_recall(db: sqlite3.Connection, pid: str, session: str, tool: s
     return True
 
 
-def run_guard(db: sqlite3.Connection, pid: str, event: dict[str, Any]) -> dict[str, Any] | None:
+def record_condition_issue(db: sqlite3.Connection, pid: str, g: sqlite3.Row, session: str,
+                           condition_name: str | None, kind: str, reason: str) -> None:
+    """Auditable record that a guard's condition could not gate it this firing.
+
+    `kind` is `unknown` (the name is not in CONDITIONS) or `unverifiable` (the
+    registered predicate could not decide). Either way the guard is inert for
+    this event -- never a match, never a deny -- and that must be visible to
+    `doctor` rather than indistinguishable from a guard that simply did not
+    apply.
+    """
+    now = utcnow()
+    def _write() -> None:
+        db.execute(
+            "INSERT INTO guard_condition_issues(guard_id,lesson_id,project_id,session_id,"
+            "condition_name,kind,reason,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (g["id"], g["lesson_id"], pid, session, condition_name, kind, reason, now))
+        db.commit()
+    with_retry(_write, db)
+
+
+def exception_suppresses(exceptions: str | None, candidates: set[str]) -> bool:
+    """Is this action covered by the guard's exception, at shell COMMAND POSITION?
+
+    Precedence: an exception match suppresses the guard even though the
+    pattern matched -- exception wins over pattern, always, and the
+    suppression is recorded as `suppressed_by_exception`, never as a silent,
+    unrecorded pass.
+
+    Deliberately NOT a raw substring/regex search over the whole command. That
+    was the flaw in the first design: `\\b(grep|...)\\b` as a free-floating
+    regex is suppressed by `python3 -c "os.path.getpid()"  # grep` -- a trailing
+    comment, or the word sitting inside a quoted string, both contain the
+    literal text "grep" without the shell ever running it. Reusing
+    `shell_cmd_match` (the same matcher `match_type=shell_cmd` guards use)
+    means the exception is only honoured when the shell would actually
+    execute that word as a command -- the same reasoning `mask_shell_data`
+    already applies to guard patterns themselves, applied symmetrically to
+    the escape hatch so it cannot be wider than the door it is next to.
+    """
+    if not exceptions:
+        return False
+    try:
+        return any(shell_cmd_match(exceptions, v) == "command_position" for v in candidates)
+    except re.error:
+        return False  # a malformed exception pattern must never silently widen suppression
+
+
+def run_guard(db: sqlite3.Connection, pid: str, event: dict[str, Any],
+             warn_enabled: bool = False) -> dict[str, Any] | None:
     tool = str(event.get("tool_name", ""))
     inp = event.get("tool_input") or {}
     mode = get_mode(db)
     session = str(event.get("session_id", ""))
     for g in active_guards(db, pid, tool):
+        cond_name = (g["condition"] if "condition" in _keys(g) else None) or None
+        if cond_name:
+            fn = CONDITIONS.get(cond_name)
+            if fn is None:
+                record_condition_issue(db, pid, g, session, cond_name, "unknown",
+                                       f"condition '{cond_name}' is not in the registry")
+                continue
+            try:
+                decided = fn(event)
+            except ConditionUnevaluable as exc:
+                record_condition_issue(db, pid, g, session, cond_name, "unverifiable", str(exc))
+                continue
+            except Exception as exc:  # noqa: BLE001 - a crash here must never deny
+                record_condition_issue(db, pid, g, session, cond_name, "unverifiable",
+                                       f"unexpected error evaluating condition: {exc!r}")
+                continue
+            if not decided:
+                continue
+
         raw = get_field(inp, g["field_name"])
         # Guard patterns are stored redacted, so a command carrying a secret would
         # never match its own stored pattern. Compare both forms.
         candidates = {raw, redact(raw)}
         if not any(guard_matches(g["match_type"], g["pattern"], v) for v in candidates):
             continue
+
+        exceptions = g["exceptions"] if "exceptions" in _keys(g) else None
+        if exception_suppresses(exceptions, candidates):
+            now = utcnow()
+            experiment = current_experiment(db)
+            origin = event_origin()
+            action_s = redact(raw)
+            def _write_suppression() -> None:
+                db.execute(
+                    "INSERT INTO guard_suppressions(guard_id,lesson_id,project_id,session_id,"
+                    "tool_name,action,created_at,origin,experiment) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (g["id"], g["lesson_id"], pid, session, tool, action_s, now, origin, experiment))
+                db.commit()
+            with_retry(_write_suppression, db)
+            continue
+
         now = utcnow()
         action = redact(raw)
         # Where the match sat, recorded at fire time because it cannot be
@@ -2000,6 +2532,7 @@ def run_guard(db: sqlite3.Connection, pid: str, event: dict[str, Any]) -> dict[s
         # that firing must be judged as natural evidence, not attributed
         # forever to how the guard first came to exist.
         origin = event_origin()
+        ge_id_box: list[int] = []
 
         def record() -> None:
             db.execute("UPDATE guards SET hit_count=hit_count+1,last_hit=? WHERE id=?", (now, g["id"]))
@@ -2010,6 +2543,7 @@ def run_guard(db: sqlite3.Connection, pid: str, event: dict[str, Any]) -> dict[s
                 (g["id"], g["lesson_id"], pid, session, tool, action, mode, now, origin,
                  experiment, klass, CAUSAL_UNVERIFIED, match_context),
             )
+            ge_id_box.append(int(cur.lastrowid))
             # A guard match is a DETERMINISTIC proof of relevance: this stored
             # lesson is about this exact action, decided by a pattern rather than
             # by a similarity score. So if the lesson was not already in front of
@@ -2028,15 +2562,51 @@ def run_guard(db: sqlite3.Connection, pid: str, event: dict[str, Any]) -> dict[s
             # injected warning would change the very behaviour being measured.
             return None
 
+        severity = (g["severity"] if "severity" in _keys(g) else None) or SEVERITY_WARN
+        if severity == SEVERITY_DENY:
+            # A retry of an action already denied this session is visible, not
+            # silently absorbed: working around a block leaves a trace.
+            prior_deny = db.execute(
+                "SELECT 1 FROM guard_events WHERE guard_id=? AND session_id=? AND action=? "
+                "  AND mode='ENFORCE' AND id<>? LIMIT 1",
+                (g["id"], session, action, ge_id_box[0] if ge_id_box else -1),
+            ).fetchone()
+            if prior_deny:
+                def _write_recurrence() -> None:
+                    db.execute(
+                        "INSERT INTO recurrence_events(candidate_id,lesson_id,project_id,session_id,"
+                        "tool_name,detected_at,attribution,origin,experiment) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (None, g["lesson_id"], pid, session, tool, now,
+                         "recurrence_after_deny", origin, experiment))
+                    db.commit()
+                with_retry(_write_recurrence, db)
+            reason = g["reason"]
+            if g["replacement"]:
+                reason += f" Suggested replacement: {g['replacement']}"
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                    "additionalContext": f"[my-error] Prevented recurrence of ERR-{g['lesson_id']:04d}. {g['rule_text']}"
+                }
+            }
+
+        # severity == warn. Never denies, in any mode. Gated by the WARN
+        # channel switch -- off by default, so a matched warn-severity guard
+        # is recorded (above) but produces no output at all until the switch
+        # is explicitly turned on. This is what keeps the SHADOW v3 freeze
+        # intact: nothing about ENFORCE's or SHADOW's existing output changes
+        # for a guard nobody has marked severity=deny.
+        if not warn_enabled:
+            return None
         reason = g["reason"]
         if g["replacement"]:
             reason += f" Suggested replacement: {g['replacement']}"
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason,
-                "additionalContext": f"[my-error] Prevented recurrence of ERR-{g['lesson_id']:04d}. {g['rule_text']}"
+                "additionalContext": f"[my-error] WARNING: matches ERR-{g['lesson_id']:04d}. {g['rule_text']} {reason}".strip()
             }
         }
     return None
@@ -2254,9 +2824,26 @@ def _dispatch_hook(args: argparse.Namespace) -> tuple[int, sqlite3.Connection, s
         return 0, db, pid, event
 
     if kind == "guard":
-        out = run_guard(db, pid, event)
-        if out:
+        # The execution gate (docs/ACTIVE-PREVENTION.md section 3): recall and
+        # the block decision are separate stages. Stage A never denies and is
+        # entirely gated by the WARN channel switch, off by default -- when it
+        # is off, this branch must produce byte-for-byte the same output as
+        # before 0.6.0 (no recall call at all), which is the freeze guarantee.
+        warn_enabled = warn_channel_enabled(db)
+        context_text = ""
+        if warn_enabled:
+            rows = contextual_recall(db, pid, event, session)
+            if rows:
+                context_text = format_lessons(rows, "possibly relevant to this action")
+        out = run_guard(db, pid, event, warn_enabled=warn_enabled)
+        if out is not None:
+            if context_text:
+                hso = out.setdefault("hookSpecificOutput", {})
+                existing_ctx = hso.get("additionalContext", "")
+                hso["additionalContext"] = (context_text + ("\n" + existing_ctx if existing_ctx else "")).strip()
             json_out(out)
+        elif context_text:
+            json_out(hook_context("PreToolUse", context_text))
         return 0, db, pid, event
 
     if kind == "failure":
@@ -2404,15 +2991,16 @@ def cmd_learn(args: argparse.Namespace) -> int:
         origin = cand["origin"]
     else:
         origin = event_origin()
+    prevention_class = getattr(args, "prevention_class", None) or PREVENTION_WARNABLE
     cur = db.execute("""
-      INSERT INTO lessons(project_id,scope,created_at,updated_at,title,cause,rule_text,confidence,status,source,source_candidate_id,tags,origin,origin_project_id,scope_reason)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      INSERT INTO lessons(project_id,scope,created_at,updated_at,title,cause,rule_text,confidence,status,source,source_candidate_id,tags,origin,origin_project_id,scope_reason,prevention_class)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (None if scope == "global" else pid, scope, now, now, args.title, args.cause, args.rule, conf,
           "active", "manual-verified", source_candidate, args.tags or "", origin,
           # Provenance is recorded for both scopes. A global lesson still has a
           # birthplace, and losing it would make "learned in Fidren, used in
           # Livara" unanswerable -- which is the whole point of the split.
-          pid, args.scope_reason or None))
+          pid, args.scope_reason or None, prevention_class))
     lid = int(cur.lastrowid)
     if source_candidate:
         db.execute("UPDATE candidates SET status='learned',lesson_id=? WHERE id=?", (lid, source_candidate))
@@ -2421,16 +3009,28 @@ def cmd_learn(args: argparse.Namespace) -> int:
             print("--guard-field and --guard-pattern are required with --guard-tool", file=sys.stderr)
             db.rollback()
             return 2
+        condition = getattr(args, "condition", None)
+        if condition and condition not in CONDITIONS:
+            print(f"Unknown condition '{condition}'. Known: {sorted(CONDITIONS)}", file=sys.stderr)
+            db.rollback()
+            return 2
         expires = None
         if args.guard_ttl_days > 0:
             expires = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=args.guard_ttl_days)).isoformat(timespec="seconds")
         db.execute("""
-          INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at,origin,eval_class,confirm_evidence)
-          VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?)
+          INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at,origin,eval_class,confirm_evidence,severity,condition,exceptions)
+          VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?)
         """, (lid, None if scope == "global" else pid, args.guard_tool, args.guard_field, args.guard_match,
               args.guard_pattern, args.replacement, args.guard_reason or args.rule, now, expires, origin,
               getattr(args, "guard_class", GUARD_CLASS_EXECUTION),
-              getattr(args, "confirm_evidence", None) or None))
+              getattr(args, "confirm_evidence", None) or None,
+              # The CLI default stays `deny`, not the schema's `warn` default:
+              # a human invoking --guard-tool/--guard-pattern explicitly is the
+              # authorization docs/ACTIVE-PREVENTION.md section 3 asks for, and
+              # every pre-0.6.0 test that learns a guard and expects it to deny
+              # in ENFORCE depends on this default being unchanged.
+              getattr(args, "severity", None) or SEVERITY_DENY,
+              condition, getattr(args, "exceptions", None)))
     db.commit()
     print(f"Learned ERR-{lid:04d} confidence={conf:.2f} scope={scope.upper()}" + (" with guard" if args.guard_tool else ""))
     if args.scope_reason:
@@ -2606,7 +3206,7 @@ def recall_metrics(db: sqlite3.Connection) -> dict[str, Any]:
         "deliveries_total": one("SELECT COUNT(*) FROM recall_events"),
         "deliveries_by_phase": by_phase,
         "deliveries_before_action": one(
-            "SELECT COUNT(*) FROM recall_events WHERE phase IN ('prompt','session-start')"),
+            "SELECT COUNT(*) FROM recall_events WHERE phase IN ('prompt','session-start','pretooluse')"),
         "deliveries_after_action": one("SELECT COUNT(*) FROM recall_events WHERE phase='failure'"),
         "missed_relevant_recall_total": one("SELECT COUNT(*) FROM missed_recalls"),
         "missed_relevant_recall_natural": one(
@@ -2627,6 +3227,52 @@ def recall_metrics(db: sqlite3.Connection) -> dict[str, Any]:
             "SELECT COUNT(*) FROM lessons WHERE status='active' AND scope='project' AND source NOT IN "
             f"({','.join('?' * len(AUTO_LESSON_SOURCES))})", tuple(sorted(AUTO_LESSON_SOURCES))),
     }
+
+
+def prevention_metrics(db: sqlite3.Connection, guards_active: int) -> dict[str, Any]:
+    """The NEW, separately-named counters docs/ACTIVE-PREVENTION.md section 5 asks for.
+
+    Deliberately a parallel set under its OWN names (`guard_matched`,
+    `would_block`, `actually_blocked`, `false_positive`, ...), not a rewrite of
+    the pre-0.6.0 instrument's fields (`would_block_shadow`,
+    `actual_blocks_enforce`, `shadow_verdict_*`, `canonical.*`). Those existing
+    fields keep meaning exactly what they meant in 0.5.0 -- dozens of tests and
+    the SHADOW v3 verdict itself depend on them as plain integers regardless of
+    whether a guard is *currently* active (a guard can fire and later be
+    forgotten; the historical event is still real evidence). The
+    `guards_active == 0 -> NOT_MEASURABLE` hard rule applies here, to the new
+    block, which is the one introduced by -- and whose only meaning comes from
+    -- this release.
+
+    Database-wide, like `canonical_dataset` -- a count that moved when you
+    `cd` was defect #1 of SHADOW v2.
+    """
+    one = lambda q, a=(): int(db.execute(q, a).fetchone()[0])  # noqa: E731
+    issues_by_kind = {r[0]: r[1] for r in db.execute(
+        "SELECT kind, COUNT(*) FROM guard_condition_issues GROUP BY kind")}
+    recurrence_by_attribution = {r[0]: r[1] for r in db.execute(
+        "SELECT attribution, COUNT(*) FROM recurrence_events GROUP BY attribution")}
+    out = {
+        "guard_matched": one("SELECT COUNT(*) FROM guard_events"),
+        "would_block": one("SELECT COUNT(*) FROM guard_events WHERE mode='SHADOW'"),
+        "actually_blocked": one(
+            "SELECT COUNT(*) FROM guard_events ge JOIN guards g ON g.id=ge.guard_id "
+            "WHERE ge.mode='ENFORCE' AND g.severity='deny'"),
+        "false_positive": one("SELECT COUNT(*) FROM guard_events WHERE causal_outcome=?", (CAUSAL_REFUTED,)),
+        "suppressed_by_exception": one("SELECT COUNT(*) FROM guard_suppressions"),
+        "missed_relevant_recall": one("SELECT COUNT(*) FROM missed_recalls"),
+        # Independent of any guard match (docs section 6) -- never gated below.
+        "recurrence_detected": one("SELECT COUNT(*) FROM recurrence_events"),
+        "recurrence_by_attribution": recurrence_by_attribution,
+        "condition_unknown_total": issues_by_kind.get("unknown", 0),
+        "condition_unverifiable_total": issues_by_kind.get("unverifiable", 0),
+    }
+    if not guards_active:
+        for k in ("guard_matched", "would_block", "actually_blocked", "false_positive",
+                  "suppressed_by_exception", "missed_relevant_recall"):
+            out[k] = NOT_MEASURABLE
+        out["not_measurable_reason"] = NOT_MEASURABLE_REASON
+    return out
 
 
 def retired_fixture_counts(db: sqlite3.Connection) -> dict[str, Any]:
@@ -2765,7 +3411,7 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
     v1_controlled_confirmed = ev("AND outcome='true_positive' AND origin=? AND experiment='v1'", (ORIGIN_CONTROLLED,))
     v1_controlled_refuted = ev("AND outcome='false_positive' AND origin=? AND experiment='v1'", (ORIGIN_CONTROLLED,))
 
-    return {
+    out = {
         "mode": mode,
         "shadow_generation": SHADOW_GENERATION,
         "shadow_started_at": started,   # v2 start; None until the first hook stamps it
@@ -2833,7 +3479,13 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
         "canonical_controlled": canonical_dataset(db, "v3", ORIGIN_CONTROLLED),
         "recall": recall_metrics(db),
         "knowledge": retired_fixture_counts(db),
+        "prevention": prevention_metrics(db, guards),
     }
+    release_coherent, release_mismatches = release_coherence_check(db)
+    out["release_coherent"] = release_coherent
+    out["release_mismatches"] = release_mismatches
+    out["shadow_v3_contamination_note"] = json.loads(meta_get(db, "shadow_v3_contamination_note") or "null")
+    return out
 
 
 
@@ -2903,29 +3555,34 @@ def cmd_datadir(args: argparse.Namespace) -> int:
 
 
 def cmd_metrics(args: argparse.Namespace) -> int:
-    db = connect()
+    # Observational: read-only, never migrates, never rotates the experiment.
+    db = connect_readonly()
     root = canonical_root()
     pid = ensure_project(db, root)
+    note = schema_compat_note(db)
     out = {"version": VERSION, "project_root": root, "project_identity": project_identity(root),
            "project_id": pid, **collect_metrics(db, pid)}
+    if note:
+        out["schema_compat_note"] = note
     print(json.dumps(out, ensure_ascii=False, separators=(",", ":") if args.compact else None,
                      indent=None if args.compact else 2))
     return 0
 
 
 def cmd_mode(args: argparse.Namespace) -> int:
-    db = connect()
     if args.set:
+        db = connect()  # a write command: changing the mode IS the mutation requested
         try:
             print(set_mode(db, args.set))
         except ValueError as exc:
             print(str(exc), file=sys.stderr); return 2
     else:
+        db = connect_readonly()
         print(get_mode(db))
     return 0
 
 def cmd_status(args: argparse.Namespace) -> int:
-    db = connect(); pid = ensure_project(db, canonical_root())
+    db = connect_readonly(); pid = ensure_project(db, canonical_root())
     counts = {}
     counts["active_lessons"] = db.execute("SELECT COUNT(*) c FROM lessons WHERE status='active' AND (scope='global' OR project_id=?)", (pid,)).fetchone()[0]
     counts["active_guards"] = db.execute("SELECT COUNT(*) c FROM guards g JOIN lessons l ON l.id=g.lesson_id WHERE g.active=1 AND l.status='active' AND (g.project_id IS NULL OR g.project_id=?)", (pid,)).fetchone()[0]
@@ -2936,7 +3593,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_review(args: argparse.Namespace) -> int:
-    db = connect(); pid = ensure_project(db, canonical_root())
+    db = connect_readonly(); pid = ensure_project(db, canonical_root())
     cands = list(db.execute("SELECT id,created_at,tool_name,bad_action,error_family,occurrences,recovery_action,recovery_evidence FROM candidates WHERE project_id=? AND status IN ('captured','evidence','review_requested') ORDER BY last_seen DESC LIMIT ?", (pid,args.limit)))
     lessons = list(db.execute("SELECT id,title,rule_text,confidence,source,use_count FROM lessons WHERE status='active' AND (scope='global' OR project_id=?) ORDER BY updated_at DESC LIMIT ?", (pid,args.limit)))
     print("PENDING CANDIDATES")
@@ -3066,10 +3723,13 @@ def cmd_retire_fixtures(args: argparse.Namespace) -> int:
 
 def cmd_recall_audit(args: argparse.Namespace) -> int:
     """Report the recall path on its own terms, never as a guard number."""
-    db = connect()
+    db = connect_readonly()
     ensure_project(db, canonical_root())
+    note = schema_compat_note(db)
     m = recall_metrics(db)
     print("RECALL AUDIT (measured separately from the guard experiment)\n")
+    if note:
+        print(f"NOTE: {note}\n")
     print(f"deliveries total:          {m['deliveries_total']}")
     print(f"  before the action:       {m['deliveries_before_action']}  (prompt / session-start)")
     print(f"  after the action:        {m['deliveries_after_action']}  (failure hook -- cannot have prevented it)")
@@ -3123,8 +3783,10 @@ def locale_recognized() -> tuple[str, bool]:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    db = connect(); root = canonical_root(); pid = ensure_project(db, root)
-    schema = int(db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0])
+    # Observational: read-only, never migrates, never rotates the experiment.
+    db = connect_readonly(); root = canonical_root(); pid = ensure_project(db, root)
+    schema = _user_version(db)
+    compat_note = schema_compat_note(db)
     db_path = data_dir() / "my-error.db"
     loc, loc_ok = locale_recognized()
     m = collect_metrics(db, pid)
@@ -3164,7 +3826,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 meta_get(db, "shadow_v2_baseline_snapshot")),
             "origin_migration_backfilled_at": origin_backfilled_at,
             "dropped_events": dropped_events(db)[0], "dropped_events_last": dropped_events(db)[1],
-            "capture_reliability_fix": CAPTURE_FIX_NOTE, **m,
+            "capture_reliability_fix": CAPTURE_FIX_NOTE,
+            "schema_compat_note": compat_note, **m,
         }, indent=2, ensure_ascii=False))
         return 0
 
@@ -3355,6 +4018,32 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if origin_backfilled_at:
         L.append("")
         L.append(f"Origin migration:   pre-existing rows backfilled as controlled_test at {origin_backfilled_at}")
+    if compat_note:
+        L.append("")
+        L.append(f"SCHEMA NOTE:        {compat_note}")
+    L.append("")
+    L.append("Active prevention (0.6.0): conditions, exceptions, severity")
+    pv = m["prevention"]
+    L.append(f"  WARN channel:            {'ON' if warn_channel_enabled(db) else 'off (default; see MY_ERROR_WARN)'}")
+    L.append(f"  guard matched / would-block / actually-blocked: {pv['guard_matched']} / {pv['would_block']} / {pv['actually_blocked']}")
+    L.append(f"  false positive:          {pv['false_positive']}")
+    L.append(f"  suppressed by exception: {pv['suppressed_by_exception']}")
+    L.append(f"  condition unknown:       {pv['condition_unknown_total']}  (guard inert, never a block)")
+    L.append(f"  condition unverifiable:  {pv['condition_unverifiable_total']}  (guard inert, never a block)")
+    L.append(f"  recurrence detected:     {pv['recurrence_detected']}  (independent of any guard match)")
+    if pv["recurrence_by_attribution"]:
+        for attr, n in pv["recurrence_by_attribution"].items():
+            L.append(f"    {attr:28} {n}")
+    L.append("")
+    L.append("Release coherence (precondition for opening a NEW SHADOW window)")
+    L.append(f"  coherent: {'yes' if m['release_coherent'] else 'NO'}")
+    for mm in m["release_mismatches"]:
+        L.append(f"    MISMATCH: {mm}")
+    if m.get("shadow_v3_contamination_note"):
+        L.append("")
+        L.append("SHADOW v3 CONTAMINATION NOTE (window kept open; annotated, not erased):")
+        for note in m["shadow_v3_contamination_note"]:
+            L.append(f"    {note}")
     print("\n".join(L))
     return 0 if os.access(data_dir(), os.W_OK) else 1
 
@@ -3394,6 +4083,22 @@ def build_parser() -> argparse.ArgumentParser:
     l.add_argument("--origin", choices=sorted(VALID_ORIGINS),
                     help="Explicit, temporary override for the SHADOW experiment population. "
                          "Defaults to the source candidate's origin, or MY_ERROR_EVENT_ORIGIN, or natural_usage.")
+    l.add_argument("--severity", choices=list(GUARD_SEVERITIES),
+                   help="`deny` may block in ENFORCE; `warn` never denies, in any mode, and only "
+                        "ever adds context, gated by the WARN channel switch (off by default). "
+                        "Defaults to `deny` for a hand-authored guard -- this is the explicit "
+                        "authorization docs/ACTIVE-PREVENTION.md section 3 requires.")
+    l.add_argument("--condition", choices=sorted(CONDITIONS),
+                   help="Named predicate ANDed with the pattern, from the closed registry. "
+                        "An unknown name is rejected here at write time -- see run_guard for what "
+                        "happens to a guard that is somehow left with one anyway (inert, never a block).")
+    l.add_argument("--exceptions",
+                   help="Regex checked at shell COMMAND POSITION (like match_type=shell_cmd): if it "
+                        "matches, the guard is suppressed even though the pattern matched. Exception "
+                        "beats pattern, always, and the suppression is recorded, never silent.")
+    l.add_argument("--prevention-class", choices=list(PREVENTION_CLASSES), default=PREVENTION_WARNABLE,
+                   help="BLOCKABLE / WARNABLE / INFORMATIONAL (docs/ACTIVE-PREVENTION.md section 1). "
+                        "Stored and reviewable; nothing here auto-converts this into a guard severity.")
     l.set_defaults(func=cmd_learn)
     s = sub.add_parser("status"); s.set_defaults(func=cmd_status)
     r = sub.add_parser("review"); r.add_argument("--limit", type=int, default=20); r.set_defaults(func=cmd_review)
