@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 VERSION = "0.6.0"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 MAX_TEXT = 4000
 AUTO_GUARD_TTL_DAYS = 90
 RECOVERY_WINDOW_MINUTES = 15
@@ -166,6 +166,84 @@ PREVENTION_BLOCKABLE = "BLOCKABLE"
 PREVENTION_WARNABLE = "WARNABLE"
 PREVENTION_INFORMATIONAL = "INFORMATIONAL"
 PREVENTION_CLASSES = (PREVENTION_BLOCKABLE, PREVENTION_WARNABLE, PREVENTION_INFORMATIONAL)
+
+# --- 0.6.0 correction (schema v8): frozen fire-time facts -------------------
+# `actually_blocked` used to join guard_events to the guard's CURRENT
+# severity, so editing a guard retroactively rewrote what a past event meant.
+# Metrics must be immutable. Three columns, written once at fire time and
+# never again:
+#   severity_at_fire    the severity actually in force when the guard fired.
+#   decision             effective outcome, closed vocabulary below.
+#   guard_fingerprint    identity of the guard's behavioural DEFINITION at
+#                        fire time (see guard_fingerprint()), so a later edit
+#                        to the guard produces a different fingerprint and old
+#                        events keep pointing at the definition that actually
+#                        fired, not the one in force when someone reads them.
+#
+# Closed decision vocabulary. Every value answers "what did the system
+# actually do" from the row alone -- no join, no current state.
+#   DECISION_DENIED                      a real deny was returned (ENFORCE,
+#                                         severity=deny).
+#   DECISION_WARN_EMITTED                a warn's additionalContext was
+#                                         actually emitted (ENFORCE,
+#                                         severity=warn, WARN channel on).
+#   DECISION_WARN_SUPPRESSED_CHANNEL_OFF a warn-severity guard matched but
+#                                         produced no output because the WARN
+#                                         channel switch was off.
+#   DECISION_SILENT_SHADOW               the guard matched but mode was
+#                                         SHADOW, so nothing could ever have
+#                                         been emitted regardless of severity.
+#   DECISION_SUPPRESSED_BY_EXCEPTION     the pattern matched but an exception
+#                                         suppressed it. Recorded today in the
+#                                         pre-existing `guard_suppressions`
+#                                         table, not in `guard_events` -- that
+#                                         table already freezes guard_id,
+#                                         action and created_at at the moment
+#                                         of suppression and never joins back
+#                                         to the guard's live state to mean
+#                                         anything, so it already satisfies the
+#                                         invariant without a new column. The
+#                                         name is listed here so the FULL
+#                                         closed vocabulary of "what can a
+#                                         guard evaluation resolve to" is
+#                                         documented in one place.
+#   DECISION_CONDITION_INERT             a named condition decided `unknown`
+#                                         or `unverifiable`, so the guard never
+#                                         reached pattern matching. Recorded
+#                                         today in `guard_condition_issues`
+#                                         (its `kind` column already
+#                                         distinguishes unknown/unverifiable),
+#                                         for the same reason as above.
+# `guard_events.decision` itself only ever takes the first four values, since
+# a `guard_events` row is only created once a guard has matched (after the
+# condition and exception checks already passed) -- see run_guard().
+DECISION_DENIED = "denied"
+DECISION_WARN_EMITTED = "warn_emitted"
+DECISION_WARN_SUPPRESSED_CHANNEL_OFF = "warn_suppressed_channel_off"
+DECISION_SILENT_SHADOW = "silent_shadow"
+DECISION_SUPPRESSED_BY_EXCEPTION = "suppressed_by_exception"
+DECISION_CONDITION_INERT = "condition_inert"
+# The full closed vocabulary (for documentation and for any future consumer
+# that wants to describe the whole guard-evaluation decision space, not just
+# the subset that lands in guard_events.decision).
+GUARD_DECISIONS_ALL = (
+    DECISION_DENIED, DECISION_WARN_EMITTED, DECISION_WARN_SUPPRESSED_CHANNEL_OFF,
+    DECISION_SILENT_SHADOW, DECISION_SUPPRESSED_BY_EXCEPTION, DECISION_CONDITION_INERT,
+)
+# The subset `guard_events.decision` can actually hold.
+GUARD_EVENT_DECISIONS = (
+    DECISION_DENIED, DECISION_WARN_EMITTED, DECISION_WARN_SUPPRESSED_CHANNEL_OFF, DECISION_SILENT_SHADOW,
+)
+
+# A pre-v8 `guard_events` row has no fire-time data -- NEVER backfilled from
+# the guard's current state, because that would invent the very history this
+# column exists to protect (see migrate(), `current < 8`). It stays NULL in
+# the database. Every consumer that reports on these columns must read NULL
+# as this third, explicit reading: not "false", not "unmeasurable" -- simply
+# unknown, because nothing was recorded at the moment that mattered. In the
+# same spirit as NOT_MEASURABLE vs SCHEMA_INSUFFICIENT: two different absences
+# must never collapse into the same number.
+UNKNOWN_AT_FIRE = "UNKNOWN_AT_FIRE"
 
 
 class ConditionUnevaluable(Exception):
@@ -1185,6 +1263,31 @@ def _add_v7_columns(db: sqlite3.Connection) -> None:
     add_column(db, "lessons", "prevention_class", f"TEXT NOT NULL DEFAULT '{PREVENTION_WARNABLE}'")
 
 
+def _add_v8_columns(db: sqlite3.Connection) -> None:
+    """Fire-time facts, frozen so a later guard edit cannot rewrite history.
+
+    Additive only. `guards.fingerprint` is backfillable (a pure function of
+    columns the row already has -- see migrate(), `current < 8`) and is
+    computed for existing rows right after this call. The three
+    `guard_events` columns are genuine fire-time facts with no reconstructible
+    value for a row that predates them, and are deliberately left NULL --
+    never backfilled from the guard's current state, which is exactly the
+    defect this schema version exists to fix. See UNKNOWN_AT_FIRE.
+    """
+    add_column(db, "guards", "fingerprint", "TEXT")
+    add_column(db, "guard_events", "severity_at_fire", "TEXT")
+    add_column(db, "guard_events", "decision", "TEXT")
+    add_column(db, "guard_events", "guard_fingerprint", "TEXT")
+    # The DENY message quotes `lessons.rule_text` live (see run_guard's
+    # SEVERITY_DENY branch), so an edited lesson changes what a PAST block
+    # appears to have said, the same defect this release fixes for severity.
+    # Freezing the whole string would duplicate data for every firing of a
+    # hot guard; a fingerprint is enough to answer "is this the same wording
+    # that fired then" without that duplication, and to detect drift if a
+    # later audit needs to know the text changed. See `text_fingerprint()`.
+    add_column(db, "guard_events", "rule_fingerprint", "TEXT")
+
+
 def _experiment_for(started_v2: str | None, started_v3: str | None, created_at: str) -> str:
     """Which generation a row belongs to, from its timestamp alone.
 
@@ -1324,6 +1427,28 @@ def migrate(db: sqlite3.Connection, current: int) -> None:
         _add_v7_columns(db)
         _exec_script(db, SCHEMA_V7)
         db.execute("PRAGMA user_version=7")
+    if current < 8:
+        _add_v8_columns(db)
+        # `guards.fingerprint` is a property of the DEFINITION already sitting
+        # in each row (tool/field/match_type/pattern/condition/exceptions/
+        # severity/replacement) -- not a fire-time fact. Backfilling it for a
+        # pre-existing guard computes the same value run_guard() would compute
+        # if that guard fired right now, so it is not fabricating history; it
+        # is filling in a column that was always a pure function of data the
+        # row already had. `guard_events.severity_at_fire`/`decision`/
+        # `guard_fingerprint` are the opposite -- genuine fire-time facts with
+        # no reconstructible value -- and are deliberately left NULL below.
+        for row in db.execute(
+            "SELECT id,tool_name,field_name,match_type,pattern,condition,exceptions,severity,replacement "
+            "FROM guards WHERE fingerprint IS NULL").fetchall():
+            fp = guard_fingerprint(row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8])
+            db.execute("UPDATE guards SET fingerprint=? WHERE id=?", (fp, row[0]))
+        # `guard_events.severity_at_fire`/`decision`/`guard_fingerprint`:
+        # explicitly NOT backfilled. See docs/ACTIVE-PREVENTION.md and the
+        # UNKNOWN_AT_FIRE constant -- every consumer must report a NULL here
+        # as unknown-at-fire, a third reading distinct from both "true" and
+        # "false", never reconstructed from the guard's current state.
+        db.execute("PRAGMA user_version=8")
 
 
 def _baseline_snapshot(db: sqlite3.Connection, at: str) -> dict[str, Any]:
@@ -1415,9 +1540,105 @@ def schema_compat_note(db: sqlite3.Connection) -> str | None:
             "about are simply not read.")
 
 
-def release_coherence_check(db: sqlite3.Connection) -> tuple[bool, list[str]]:
-    """Do the running code, the beacon, the installed manifest, the schema and
-    the hooks manifest all name the SAME release?
+# Evidence older than this is reported STALE, not treated as current proof a
+# hook is still firing -- a day covers a normal gap between sessions without
+# manufacturing false alarms on every short break between them.
+HOOKS_EVIDENCE_STALE_SECONDS = 24 * 3600
+
+
+def _default_health_path() -> Path:
+    # Same override discipline as MY_ERROR_DATA_DIR: tests (and any sandboxed
+    # run) must be able to point this at a fixture instead of this machine's
+    # real watchdog file, which `release_coherence_check` must never read as
+    # a side effect of a test that is not ABOUT this machine's real state.
+    env = os.getenv("MY_ERROR_HOOKS_HEALTH_PATH")
+    if env:
+        return Path(env)
+    return Path.home() / ".claude" / "watchdogs" / ".my-error-health.json"
+
+
+def _epoch_seconds(value: Any) -> float | None:
+    """Accept either an ISO-8601 string (the beacon) or epoch milliseconds
+    (the watchdog health file, confirmed from its own `at` field) and return
+    seconds since the epoch, or None if `value` is neither."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        # The health file's `at` is milliseconds; a plausible ISO timestamp as
+        # a number does not happen here, so this branch is unambiguous.
+        return float(value) / 1000.0
+    try:
+        return dt.datetime.fromisoformat(str(value)).timestamp()
+    except ValueError:
+        return None
+
+
+def hooks_evidence(beacon_path: Path, health_path: Path) -> dict[str, Any]:
+    """What actually fired, read from two independently-written artifacts --
+    never from the hooks MANIFEST, which only says what the plugin declares.
+
+    Read-only: `open()`/`read_text()` for reading is not a database write and
+    touches nothing else. Both paths are parameters precisely so tests can
+    point this at fixtures instead of this machine's real files.
+
+      - `runtime.json` (my-error's own beacon, written on every hook): proves
+        only the SINGLE most recently fired hook (`last_hook`/`last_seen`).
+      - the external watchdog's `.my-error-health.json`: a broader per-hook
+        boolean map under `health.hooks`, written by a DIFFERENT process on
+        its own schedule (confirmed shape: `{"at": <epoch ms>, "health":
+        {"hooks_registered": bool, "hooks": {"PreToolUse": bool, ...}}}`).
+
+    Absent or unreadable degrades EACH source to "absent"/"unreadable"
+    independently -- never silently treated as "no hooks fired" (a negative
+    finding) and never as grounds for "coherent".
+    """
+    now = time.time()
+    out: dict[str, Any] = {
+        "beacon_status": "absent", "beacon_last_hook": None, "beacon_age_seconds": None,
+        "health_status": "absent", "health_evidenced": [], "health_age_seconds": None,
+    }
+    try:
+        raw = beacon_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        pass
+    except OSError:
+        out["beacon_status"] = "unreadable"
+    else:
+        try:
+            beacon = json.loads(raw)
+            out["beacon_status"] = "ok"
+            out["beacon_last_hook"] = beacon.get("last_hook")
+            age = _epoch_seconds(beacon.get("last_seen"))
+            out["beacon_age_seconds"] = (now - age) if age is not None else None
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            out["beacon_status"] = "unreadable"
+    try:
+        raw = health_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        pass
+    except OSError:
+        out["health_status"] = "unreadable"
+    else:
+        try:
+            health = json.loads(raw)
+            h = health.get("health") or {}
+            hooks_map = h.get("hooks") or {}
+            out["health_status"] = "ok"
+            out["health_evidenced"] = sorted(k for k, v in hooks_map.items() if v)
+            age = _epoch_seconds(health.get("at"))
+            out["health_age_seconds"] = (now - age) if age is not None else None
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            out["health_status"] = "unreadable"
+    return out
+
+
+def release_coherence_check(
+    db: sqlite3.Connection,
+    beacon_path: Path | None = None,
+    health_path: Path | None = None,
+) -> tuple[bool, list[str], dict[str, Any]]:
+    """Do the running code, the beacon, the installed manifest, the schema,
+    the hooks MANIFEST, and the hooks ACTUALLY LOADED all name the SAME release?
 
     This is the precondition for opening a new SHADOW experiment window
     (`active_experiment_started(create=True)`): the live incident this guards
@@ -1426,6 +1647,16 @@ def release_coherence_check(db: sqlite3.Connection) -> tuple[bool, list[str]]:
     observational command silently advance the schema and rotate the
     experiment. It never touches the live installation; it only reads files
     already on disk next to this script and the database already open.
+
+    `hooks_declared()` says only what the plugin's manifest ASKS Claude Code
+    to register -- not that Claude Code actually did. 0.6.0's correction:
+    `hooks_evidence()` reads two artifacts written by processes OTHER than a
+    manifest parser (my-error's own beacon, and the external watchdog's
+    health file) to say which hooks have EVIDENCE of having fired. A hook
+    that is declared but never evidenced is reported `unverified`, never
+    silently folded into "present". `beacon_path`/`health_path` default to
+    this machine's real files but are overridable so tests run against
+    fixtures, never against this machine's state.
     """
     mismatches: list[str] = []
     try:
@@ -1455,7 +1686,37 @@ def release_coherence_check(db: sqlite3.Connection) -> tuple[bool, list[str]]:
     missing = expected_hooks - declared
     if missing:
         mismatches.append(f"hooks manifest is missing: {sorted(missing)}")
-    return (not mismatches, mismatches)
+
+    # --- hooks ACTUALLY LOADED, not merely declared -------------------------
+    ev = hooks_evidence(beacon_path or (data_dir() / "runtime.json"), health_path or _default_health_path())
+    evidenced = set(ev["health_evidenced"])
+    if ev["beacon_last_hook"]:
+        evidenced.add(str(ev["beacon_last_hook"]))
+    if ev["health_status"] in ("absent", "unreadable") and ev["beacon_status"] in ("absent", "unreadable"):
+        # Both sources missing: there is no evidence to read at all. This must
+        # degrade to "cannot verify" -- NEVER to "coherent" -- so it is always
+        # a mismatch, distinct in wording from an actual disagreement.
+        mismatches.append(
+            "hooks-loaded evidence cannot be verified: both the beacon "
+            f"({ev['beacon_status']}) and the watchdog health file ({ev['health_status']}) "
+            "are unavailable -- declared hooks are UNVERIFIED, not confirmed present")
+    else:
+        unverified = declared - evidenced
+        if unverified:
+            mismatches.append(
+                f"declared but UNVERIFIED (no evidence of ever firing): {sorted(unverified)}")
+        for src, age, status in (("beacon", ev["beacon_age_seconds"], ev["beacon_status"]),
+                                 ("watchdog health file", ev["health_age_seconds"], ev["health_status"])):
+            if status == "unreadable":
+                mismatches.append(f"the {src} exists but could not be parsed -- cannot verify from it")
+            elif status == "ok" and age is not None and age > HOOKS_EVIDENCE_STALE_SECONDS:
+                mismatches.append(
+                    f"the {src}'s hooks-loaded evidence is stale ({age:.0f}s old, "
+                    f"older than {HOOKS_EVIDENCE_STALE_SECONDS}s)")
+    ev["declared_hooks"] = sorted(declared)
+    ev["evidenced_hooks"] = sorted(evidenced)
+    ev["unverified_hooks"] = sorted(declared - evidenced)
+    return (not mismatches, mismatches, ev)
 
 
 def annotate_shadow_v3_contamination(db: sqlite3.Connection, note: dict[str, Any]) -> None:
@@ -1496,7 +1757,7 @@ def active_experiment_started(db: sqlite3.Connection, create: bool = False) -> s
         return val
     if not create:
         return None
-    coherent, mismatches = release_coherence_check(db)
+    coherent, mismatches, _hooks_ev = release_coherence_check(db)
     if not coherent:
         now = utcnow()
         try:
@@ -2185,9 +2446,14 @@ def make_auto_lesson(db: sqlite3.Connection, pid: str, candidate: sqlite3.Row, g
           PREVENTION_BLOCKABLE))  # a narrow, verified one-token correction is exactly the deterministic case BLOCKABLE describes
     lesson_id = int(cur.lastrowid)
     expires = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=AUTO_GUARD_TTL_DAYS)).isoformat(timespec="seconds")
+    guard_severity = auto_guard_severity(db)
+    # No condition/exceptions/replacement for an auto-learned guard, so the
+    # fingerprint's identity rests on tool/field/match_type/pattern/severity.
+    fingerprint = guard_fingerprint("Bash", "command", "exact", candidate["bad_action"],
+                                    None, None, guard_severity, good_action)
     db.execute("""
-      INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at,origin,severity)
-      VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?)
+      INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at,origin,severity,fingerprint)
+      VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?)
     """, (lesson_id, pid, "Bash", "command", "exact", candidate["bad_action"], good_action,
           f"my-error learned this exact command already failed; use `{good_action}` instead.", now, expires, origin,
           # User decision 2026-10-01: warn by default (no human was in the
@@ -2196,7 +2462,7 @@ def make_auto_lesson(db: sqlite3.Connection, pid: str, candidate: sqlite3.Row, g
           # auditable opt-in via MY_ERROR_AUTO_GUARD_SEVERITY or the
           # `auto_guard_severity` meta key, the same pattern as the WARN
           # channel switch. Benchmarks that measure blocking set it.
-          auto_guard_severity(db)))
+          guard_severity, fingerprint))
     db.execute("UPDATE candidates SET status='learned',recovery_action=?,recovery_evidence=recovery_evidence+1,lesson_id=? WHERE id=?",
                (good_action, lesson_id, candidate["id"]))
     db.commit()
@@ -2619,6 +2885,49 @@ def exception_suppresses(exceptions: str | None, candidates: set[str]) -> bool:
         return False  # a malformed exception pattern must never silently widen suppression
 
 
+def guard_fingerprint(tool_name: str | None, field_name: str | None, match_type: str | None,
+                      pattern: str | None, condition: str | None, exceptions: str | None,
+                      severity: str | None, replacement: str | None) -> str:
+    """Stable identifier for a guard's behavioural DEFINITION, not its row id.
+
+    Computed from exactly the fields that determine what the guard DOES:
+    `tool_name`, `field_name`, `match_type`, `pattern`, `condition`,
+    `exceptions`, `severity`, `replacement`. Deliberately excludes `reason`
+    (prose, not behaviour), `id`/`lesson_id`/`project_id`/`active`/
+    `created_at`/`expires_at`/`hit_count`/`last_hit`/`origin`/`eval_class`/
+    `confirm_evidence` -- none of those change what action the guard takes
+    against an event, only its bookkeeping or its causal-scoring class.
+
+    `eval_class` is a judgment about how to SCORE a firing afterwards, not
+    about whether/how it fires, so it is intentionally not part of this
+    identity; `guard_events.guard_class` already freezes it separately at
+    fire time.
+
+    Two guards that happen to differ only in reason text or bookkeeping
+    collide to the same fingerprint on purpose -- this identifies "the same
+    rule, the same enforcement", not "the same database row". A later edit to
+    any of the eight fields above produces a different fingerprint, so an old
+    `guard_events` row keeps pointing at the definition that actually fired,
+    never at whatever the guard has since become.
+
+    NUL-delimited (`\\x00`), with every field normalized through `str(x or
+    "")` first, so `None` and `""` collapse deliberately (both mean "this
+    field was not set") rather than producing two fingerprints for what is,
+    behaviourally, the same guard.
+    """
+    parts = [str(x or "") for x in (
+        tool_name, field_name, match_type, pattern, condition, exceptions, severity, replacement)]
+    canon = "\x00".join(parts)
+    return "fp1:" + hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def text_fingerprint(text: str | None) -> str:
+    """Fingerprint of free text (a lesson's `rule_text`), same scheme as
+    `guard_fingerprint`, so a later edit to the wording is detectable without
+    duplicating the full string into every `guard_events` row it ever fired."""
+    return "tf1:" + hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
+
+
 def run_guard(db: sqlite3.Connection, pid: str, event: dict[str, Any],
              warn_enabled: bool = False) -> dict[str, Any] | None:
     tool = str(event.get("tool_name", ""))
@@ -2684,14 +2993,40 @@ def run_guard(db: sqlite3.Connection, pid: str, event: dict[str, Any],
         origin = event_origin()
         ge_id_box: list[int] = []
 
+        # Frozen at fire time (schema v8). `severity` is read from the guard's
+        # CURRENT row here, at the moment it fires -- but then written into the
+        # event and never read live again. A later edit to this guard changes
+        # `g["severity"]` for the NEXT firing, not for this one already on
+        # disk. Same for the fingerprint: computed from today's definition,
+        # stored, done.
+        severity = (g["severity"] if "severity" in _keys(g) else None) or SEVERITY_WARN
+        fingerprint_now = guard_fingerprint(
+            g["tool_name"], g["field_name"], g["match_type"], g["pattern"],
+            cond_name, exceptions, severity, g["replacement"])
+        rule_fp_now = text_fingerprint(g["rule_text"] if "rule_text" in _keys(g) else None)
+        # `decision` depends only on facts already known at this point (mode,
+        # severity, and whether the WARN channel is on) -- never on anything
+        # computed later, so it is correct to freeze here, before the
+        # SHADOW/ENFORCE branch below even runs.
+        if mode == MODE_SHADOW:
+            decision = DECISION_SILENT_SHADOW
+        elif severity == SEVERITY_DENY:
+            decision = DECISION_DENIED
+        elif warn_enabled:
+            decision = DECISION_WARN_EMITTED
+        else:
+            decision = DECISION_WARN_SUPPRESSED_CHANNEL_OFF
+
         def record() -> None:
             db.execute("UPDATE guards SET hit_count=hit_count+1,last_hit=? WHERE id=?", (now, g["id"]))
             cur = db.execute(
                 "INSERT INTO guard_events(guard_id,lesson_id,project_id,session_id,tool_name,action,mode,"
-                "created_at,origin,experiment,guard_class,causal_outcome,match_context)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "created_at,origin,experiment,guard_class,causal_outcome,match_context,"
+                "severity_at_fire,decision,guard_fingerprint,rule_fingerprint)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (g["id"], g["lesson_id"], pid, session, tool, action, mode, now, origin,
-                 experiment, klass, CAUSAL_UNVERIFIED, match_context),
+                 experiment, klass, CAUSAL_UNVERIFIED, match_context,
+                 severity, decision, fingerprint_now, rule_fp_now),
             )
             ge_id_box.append(int(cur.lastrowid))
             # A guard match is a DETERMINISTIC proof of relevance: this stored
@@ -2712,7 +3047,6 @@ def run_guard(db: sqlite3.Connection, pid: str, event: dict[str, Any],
             # injected warning would change the very behaviour being measured.
             return None
 
-        severity = (g["severity"] if "severity" in _keys(g) else None) or SEVERITY_WARN
         if severity == SEVERITY_DENY:
             # A retry of an action already denied this session is visible, not
             # silently absorbed: working around a block leaves a trace.
@@ -3203,9 +3537,14 @@ def cmd_learn(args: argparse.Namespace) -> int:
         expires = None
         if args.guard_ttl_days > 0:
             expires = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=args.guard_ttl_days)).isoformat(timespec="seconds")
+        guard_severity = getattr(args, "severity", None) or SEVERITY_DENY
+        guard_exceptions = getattr(args, "exceptions", None)
+        fingerprint = guard_fingerprint(args.guard_tool, args.guard_field, args.guard_match,
+                                        args.guard_pattern, condition, guard_exceptions,
+                                        guard_severity, args.replacement)
         db.execute("""
-          INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at,origin,eval_class,confirm_evidence,severity,condition,exceptions)
-          VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?)
+          INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at,origin,eval_class,confirm_evidence,severity,condition,exceptions,fingerprint)
+          VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?)
         """, (lid, None if scope == "global" else pid, args.guard_tool, args.guard_field, args.guard_match,
               args.guard_pattern, args.replacement, args.guard_reason or args.rule, now, expires, origin,
               getattr(args, "guard_class", GUARD_CLASS_EXECUTION),
@@ -3215,8 +3554,8 @@ def cmd_learn(args: argparse.Namespace) -> int:
               # authorization docs/ACTIVE-PREVENTION.md section 3 asks for, and
               # every pre-0.6.0 test that learns a guard and expects it to deny
               # in ENFORCE depends on this default being unchanged.
-              getattr(args, "severity", None) or SEVERITY_DENY,
-              condition, getattr(args, "exceptions", None)))
+              guard_severity,
+              condition, guard_exceptions, fingerprint))
     db.commit()
     print(f"Learned ERR-{lid:04d} confidence={conf:.2f} scope={scope.upper()}" + (" with guard" if args.guard_tool else ""))
     if args.scope_reason:
@@ -3480,6 +3819,7 @@ def prevention_metrics(db: sqlite3.Connection, guards_active: int) -> dict[str, 
             "suppressed_by_exception": SCHEMA_INSUFFICIENT, "missed_relevant_recall": SCHEMA_INSUFFICIENT,
             "recurrence_detected": SCHEMA_INSUFFICIENT, "recurrence_by_attribution": {},
             "condition_unknown_total": SCHEMA_INSUFFICIENT, "condition_unverifiable_total": SCHEMA_INSUFFICIENT,
+            "actually_blocked_unknown_at_fire": SCHEMA_INSUFFICIENT,
             "schema_insufficient_reason": reason,
         }
     one = lambda q, a=(): int(db.execute(q, a).fetchone()[0])  # noqa: E731
@@ -3487,12 +3827,34 @@ def prevention_metrics(db: sqlite3.Connection, guards_active: int) -> dict[str, 
         "SELECT kind, COUNT(*) FROM guard_condition_issues GROUP BY kind")}
     recurrence_by_attribution = {r[0]: r[1] for r in db.execute(
         "SELECT attribution, COUNT(*) FROM recurrence_events GROUP BY attribution")}
+    # `decision`/`severity_at_fire`/`guard_fingerprint` are schema v8. A v7
+    # database (guards.severity exists, but these three columns do not) still
+    # has `guard_events` rows -- just none of them can be read as `decision`,
+    # so `actually_blocked` must fall back to UNKNOWN_AT_FIRE for every one of
+    # them rather than resurrect the join on guards.severity that defect this
+    # release fixes.
+    has_decision_col = _column_exists(db, "guard_events", "decision")
+    if has_decision_col:
+        # THE FIX: `actually_blocked` reads the FROZEN decision recorded at
+        # fire time. It never joins back to `guards` to ask what the guard's
+        # severity is NOW -- that join is exactly the defect this release
+        # closes: editing a guard's severity after the fact used to silently
+        # rewrite what every one of its past events meant.
+        actually_blocked = one(
+            "SELECT COUNT(*) FROM guard_events WHERE mode='ENFORCE' AND decision=?", (DECISION_DENIED,))
+        # Pre-v8 rows have decision IS NULL -- genuinely unknown-at-fire, never
+        # reconstructed via the banned join, and never silently folded into
+        # `actually_blocked` above or into any other bucket.
+        actually_blocked_unknown = one(
+            "SELECT COUNT(*) FROM guard_events WHERE mode='ENFORCE' AND decision IS NULL")
+    else:
+        actually_blocked = 0
+        actually_blocked_unknown = one("SELECT COUNT(*) FROM guard_events WHERE mode='ENFORCE'")
     out = {
         "guard_matched": one("SELECT COUNT(*) FROM guard_events"),
         "would_block": one("SELECT COUNT(*) FROM guard_events WHERE mode='SHADOW'"),
-        "actually_blocked": one(
-            "SELECT COUNT(*) FROM guard_events ge JOIN guards g ON g.id=ge.guard_id "
-            "WHERE ge.mode='ENFORCE' AND g.severity='deny'"),
+        "actually_blocked": actually_blocked,
+        "actually_blocked_unknown_at_fire": actually_blocked_unknown,
         "false_positive": one("SELECT COUNT(*) FROM guard_events WHERE causal_outcome=?", (CAUSAL_REFUTED,)),
         "suppressed_by_exception": one("SELECT COUNT(*) FROM guard_suppressions"),
         "missed_relevant_recall": one("SELECT COUNT(*) FROM missed_recalls"),
@@ -3739,9 +4101,10 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
         "knowledge": retired_fixture_counts(db),
         "prevention": prevention_metrics(db, guards),
     }
-    release_coherent, release_mismatches = release_coherence_check(db)
+    release_coherent, release_mismatches, hooks_loaded = release_coherence_check(db)
     out["release_coherent"] = release_coherent
     out["release_mismatches"] = release_mismatches
+    out["hooks_loaded"] = hooks_loaded
     out["shadow_v3_contamination_note"] = json.loads(meta_get(db, "shadow_v3_contamination_note") or "null")
     return out
 
@@ -4286,6 +4649,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     pv = m["prevention"]
     L.append(f"  WARN channel:            {'ON' if warn_channel_enabled(db) else 'off (default; see MY_ERROR_WARN)'}")
     L.append(f"  guard matched / would-block / actually-blocked: {pv['guard_matched']} / {pv['would_block']} / {pv['actually_blocked']}")
+    L.append(f"  actually-blocked, unknown-at-fire: {pv.get('actually_blocked_unknown_at_fire', 0)}"
+             "  (ENFORCE events from before schema v8 -- no frozen decision was recorded; NOT counted as blocked or not-blocked)")
     L.append(f"  false positive:          {pv['false_positive']}")
     L.append(f"  suppressed by exception: {pv['suppressed_by_exception']}")
     L.append(f"  condition unknown:       {pv['condition_unknown_total']}  (guard inert, never a block)")
@@ -4299,6 +4664,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     L.append(f"  coherent: {'yes' if m['release_coherent'] else 'NO'}")
     for mm in m["release_mismatches"]:
         L.append(f"    MISMATCH: {mm}")
+    hl = m.get("hooks_loaded") or {}
+    if hl:
+        L.append("")
+        L.append("  Hooks ACTUALLY LOADED (not merely declared in the manifest):")
+        L.append(f"    declared:    {hl.get('declared_hooks', [])}")
+        L.append(f"    evidenced:   {hl.get('evidenced_hooks', [])}  (evidence they fired, from the beacon + watchdog health file)")
+        L.append(f"    unverified:  {hl.get('unverified_hooks', [])}  (declared, but no evidence of ever firing -- NOT reported as present)")
+        L.append(f"    beacon:              {hl.get('beacon_status')}, last_hook={hl.get('beacon_last_hook')!r}, "
+                 f"age={hl.get('beacon_age_seconds')}")
+        L.append(f"    watchdog health file: {hl.get('health_status')}, age={hl.get('health_age_seconds')}")
     if m.get("shadow_v3_contamination_note"):
         L.append("")
         L.append("SHADOW v3 CONTAMINATION NOTE (window kept open; annotated, not erased):")
