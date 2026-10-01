@@ -36,6 +36,12 @@ class MyErrorTest(unittest.TestCase):
         # default is SHADOW and a test that silently depended on it would be
         # asserting a default rather than a behaviour.
         self.env["MY_ERROR_MODE"] = "ENFORCE"
+        # This whole suite predates the 2026-10-01 decision that the
+        # auto-learned guard defaults to `warn`. Every test here that trains
+        # a correction via `train_pair` and then asserts a `deny` is testing
+        # the pre-existing, still-supported `deny` opt-in explicitly -- not
+        # the new default, which ActivePreventionTest covers separately.
+        self.env["MY_ERROR_AUTO_GUARD_SEVERITY"] = "deny"
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -2618,6 +2624,107 @@ class ActivePreventionTest(unittest.TestCase):
         self.assertIsNotNone(out)
         self.assertEqual(out["hookSpecificOutput"]["additionalContext"].count("ERR-"), 2)
 
+    # --- path/identifier segmentation in the PreToolUse query ---------------
+    # Regression coverage for a real finding: a path or a dotted module
+    # reference tokenizes as ONE opaque blob under base_tokens() (it includes
+    # '/' and '.'), so a lesson about ~/Downloads/*.3mf could never match a
+    # command that reads exactly that file -- the tokens proving relevance
+    # did not exist, not merely scored low. These tests must run with the
+    # real `hook guard` subprocess entry point and `cwd` fixed to self.project
+    # for both the `learn` and the `hook` call (project identity is resolved
+    # from the process cwd when no CLAUDE_PROJECT_DIR-free event is passed).
+    def _learn_3mf_lesson(self):
+        return self.learn(
+            "--scope", "project", "--title", "3mf nao encontrado apos download",
+            "--cause", "zip corrompido ou download incompleto confundido com arquivo perdido",
+            "--rule", ("Antes de ler um .3mf de ~/Downloads, checar os.path.exists e procurar em "
+                      "~/.local/share/Trash/files antes de concluir que sumiu"),
+            "--confidence", "verified", "--tags", "3mf,fixtures,downloads,trash")
+
+    def test_path_shaped_lesson_delivers_for_the_exact_repro(self):
+        self._learn_3mf_lesson()
+        cmd = 'python3 -c "import zipfile; zipfile.ZipFile("/home/w-jr/Downloads/star.3mf")"'
+        out = self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                  "tool_input": {"command": cmd}}, warn="1")
+        self.assertIsNotNone(out, "a path-shaped lesson must be reachable from a command "
+                                  "that touches exactly that path")
+        self.assertIn("ERR-", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_path_shaped_lesson_delivers_for_a_write_to_the_same_kind_of_path(self):
+        self._learn_3mf_lesson()
+        target = str(Path.home() / "Downloads" / "model.3mf")
+        out = self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Write",
+                                  "tool_input": {"file_path": target, "content": "binary..."}}, warn="1")
+        self.assertIsNotNone(out, "the Write/Edit extract_action shape (file=...;content_sha256=...) "
+                                  "must also reach a path-shaped lesson")
+
+    def test_segment_expansion_does_not_make_generic_fragments_noisy(self):
+        self._learn_3mf_lesson()
+        unrelated = ["echo hello", "ls /tmp", "npm test", "cd /home/w-jr && pwd"]
+        for cmd in unrelated:
+            out = self.hook("guard", {"session_id": f"s-{hash(cmd)}", "cwd": str(self.project),
+                                      "tool_name": "Bash", "tool_input": {"command": cmd}}, warn="1")
+            self.assertIsNone(out, f"an unrelated command must inject nothing, got output for: {cmd!r}")
+
+    def test_whole_token_match_outranks_segment_only_match(self):
+        # Lesson A shares a whole word ("alembic") with the action.
+        self.learn("--scope", "project", "--title", "Alembic ordering",
+                  "--cause", "alembic migration ran out of order",
+                  "--rule", "Run alembic migrations in dependency order.",
+                  "--confidence", "high", "--tags", "alembic,migration")
+        # Lesson B shares only a generic path segment ("home") via its own
+        # path-shaped rule text, never a whole word the action also has.
+        self.learn("--scope", "project", "--title", "Home directory cleanup",
+                  "--cause", "a cleanup script touched the wrong home directory",
+                  "--rule", "Confirm the target before deleting anything under /home/someone/old.",
+                  "--confidence", "high", "--tags", "cleanup,home")
+        out = self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                  "tool_input": {"command": "alembic upgrade head  # /home/w-jr/project"}},
+                        warn="1")
+        self.assertIsNotNone(out)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Run alembic migrations in dependency order.", ctx)
+        # If both were delivered (noise budget is 2), the whole-token lesson
+        # must be the FIRST one listed -- `format_lessons` prints `chosen` in
+        # the order recall ranked them.
+        if "Confirm the target before deleting" in ctx:
+            self.assertLess(ctx.index("Run alembic migrations"), ctx.index("Confirm the target before deleting"))
+
+    # --- auto-learned guard severity default (user decision 2026-10-01) ----
+    def _train_pair(self, bad, error, good, sid="auto-sev"):
+        fail = {"session_id": sid, "cwd": str(self.project), "tool_name": "Bash",
+                "tool_input": {"command": bad}, "error": error, "is_interrupt": False}
+        success = {"session_id": sid, "cwd": str(self.project), "tool_name": "Bash",
+                   "tool_input": {"command": good}, "tool_response": {"stdout": "ok"}}
+        self.hook("failure", fail)
+        return self.hook("success", success)
+
+    def test_auto_pipeline_defaults_to_warn_and_does_not_deny(self):
+        env = self.env.copy(); env.pop("MY_ERROR_AUTO_GUARD_SEVERITY", None)
+        self.env = env
+        out = self._train_pair("npm run buil", "Exit code 1\nMissing script: buil", "npm run build")
+        self.assertIsNotNone(out, "the correction must still be learned")
+        repeat = {"session_id": "auto-sev", "cwd": str(self.project), "tool_name": "Bash",
+                  "tool_input": {"command": "npm run buil"}}
+        guard_out = self.hook("guard", repeat, mode="ENFORCE")
+        self.assertIsNone(guard_out, "the auto-learned guard must default to warn, never deny")
+        db = self.db()
+        try:
+            severity = db.execute("select severity from guards limit 1").fetchone()[0]
+        finally:
+            db.close()
+        self.assertEqual(severity, "warn")
+
+    def test_auto_pipeline_opt_in_restores_deny(self):
+        env = self.env.copy(); env["MY_ERROR_AUTO_GUARD_SEVERITY"] = "deny"
+        self.env = env
+        self._train_pair("npm run buil", "Exit code 1\nMissing script: buil", "npm run build")
+        repeat = {"session_id": "auto-sev", "cwd": str(self.project), "tool_name": "Bash",
+                  "tool_input": {"command": "npm run buil"}}
+        guard_out = self.hook("guard", repeat, mode="ENFORCE")
+        self.assertIsNotNone(guard_out)
+        self.assertEqual(guard_out["hookSpecificOutput"]["permissionDecision"], "deny")
+
     # --- WARN channel off: the freeze guarantee ------------------------------
     def test_warn_channel_off_is_byte_identical_to_pre_0_6_0_output(self):
         self._learn_relevant_lesson()
@@ -2907,3 +3014,124 @@ class CrossVersionCompatibilityTest(unittest.TestCase):
             self.assertEqual(int(db.execute("PRAGMA user_version").fetchone()[0]), SCHEMA_VERSION_EXPECTED)
         finally:
             db.close()
+
+
+class ReadOnlyOnOlderSchemaTest(unittest.TestCase):
+    """The crash this was built to catch: CURRENT (read-only) code against an
+    OLDER, unmigrated database -- the direction every other cross-version test
+    in this file does not exercise, because they all build the fixture with
+    the code under test, so the schema is always already current.
+
+    Reproduces the exact live scenario: the user's installed database sits at
+    schema 6 (0.5.0); a newer checkout's `doctor`/`metrics` must describe it,
+    not migrate it and not crash on it.
+    """
+
+    OLD_VERSIONS = {"0.4.5": "b9abf55", "0.5.0": "e3401dc"}  # schema 5, schema 6
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self.tmp.name) / "project"
+        self.data = Path(self.tmp.name) / "data"
+        self.project.mkdir(); self.data.mkdir()
+        self.env = os.environ.copy()
+        self.env["MY_ERROR_DATA_DIR"] = str(self.data)
+        self.env["CLAUDE_PROJECT_DIR"] = str(self.project)
+        self.env["MY_ERROR_MODE"] = "SHADOW"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _extract(self, sha: str) -> Path:
+        out = subprocess.run(["git", "show", f"{sha}:scripts/my_error.py"], cwd=str(ROOT),
+                             text=True, capture_output=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        old = Path(self.tmp.name) / f"old_{sha}.py"
+        old.write_text(out.stdout, encoding="utf-8")
+        return old
+
+    def _build_fixture(self, sha: str) -> int:
+        """Build the database with OLD code, so it is genuinely at that schema."""
+        old_script = self._extract(sha)
+        p = subprocess.run([sys.executable, str(old_script), "status"],
+                           text=True, capture_output=True, env=self.env, cwd=str(self.project))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            v = int(db.execute("PRAGMA user_version").fetchone()[0])
+        finally:
+            db.close()
+        return v
+
+    def _user_version(self) -> int:
+        db = sqlite3.connect(self.data / "my-error.db")
+        try:
+            return int(db.execute("PRAGMA user_version").fetchone()[0])
+        finally:
+            db.close()
+
+    def test_doctor_and_metrics_degrade_on_v5_and_v6(self):
+        for label, sha in self.OLD_VERSIONS.items():
+            with self.subTest(label=label):
+                self.tmp.cleanup()
+                self.tmp = tempfile.TemporaryDirectory()
+                self.project = Path(self.tmp.name) / "project"
+                self.data = Path(self.tmp.name) / "data"
+                self.project.mkdir(); self.data.mkdir()
+                self.env["MY_ERROR_DATA_DIR"] = str(self.data)
+                self.env["CLAUDE_PROJECT_DIR"] = str(self.project)
+                built_version = self._build_fixture(sha)
+                self.assertLess(built_version, SCHEMA_VERSION_EXPECTED, f"{label} fixture is not actually older")
+
+                for cmd in (["doctor", "--json"], ["metrics"], ["status"], ["recall-audit"], ["review"]):
+                    p = subprocess.run([sys.executable, str(SCRIPT), *cmd],
+                                       text=True, capture_output=True, env=self.env, cwd=str(self.project))
+                    self.assertEqual(p.returncode, 0, f"{label}/{cmd}: {p.stderr}")
+                    self.assertNotIn("Traceback", p.stderr, f"{label}/{cmd} crashed: {p.stderr}")
+
+                self.assertEqual(self._user_version(), built_version,
+                                 f"a read-only command migrated a v{built_version} database ({label})")
+
+                doctor_json = json.loads(subprocess.run(
+                    [sys.executable, str(SCRIPT), "doctor", "--json"],
+                    text=True, capture_output=True, env=self.env, cwd=str(self.project)).stdout)
+                self.assertIsNotNone(doctor_json.get("schema_compat_note"),
+                                     f"{label}: the compat note schema_compat_note() builds was never reached")
+                self.assertIn(f"v{built_version}", doctor_json["schema_compat_note"])
+
+                doctor_text = subprocess.run(
+                    [sys.executable, str(SCRIPT), "doctor"],
+                    text=True, capture_output=True, env=self.env, cwd=str(self.project)).stdout
+                self.assertIn("SCHEMA NOTE", doctor_text)
+
+                # Distinguishes the two different reasons a number can be
+                # absent: SCHEMA_INSUFFICIENT (this database predates the
+                # column/table) must never collapse into NOT_MEASURABLE
+                # (schema is current, there is simply no active guard) --
+                # they are different facts and must read differently.
+                prevention = doctor_json["prevention"]
+                self.assertEqual(prevention["would_block"], "SCHEMA_INSUFFICIENT")
+                self.assertIn("schema_insufficient_reason", prevention)
+
+                self.assertEqual(self._user_version(), built_version,
+                                 f"reading doctor twice migrated the database ({label})")
+
+    def test_hook_still_migrates_and_works_on_the_same_fixtures(self):
+        for label, sha in self.OLD_VERSIONS.items():
+            with self.subTest(label=label):
+                self.tmp.cleanup()
+                self.tmp = tempfile.TemporaryDirectory()
+                self.project = Path(self.tmp.name) / "project"
+                self.data = Path(self.tmp.name) / "data"
+                self.project.mkdir(); self.data.mkdir()
+                self.env["MY_ERROR_DATA_DIR"] = str(self.data)
+                self.env["CLAUDE_PROJECT_DIR"] = str(self.project)
+                self._build_fixture(sha)
+                event = {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                        "tool_input": {"command": "echo hi"}}
+                p = subprocess.run([sys.executable, str(SCRIPT), "hook", "guard"],
+                                   input=json.dumps(event), text=True, capture_output=True,
+                                   env=self.env, cwd=str(self.project))
+                self.assertEqual(p.returncode, 0, f"{label}: {p.stderr}")
+                self.assertEqual(self._user_version(), SCHEMA_VERSION_EXPECTED,
+                                 f"{label}: the write path (hook) must still migrate to current")
