@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,7 +21,7 @@ def me_version() -> str:
 
 
 # Bumped with SCHEMA_VERSION in my_error.py; named so a schema bump touches one line.
-SCHEMA_VERSION_EXPECTED = 7
+SCHEMA_VERSION_EXPECTED = 8
 
 
 class MyErrorTest(unittest.TestCase):
@@ -2943,6 +2944,240 @@ class ActivePreventionTest(unittest.TestCase):
             locked.chmod(0o700)
 
 
+class FrozenFireTimeFactsTest(unittest.TestCase):
+    """Schema v8: `guard_events.severity_at_fire`/`decision`/`guard_fingerprint`.
+
+    The defect this closes: `actually_blocked` used to join `guard_events` to
+    the guard's CURRENT `severity`, so editing a guard retroactively rewrote
+    what a past event meant. These columns are written once, at fire time,
+    and read back without ever joining to `guards` for anything behavioural.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self.tmp.name) / "project"
+        self.data = Path(self.tmp.name) / "data"
+        self.project.mkdir(); self.data.mkdir()
+        self.env = os.environ.copy()
+        self.env["MY_ERROR_DATA_DIR"] = str(self.data)
+        self.env["CLAUDE_PROJECT_DIR"] = str(self.project)
+        self.env["MY_ERROR_MODE"] = "ENFORCE"
+        self.env.pop("MY_ERROR_WARN", None)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_cli(self, *args, event=None, mode=None, warn=None):
+        env = self.env.copy()
+        if mode is not None:
+            env["MY_ERROR_MODE"] = mode
+        if warn is not None:
+            env["MY_ERROR_WARN"] = warn
+        return subprocess.run([sys.executable, str(SCRIPT), *args],
+                              input=(json.dumps(event) if event is not None else None),
+                              text=True, capture_output=True, env=env, cwd=str(self.project))
+
+    def hook(self, kind, event, mode=None, warn=None):
+        p = self.run_cli("hook", kind, event=event, mode=mode, warn=warn)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return json.loads(p.stdout) if p.stdout.strip() else None
+
+    def learn(self, *args):
+        p = self.run_cli("learn", *args)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return p.stdout
+
+    def db(self):
+        return sqlite3.connect(self.data / "my-error.db")
+
+    def doctor_json(self, mode=None, warn=None):
+        p = self.run_cli("doctor", "--json", mode=mode, warn=warn)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return json.loads(p.stdout)
+
+    def _last_event(self, db):
+        row = db.execute(
+            "select mode,severity_at_fire,decision,guard_fingerprint,rule_fingerprint "
+            "from guard_events order by id desc limit 1").fetchone()
+        self.assertIsNotNone(row, "no guard_events row was written")
+        return row
+
+    # --- decision vocabulary -------------------------------------------------
+    def test_decision_denied_in_enforce_with_severity_deny(self):
+        self.learn("--scope", "project", "--title", "T", "--cause", "C", "--rule", "R",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit", "--severity", "deny")
+        out = self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                  "tool_input": {"command": "doit"}}, mode="ENFORCE")
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        mode, sev, decision, gfp, rfp = self._last_event(self.db())
+        self.assertEqual(mode, "ENFORCE")
+        self.assertEqual(sev, "deny")
+        self.assertEqual(decision, "denied")
+        self.assertTrue(gfp and gfp.startswith("fp1:"))
+        self.assertTrue(rfp and rfp.startswith("tf1:"))
+
+    def test_decision_warn_emitted_when_channel_on(self):
+        self.learn("--scope", "project", "--title", "T", "--cause", "C", "--rule", "R",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit", "--severity", "warn")
+        out = self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                  "tool_input": {"command": "doit"}}, mode="ENFORCE", warn="1")
+        self.assertIsNotNone(out)
+        _, sev, decision, _, _ = self._last_event(self.db())
+        self.assertEqual(sev, "warn")
+        self.assertEqual(decision, "warn_emitted")
+
+    def test_decision_warn_suppressed_channel_off(self):
+        self.learn("--scope", "project", "--title", "T", "--cause", "C", "--rule", "R",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit", "--severity", "warn")
+        out = self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                  "tool_input": {"command": "doit"}}, mode="ENFORCE")
+        self.assertIsNone(out)
+        _, sev, decision, _, _ = self._last_event(self.db())
+        self.assertEqual(sev, "warn")
+        self.assertEqual(decision, "warn_suppressed_channel_off")
+
+    def test_decision_silent_shadow_regardless_of_severity(self):
+        self.learn("--scope", "project", "--title", "T", "--cause", "C", "--rule", "R",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit", "--severity", "deny")
+        out = self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                                  "tool_input": {"command": "doit"}}, mode="SHADOW")
+        self.assertIsNone(out)
+        mode, sev, decision, _, _ = self._last_event(self.db())
+        self.assertEqual(mode, "SHADOW")
+        self.assertEqual(sev, "deny")
+        self.assertEqual(decision, "silent_shadow")
+
+    # --- the fix: actually_blocked reads the FROZEN decision, never guards --
+    def test_actually_blocked_is_immune_to_a_later_severity_edit(self):
+        """The exact defect report: editing a guard's severity after it fired
+        must not retroactively change what `actually_blocked` already counted.
+        """
+        self.learn("--scope", "project", "--title", "T", "--cause", "C", "--rule", "R",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit", "--severity", "deny")
+        self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                            "tool_input": {"command": "doit"}}, mode="ENFORCE")
+        before = self.doctor_json()["prevention"]["actually_blocked"]
+        self.assertEqual(before, 1)
+        # Simulate the guard being edited AFTER it fired -- directly in the
+        # database, exactly the scenario the live join-based bug could not
+        # survive: the join would have re-read this new value and silently
+        # reclassified the already-recorded event.
+        db = self.db()
+        try:
+            db.execute("update guards set severity='warn'")
+            db.commit()
+        finally:
+            db.close()
+        after = self.doctor_json()["prevention"]["actually_blocked"]
+        self.assertEqual(after, before, "actually_blocked must not change when a guard is edited after firing")
+
+    def test_unknown_at_fire_rows_are_never_backfilled_and_are_reported_separately(self):
+        self.learn("--scope", "project", "--title", "T", "--cause", "C", "--rule", "R",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit", "--severity", "deny")
+        self.hook("guard", {"session_id": "s", "cwd": str(self.project), "tool_name": "Bash",
+                            "tool_input": {"command": "doit"}}, mode="ENFORCE")
+        # Simulate a PRE-v8 row: the fire-time columns are genuinely unknown.
+        db = self.db()
+        try:
+            guard_id = db.execute("select id from guards limit 1").fetchone()[0]
+            lesson_id = db.execute("select lesson_id from guards limit 1").fetchone()[0]
+            db.execute(
+                "insert into guard_events(guard_id,lesson_id,project_id,session_id,tool_name,action,mode,"
+                "created_at,origin,experiment,guard_class,causal_outcome,severity_at_fire,decision,guard_fingerprint)"
+                " values(?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL)",
+                (guard_id, lesson_id, "legacy-project", "legacy-session", "Bash", "doit", "ENFORCE",
+                 "2026-01-01T00:00:00+00:00", "natural_usage", "v1", "execution_error", "not_evaluated"))
+            db.commit()
+        finally:
+            db.close()
+        pv = self.doctor_json()["prevention"]
+        self.assertEqual(pv["actually_blocked"], 1, "the one real, frozen DENY must still count")
+        self.assertEqual(pv["actually_blocked_unknown_at_fire"], 1,
+                         "the pre-v8 row must be reported as unknown-at-fire, never folded into actually_blocked")
+        text = self.run_cli("doctor").stdout
+        self.assertIn("unknown-at-fire", text)
+
+    # --- guard_fingerprint identifies the DEFINITION, not the row -----------
+    def test_guard_fingerprint_is_stored_on_the_guard_at_creation(self):
+        self.learn("--scope", "project", "--title", "T", "--cause", "C", "--rule", "R",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit", "--severity", "deny")
+        db = self.db()
+        try:
+            fp = db.execute("select fingerprint from guards limit 1").fetchone()[0]
+        finally:
+            db.close()
+        self.assertTrue(fp and fp.startswith("fp1:"))
+
+    def test_fingerprint_differs_for_a_differently_defined_guard(self):
+        self.learn("--scope", "project", "--title", "T1", "--cause", "C", "--rule", "R",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit", "--severity", "deny")
+        self.learn("--scope", "project", "--title", "T2", "--cause", "C", "--rule", "R",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit", "--severity", "warn")
+        db = self.db()
+        try:
+            fps = [r[0] for r in db.execute("select fingerprint from guards order by id")]
+        finally:
+            db.close()
+        self.assertEqual(len(fps), 2)
+        self.assertNotEqual(fps[0], fps[1], "severity is part of the fingerprint's identity")
+
+    def test_fingerprint_identical_for_same_definition_different_reason_text(self):
+        import importlib
+        sys.path.insert(0, str(ROOT / "scripts"))
+        try:
+            me = importlib.import_module("my_error"); importlib.reload(me)
+            fp_a = me.guard_fingerprint("Bash", "command", "exact", "doit", None, None, "deny", None)
+            fp_b = me.guard_fingerprint("Bash", "command", "exact", "doit", None, None, "deny", None)
+        finally:
+            sys.path.remove(str(ROOT / "scripts"))
+        self.assertEqual(fp_a, fp_b, "the fingerprint is a pure function of the definition fields")
+
+    def test_fingerprint_frozen_in_guard_events_survives_a_later_pattern_edit(self):
+        self.learn("--scope", "project", "--title", "T", "--cause", "C", "--rule", "R",
+                  "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                  "--guard-match", "exact", "--guard-pattern", "doit", "--severity", "deny")
+        self.hook("guard", {"session_id": "s1", "cwd": str(self.project), "tool_name": "Bash",
+                            "tool_input": {"command": "doit"}}, mode="ENFORCE")
+        db = self.db()
+        try:
+            fp_before = db.execute(
+                "select guard_fingerprint from guard_events order by id desc limit 1").fetchone()[0]
+            # Edit the guard's pattern directly -- the only way to do this
+            # today, since there is no CLI edit command; the guard still
+            # matches the same literal command here, so it fires again.
+            db.execute("update guards set severity='warn'")
+            db.commit()
+        finally:
+            db.close()
+        self.hook("guard", {"session_id": "s2", "cwd": str(self.project), "tool_name": "Bash",
+                            "tool_input": {"command": "doit"}}, mode="ENFORCE", warn="1")
+        db = self.db()
+        try:
+            fp_after = db.execute(
+                "select guard_fingerprint from guard_events order by id desc limit 1").fetchone()[0]
+        finally:
+            db.close()
+        self.assertNotEqual(fp_before, fp_after,
+                           "a changed severity must change the fingerprint of the NEW firing")
+        # And the OLD row's fingerprint must be untouched.
+        db = self.db()
+        try:
+            still = db.execute(
+                "select guard_fingerprint from guard_events order by id asc limit 1").fetchone()[0]
+        finally:
+            db.close()
+        self.assertEqual(still, fp_before, "an old guard_events row's fingerprint must never be rewritten")
+
+
 class ReleaseCoherenceAndContaminationTest(unittest.TestCase):
     """Fixtures only -- never touches the live installation or database."""
 
@@ -2955,6 +3190,22 @@ class ReleaseCoherenceAndContaminationTest(unittest.TestCase):
         self.env["MY_ERROR_DATA_DIR"] = str(self.data)
         self.env["CLAUDE_PROJECT_DIR"] = str(self.project)
         self.env["MY_ERROR_MODE"] = "SHADOW"
+        # Fixture only -- never this machine's real watchdog health file. A
+        # complete, fresh, all-hooks-evidenced fixture, so these tests exercise
+        # release_coherence_check's OTHER checks (version/schema/manifest)
+        # without the hooks-actually-loaded check (0.6.0 v8 correction) adding
+        # an unrelated mismatch of its own.
+        self.health_path = Path(self.tmp.name) / "health.json"
+        self.health_path.write_text(json.dumps({
+            "at": int(time.time() * 1000),
+            "health": {
+                "hooks_registered": True,
+                "hooks": {h: True for h in
+                          ("SessionStart", "UserPromptSubmit", "PreToolUse",
+                           "PostToolUseFailure", "PostToolUse", "SessionEnd", "Stop")},
+            },
+        }), encoding="utf-8")
+        self.env["MY_ERROR_HOOKS_HEALTH_PATH"] = str(self.health_path)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -3030,16 +3281,105 @@ class ReleaseCoherenceAndContaminationTest(unittest.TestCase):
         out = self.run_cli("doctor").stdout
         self.assertIn("CONTAMINATION NOTE", out)
 
+    # --- 0.6.0 v8 correction: hooks ACTUALLY LOADED, not merely declared ----
+    # Every one of these points `health_path`/`beacon_path` at a FIXTURE this
+    # test writes -- never at this machine's real watchdog file, per the
+    # explicit requirement that this be testable without depending on this
+    # machine's state. `release_coherence_check` is called directly (not
+    # through the CLI subprocess) so os.environ is patched for the duration,
+    # same discipline as MY_ERROR_DATA_DIR everywhere else in this suite.
+    def _import_me(self):
+        import importlib
+        sys.path.insert(0, str(ROOT / "scripts"))
+        self.addCleanup(lambda: sys.path.remove(str(ROOT / "scripts")) if str(ROOT / "scripts") in sys.path else None)
+        me = importlib.import_module("my_error"); importlib.reload(me)
+        return me
+
+    def _check(self, me, beacon_path, health_path):
+        with unittest.mock.patch.dict(os.environ, {"MY_ERROR_DATA_DIR": str(self.data),
+                                                    "CLAUDE_PROJECT_DIR": str(self.project)}):
+            db = sqlite3.connect(self.data / "my-error.db")
+            try:
+                return me.release_coherence_check(db, beacon_path=beacon_path, health_path=health_path)
+            finally:
+                db.close()
+
+    def test_declared_hook_with_no_evidence_is_unverified_not_present(self):
+        self.run_cli("doctor", "--json")  # bootstrap the database
+        # Health fixture evidences only SOME of the declared hooks.
+        self.health_path.write_text(json.dumps({
+            "at": int(time.time() * 1000),
+            "health": {"hooks_registered": True,
+                      "hooks": {"PreToolUse": True, "PostToolUseFailure": True}},
+        }), encoding="utf-8")
+        me = self._import_me()
+        coherent, mismatches, ev = self._check(me, self.data / "runtime.json", self.health_path)
+        self.assertFalse(coherent)
+        self.assertIn("SessionStart", ev["unverified_hooks"])
+        self.assertIn("PreToolUse", ev["evidenced_hooks"])
+        self.assertNotIn("PreToolUse", ev["unverified_hooks"])
+        self.assertTrue(any("UNVERIFIED" in m for m in mismatches))
+
+    def test_absent_evidence_degrades_to_cannot_verify_never_coherent(self):
+        self.run_cli("doctor", "--json")
+        missing_health = self.data / "does-not-exist.json"
+        missing_beacon = self.data / "also-does-not-exist.json"
+        me = self._import_me()
+        coherent, mismatches, ev = self._check(me, missing_beacon, missing_health)
+        self.assertFalse(coherent, "absent evidence must never read as coherent")
+        self.assertEqual(ev["beacon_status"], "absent")
+        self.assertEqual(ev["health_status"], "absent")
+        self.assertTrue(any("cannot be verified" in m for m in mismatches))
+
+    def test_unreadable_evidence_degrades_to_cannot_verify(self):
+        self.run_cli("doctor", "--json")
+        self.health_path.write_text("{not valid json", encoding="utf-8")
+        me = self._import_me()
+        coherent, mismatches, ev = self._check(me, self.data / "runtime.json", self.health_path)
+        self.assertEqual(ev["health_status"], "unreadable")
+        self.assertFalse(coherent)
+
+    def test_stale_evidence_is_reported_as_a_mismatch(self):
+        self.run_cli("doctor", "--json")
+        me = self._import_me()
+        stale_at_ms = (time.time() - me.HOOKS_EVIDENCE_STALE_SECONDS - 60) * 1000
+        self.health_path.write_text(json.dumps({
+            "at": stale_at_ms,
+            "health": {"hooks_registered": True,
+                      "hooks": {h: True for h in
+                                ("SessionStart", "UserPromptSubmit", "PreToolUse",
+                                 "PostToolUseFailure", "PostToolUse", "SessionEnd", "Stop")}},
+        }), encoding="utf-8")
+        coherent, mismatches, ev = self._check(me, self.data / "runtime.json", self.health_path)
+        self.assertFalse(coherent)
+        self.assertTrue(any("stale" in m for m in mismatches))
+
+    def test_doctor_surfaces_hooks_loaded_findings(self):
+        self.health_path.write_text(json.dumps({
+            "at": int(time.time() * 1000),
+            "health": {"hooks_registered": True, "hooks": {"PreToolUse": True}},
+        }), encoding="utf-8")
+        self.run_cli("doctor", "--json")
+        d = json.loads(self.run_cli("doctor", "--json").stdout)
+        hl = d["hooks_loaded"]
+        self.assertIn("PreToolUse", hl["evidenced_hooks"])
+        self.assertIn("SessionStart", hl["unverified_hooks"])
+        text = self.run_cli("doctor").stdout
+        self.assertIn("Hooks ACTUALLY LOADED", text)
+        self.assertIn("unverified", text)
+
 
 class CrossVersionCompatibilityTest(unittest.TestCase):
-    """Older code against a v7 database: forward-compat and rollback, proven.
+    """Older code against a v8 database: forward-compat and rollback, proven.
 
     Extracts 0.4.5 and 0.5.0 from this repo's own git history (the versions
-    named in docs/ARCHITECTURE.md and the live incident report) and runs them,
-    unmodified, against a database the CURRENT code has migrated to v7.
+    named in docs/ARCHITECTURE.md and the live incident report), PLUS 0.6.0's
+    own pre-v8 commit (schema v7, c24127d -- the branch's own history, now
+    that v7 commits exist on it), and runs all three, unmodified, against a
+    database the CURRENT code has migrated to v8.
     """
 
-    OLD_VERSIONS = {"0.4.5": "b9abf55", "0.5.0": "e3401dc"}
+    OLD_VERSIONS = {"0.4.5": "b9abf55", "0.5.0": "e3401dc", "0.6.0-v7": "c24127d"}
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -3050,7 +3390,7 @@ class CrossVersionCompatibilityTest(unittest.TestCase):
         self.env["MY_ERROR_DATA_DIR"] = str(self.data)
         self.env["CLAUDE_PROJECT_DIR"] = str(self.project)
         self.env["MY_ERROR_MODE"] = "SHADOW"
-        # Migrate to v7 through the CURRENT, real code first.
+        # Migrate to v8 through the CURRENT, real code first.
         subprocess.run([sys.executable, str(SCRIPT), "doctor", "--json"],
                        text=True, capture_output=True, env=self.env, cwd=str(self.project), check=True)
 
@@ -3065,26 +3405,29 @@ class CrossVersionCompatibilityTest(unittest.TestCase):
         old.write_text(out.stdout, encoding="utf-8")
         return old
 
-    def test_old_versions_operate_correctly_against_a_v7_database(self):
+    def test_old_versions_operate_correctly_against_a_v8_database(self):
         db_before = (self.data / "my-error.db").read_bytes()
         for label, sha in self.OLD_VERSIONS.items():
             old_script = self._extract(sha)
             p = subprocess.run([sys.executable, str(old_script), "doctor", "--json"],
                                text=True, capture_output=True, env=self.env, cwd=str(self.project))
-            self.assertEqual(p.returncode, 0, f"{label} ({sha}) failed against a v7 database: {p.stderr}")
+            self.assertEqual(p.returncode, 0, f"{label} ({sha}) failed against a v8 database: {p.stderr}")
             d = json.loads(p.stdout)
             self.assertIn("schema_version", d)
         db = sqlite3.connect(self.data / "my-error.db")
         try:
-            # Rollback proof: the old code's fast path (_user_version >= its own
-            # SCHEMA_VERSION) must have left the v7 database at v7 -- it has no
-            # reason to touch `user_version` at all, since its own constant is
-            # smaller. What is "lost" running old code: it cannot read or act on
-            # severity/condition/exceptions/prevention_class, the new tables
-            # (guard_suppressions, guard_condition_issues, recurrence_events), or
-            # any of the 0.6.0 metrics -- it simply never queries them. What is
-            # preserved: every column and table that existed at its own schema
-            # version, unchanged in shape and content.
+            # Rollback proof: every old code's fast path (_user_version >= its
+            # own SCHEMA_VERSION) must have left the v8 database at v8 -- none
+            # has a reason to touch `user_version` at all, since its own
+            # constant is smaller. What is "lost" running old code: 0.4.5/0.5.0
+            # cannot read or act on severity/condition/exceptions/
+            # prevention_class or the v7 tables; additionally, 0.6.0-v7
+            # (c24127d, this branch's own pre-v8 history) cannot read or act on
+            # severity_at_fire/decision/guard_fingerprint/rule_fingerprint or
+            # guards.fingerprint -- none of the three ever queries columns that
+            # postdate it. What is preserved: every column and table that
+            # existed at its own schema version, unchanged in shape and
+            # content.
             self.assertEqual(int(db.execute("PRAGMA user_version").fetchone()[0]), SCHEMA_VERSION_EXPECTED)
         finally:
             db.close()
@@ -3098,10 +3441,16 @@ class ReadOnlyOnOlderSchemaTest(unittest.TestCase):
 
     Reproduces the exact live scenario: the user's installed database sits at
     schema 6 (0.5.0); a newer checkout's `doctor`/`metrics` must describe it,
-    not migrate it and not crash on it.
+    not migrate it and not crash on it. 0.6.0-v7 (c24127d, this branch's own
+    pre-v8 history) extends the same proof one step further: a GENUINELY v7
+    database (guards.severity and the v7 tables already exist, but
+    severity_at_fire/decision/guard_fingerprint do not) must not be reported
+    as SCHEMA_INSUFFICIENT for prevention_metrics as a whole -- it has
+    everything v7 needs -- but every v8 fire-time fact on it must read as
+    unknown-at-fire, never reconstructed from current guard state.
     """
 
-    OLD_VERSIONS = {"0.4.5": "b9abf55", "0.5.0": "e3401dc"}  # schema 5, schema 6
+    OLD_VERSIONS = {"0.4.5": "b9abf55", "0.5.0": "e3401dc", "0.6.0-v7": "c24127d"}  # schema 5, 6, 7
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -3144,7 +3493,7 @@ class ReadOnlyOnOlderSchemaTest(unittest.TestCase):
         finally:
             db.close()
 
-    def test_doctor_and_metrics_degrade_on_v5_and_v6(self):
+    def test_doctor_and_metrics_degrade_on_v5_v6_and_v7(self):
         for label, sha in self.OLD_VERSIONS.items():
             with self.subTest(label=label):
                 self.tmp.cleanup()
@@ -3184,8 +3533,28 @@ class ReadOnlyOnOlderSchemaTest(unittest.TestCase):
                 # (schema is current, there is simply no active guard) --
                 # they are different facts and must read differently.
                 prevention = doctor_json["prevention"]
-                self.assertEqual(prevention["would_block"], "SCHEMA_INSUFFICIENT")
-                self.assertIn("schema_insufficient_reason", prevention)
+                if built_version < 7:
+                    # guards.severity and the v7 tables do not exist at all --
+                    # the WHOLE active-prevention block is insufficient.
+                    self.assertEqual(prevention["would_block"], "SCHEMA_INSUFFICIENT")
+                    self.assertIn("schema_insufficient_reason", prevention)
+                else:
+                    # A genuinely v7 database (0.6.0-v7/c24127d): everything
+                    # v7 needs is present, so the block as a whole is NOT
+                    # schema-insufficient -- `would_block` is a real int.
+                    # But severity_at_fire/decision/guard_fingerprint are v8,
+                    # so `actually_blocked` must read as 0 (nothing can be
+                    # proven DENIED without the frozen `decision` column) and
+                    # every ENFORCE event on it must be counted as
+                    # unknown-at-fire, never silently reconstructed via the
+                    # banned join on guards.severity.
+                    # guards_active==0 on a fresh fixture, so NOT_MEASURABLE
+                    # applies (a different, already-tested sentinel) -- the
+                    # point here is only that it is NOT SCHEMA_INSUFFICIENT.
+                    self.assertNotEqual(prevention["would_block"], "SCHEMA_INSUFFICIENT",
+                                        f"{label}: a genuine v7 db should not be SCHEMA_INSUFFICIENT for v7 metrics")
+                    self.assertNotEqual(prevention["actually_blocked"], "SCHEMA_INSUFFICIENT")
+                    self.assertNotIn(prevention["actually_blocked_unknown_at_fire"], ("SCHEMA_INSUFFICIENT",))
 
                 self.assertEqual(self._user_version(), built_version,
                                  f"reading doctor twice migrated the database ({label})")
