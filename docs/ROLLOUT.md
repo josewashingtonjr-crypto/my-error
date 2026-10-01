@@ -1,7 +1,34 @@
 # Rollout — 0.4.5 (installed) → 0.6.0
 
-NOT AUTHORIZED. This is the plan, written to be executed only on the user's
-explicit go-ahead, one stage at a time, with a stop condition at each.
+Authorization status, recorded 2026-10-01. Each stage is executed only on the
+user's explicit go-ahead, one at a time, with a stop condition at each.
+
+| Stage | Status |
+|---|---|
+| 0 — baseline | authorized, after the freeze |
+| 1 — hook timeout | **authorized**, after the freeze, sequential, individual rollback |
+| 2 — install 0.6.0, WARN off | **authorized**, after the freeze, sequential, individual rollback |
+| 3 — annotate the contaminated v3 window | **authorized**, after the freeze, sequential, individual rollback |
+| 4 — WARN on | authorized later; gated on the coherence confirmation below |
+| 5 — seed the three guards | authorized later, **as `warn` only** |
+| 6 — selective ENFORCE | **NOT authorized.** Requires fresh authorization based on evidence |
+
+Standing constraints set by the user:
+
+- The experimental freeze holds until **2026-10-02**. Nothing in this document
+  runs before then.
+- **No new lesson is written to the live database during the freeze.** This
+  includes the false-pass lesson described in "After the freeze" below, which is
+  authorized but deferred.
+- The contaminated SHADOW v3 window is preserved. Its history is not rewritten.
+- Before WARN is enabled, the installed version, the hooks **actually loaded**
+  (not merely declared), the schema and the baseline must be confirmed to agree.
+- ENFORCE additionally requires the fire-time immutability work: `guard_events`
+  must persist the severity, the effective decision and the rule identifier as
+  they were at the moment of firing, so a later edit to a guard cannot change
+  what a past metric means.
+- The `heldout_live_benchmark.py` result stays documented at its real value.
+  Thresholds are not adjusted to manufacture a pass.
 
 ## Starting state, measured 2026-10-01
 
@@ -102,6 +129,11 @@ generation starting from a silently-cleaned slate would be unfalsifiable.
 
 ## Stage 4 — WARN on, still no guards
 
+Authorized later, and only after this gate passes: the installed version, the
+hooks evidenced as actually having fired, the schema and the baseline all agree.
+A hook that the manifest declares but that has never been observed to run counts
+as unverified, not present.
+
 Turn the WARN channel on. Contextual recall begins injecting at PreToolUse;
 nothing can block, because no guard exists.
 
@@ -136,6 +168,10 @@ mechanically verifiable at all.
 
 ## Stage 6 — selective ENFORCE
 
+**Not authorized.** Requires fresh authorization from the user, based on
+evidence, and is additionally blocked until `guard_events` persists fire-time
+severity, decision and rule identity.
+
 Only after stage 5 has produced a real false-positive rate. Promote
 guard-by-guard, `warn` → `deny`, never a global switch. ERR-0017 only with
 `condition=cwd_not_git_repo`; it is a false-positive factory without it, since
@@ -156,3 +192,41 @@ Not success: green tests, a non-zero guard count, or a zero in any prevention
 metric. With `guards_active == 0` those metrics now read `NOT_MEASURABLE`, and on
 a pre-v7 database `SCHEMA_INSUFFICIENT` — two different reasons, deliberately
 never collapsed into the same `0` that started this whole investigation.
+
+
+## After the freeze — authorized, deferred
+
+Writing a lesson changes the recall pool and injects into later sessions, so
+none of this happens before 2026-10-02.
+
+- Record the lesson the user authorized: a test fixture built by the code under
+  test cannot observe a version-skew bug. That is how `doctor` and `metrics`
+  crashing on a pre-v7 database survived 160 green tests. Measured corollary
+  from the same day: a single-lesson fixture cannot observe tag collision, which
+  is how the recall-dedup inversion survived two review rounds. Build fixtures
+  from older code and from realistic data pools.
+- Use the **installed** binary to write it, not this worktree's. `learn` is a
+  write command, and running the newer code against the live database would
+  migrate it ahead of the installed runtime — recreating the exact incoherence
+  stage 2 exists to resolve.
+
+## What would demonstrate real prevention
+
+The user's stated objective is to demonstrate real prevention, not correct
+functioning of the prevention mechanisms. Those are different claims and this
+project has already mistaken one for the other twice. What counts:
+
+1. A recurrence of a **recorded** mistake, in genuine work, denied before it
+   executed — recorded as `actually_blocked` with a confirmed causal outcome,
+   where the confirmation comes from `confirm_evidence` matching the predicted
+   harm, not merely from the command having failed.
+2. A false-positive count that is a measured number over a known denominator of
+   legitimate operations, not an absence of complaints.
+3. Both read from fire-time columns, so neither can be rewritten by editing a
+   guard afterwards.
+
+What does not count, and must never be reported as if it did: a green test
+suite, a non-zero guard count, a benchmark at 100%, or a zero in any prevention
+metric. With no guards those metrics read `NOT_MEASURABLE`; on an old schema,
+`SCHEMA_INSUFFICIENT`; for a pre-v8 event, unknown-at-fire. Three different
+reasons, none of them a result.
