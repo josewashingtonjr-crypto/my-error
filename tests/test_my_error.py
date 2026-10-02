@@ -3352,74 +3352,262 @@ class ReleaseCoherenceAndContaminationTest(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {"MY_ERROR_DATA_DIR": str(self.data),
                                                     "CLAUDE_PROJECT_DIR": str(self.project)}):
             db = sqlite3.connect(self.data / "my-error.db")
+            db.row_factory = sqlite3.Row
             try:
                 return me.release_coherence_check(db, beacon_path=beacon_path, health_path=health_path)
             finally:
                 db.close()
 
-    def test_declared_hook_with_no_evidence_is_unverified_not_present(self):
+    # --- 0.6.0-rc2 correction: health.hooks is a DECLARATION, never evidence
+    # that anything fired (proven rc1 defect -- see release_coherence_check's
+    # docstring). These replace the rc1-era tests that asserted the opposite.
+
+    def _insert_recall_event(self, phase, recalled_at, session="s1"):
+        db = self._db()
+        try:
+            db.execute(
+                "INSERT INTO recall_events(lesson_id,lesson_scope,origin_project_id,"
+                "consuming_project_id,cross_project,recalled_at,session_id,rank,phase,"
+                "top_k,pool_size) VALUES(1,'project',NULL,'p',0,?,?,1,?,5,1)",
+                (recalled_at, session, phase))
+            db.commit()
+        finally:
+            db.close()
+
+    def _insert_guard_event(self, created_at):
+        db = self._db()
+        try:
+            db.execute(
+                "INSERT INTO guard_events(guard_id,lesson_id,project_id,session_id,"
+                "tool_name,action,mode,created_at,outcome) "
+                "VALUES(1,1,'p','s1','Bash','echo hi','SHADOW',?,'pending')",
+                (created_at,))
+            db.commit()
+        finally:
+            db.close()
+
+    def _insert_candidate(self, last_seen):
+        db = self._db()
+        try:
+            db.execute(
+                "INSERT INTO candidates(project_id,session_id,created_at,last_seen,"
+                "tool_name,bad_action,error_family,error_fingerprint,error_excerpt) "
+                "VALUES('p','s1',?,?,'Bash','false','generic','fp1','boom')",
+                (last_seen, last_seen))
+            db.commit()
+        finally:
+            db.close()
+
+    def _iso(self, age_seconds=0.0):
+        import datetime as _dt
+        return (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=age_seconds)).isoformat(timespec="seconds")
+
+    # 1. Manifest declares a hook, no execution occurred -> DECLARED +
+    #    UNOBSERVED, never MISMATCH.
+    def test_declared_hook_with_no_evidence_is_unobserved_not_mismatch(self):
         self.run_cli("doctor", "--json")  # bootstrap the database
-        # Health fixture evidences only SOME of the declared hooks.
-        self.health_path.write_text(json.dumps({
-            "at": int(time.time() * 1000),
-            "health": {"hooks_registered": True,
-                      "hooks": {"PreToolUse": True, "PostToolUseFailure": True}},
-        }), encoding="utf-8")
         me = self._import_me()
         coherent, mismatches, ev = self._check(me, self.data / "runtime.json", self.health_path)
-        self.assertFalse(coherent)
-        self.assertIn("SessionStart", ev["unverified_hooks"])
-        self.assertIn("PreToolUse", ev["evidenced_hooks"])
-        self.assertNotIn("PreToolUse", ev["unverified_hooks"])
-        self.assertTrue(any("UNVERIFIED" in m for m in mismatches))
+        cov = ev["coverage"]
+        self.assertTrue(cov["SessionStart"]["declared"])
+        self.assertEqual(cov["SessionStart"]["state"], me.HOOK_UNOBSERVED)
+        self.assertIn("SessionStart", ev["unobserved_hooks"])
+        self.assertNotIn("SessionStart", ev["mismatched_hooks"])
+        # UNOBSERVED must never contribute a release mismatch.
+        self.assertFalse(any("SessionStart" in m for m in mismatches))
 
-    def test_absent_evidence_degrades_to_cannot_verify_never_coherent(self):
+    # 2. A hook executes and produces valid evidence -> OBSERVED.
+    def test_hook_with_current_evidence_is_observed(self):
+        self.run_cli("doctor", "--json")
+        self._insert_guard_event(self._iso(5))
+        me = self._import_me()
+        coherent, mismatches, ev = self._check(me, self.data / "runtime.json", self.health_path)
+        self.assertEqual(ev["coverage"]["PreToolUse"]["state"], me.HOOK_OBSERVED)
+        self.assertIn("PreToolUse", ev["observed_hooks"])
+
+    # 3. UserPromptSubmit with recall_events.phase='prompt' -> OBSERVED. This
+    #    is the exact live case rc1 got wrong: a `doctor` check reported
+    #    UserPromptSubmit unverified while this evidence existed and was
+    #    minutes old. Regression test for that proven defect.
+    def test_user_prompt_submit_observed_via_recall_events_phase_prompt(self):
+        self.run_cli("doctor", "--json")
+        self._insert_recall_event("prompt", self._iso(120))
+        me = self._import_me()
+        coherent, mismatches, ev = self._check(me, self.data / "runtime.json", self.health_path)
+        self.assertEqual(ev["coverage"]["UserPromptSubmit"]["state"], me.HOOK_OBSERVED)
+        self.assertIn("UserPromptSubmit", ev["observed_hooks"])
+
+    # 4. SessionEnd and Stop not yet fired -> UNOBSERVED, and the overall
+    #    coherence verdict is NOT dragged down by them.
+    def test_session_end_hooks_unobserved_never_drag_down_coherence(self):
+        self.run_cli("doctor", "--json")
+        me = self._import_me()
+        coherent, mismatches, ev = self._check(me, self.data / "runtime.json", self.health_path)
+        for event in me.SESSION_END_ONLY_HOOKS:
+            self.assertEqual(ev["coverage"][event]["state"], me.HOOK_UNOBSERVED)
+        self.assertTrue(coherent, "a session that has not ended yet must still be able to be coherent")
+
+    # 5. Manifest and runtime genuinely incompatible -> MISMATCH.
+    def test_evidence_for_an_undeclared_hook_is_mismatch(self):
+        self.run_cli("doctor", "--json")
+        beacon_path = self.data / "runtime.json"
+        beacon_path.write_text(json.dumps(
+            {"version": me_version(), "last_hook": "bogus-kind-not-in-any-manifest", "last_seen": self._iso(1)}),
+            encoding="utf-8")
+        me = self._import_me()
+        # A beacon `last_hook` with no KIND_TO_EVENT mapping produces no event
+        # at all, so exercise the undeclared-event path directly through
+        # hook_observability with a fabricated but internally-consistent
+        # observation set instead -- this is the shape MISMATCH exists for.
+        _conn = sqlite3.connect(self.data / "my-error.db")
+        _conn.row_factory = sqlite3.Row
+        ev = me.hooks_evidence(beacon_path, self.health_path, db=_conn)
+        _conn.close()
+        ev["db_observations"] = {"PostToolUse": [{"source": "guard_events", "age_seconds": 1.0, "strength": "strong"}]}
+        cov = me.hook_observability(ev, declared={"SessionStart", "UserPromptSubmit", "PreToolUse",
+                                                   "PostToolUseFailure", "Stop", "SessionEnd"})  # PostToolUse NOT declared
+        self.assertEqual(cov["PostToolUse"]["state"], me.HOOK_MISMATCH)
+        self.assertIn("does not declare", cov["PostToolUse"]["mismatch_reason"])
+
+    # 6. Evidence that is stale, or belongs to a different release, is not
+    #    counted as current OBSERVED; it is reported with its age/provenance.
+    def test_stale_evidence_is_not_counted_as_observed(self):
+        self.run_cli("doctor", "--json")
+        me = self._import_me()
+        stale_age = me.HOOKS_EVIDENCE_STALE_SECONDS + 60
+        self._insert_guard_event(self._iso(stale_age))
+        coherent, mismatches, ev = self._check(me, self.data / "runtime.json", self.health_path)
+        entry = ev["coverage"]["PreToolUse"]
+        self.assertEqual(entry["state"], me.HOOK_UNOBSERVED)
+        self.assertTrue(entry["evidence"][0]["stale"])
+        self.assertGreater(entry["evidence"][0]["age_seconds"], me.HOOKS_EVIDENCE_STALE_SECONDS)
+
+    def test_evidence_from_a_different_release_is_not_counted_as_observed(self):
+        self.run_cli("doctor", "--json")
+        beacon_path = self.data / "runtime.json"
+        beacon_path.write_text(json.dumps(
+            {"version": "0.5.0", "last_hook": "prompt", "last_seen": self._iso(5)}), encoding="utf-8")
+        me = self._import_me()
+        coherent, mismatches, ev = self._check(me, beacon_path, self.health_path)
+        entry = ev["coverage"]["UserPromptSubmit"]
+        self.assertEqual(entry["state"], me.HOOK_UNOBSERVED,
+                         "evidence tagged with a DIFFERENT code version must not be credited to this release")
+        self.assertEqual(entry["evidence"][0]["release"], "other")
+        # The version disagreement is still a genuine release mismatch.
+        self.assertFalse(coherent)
+        self.assertTrue(any("0.5.0" in m for m in mismatches))
+
+    # 7. Session restart and plugin update: evidence from before the update
+    #    must not be silently credited to the new release. Covered by the two
+    #    tests directly above (stale ages out; a stamped older version is
+    #    excluded by name) -- this test exercises both facts together, as a
+    #    restart would actually produce them.
+    def test_restart_after_update_does_not_credit_old_evidence(self):
+        self.run_cli("doctor", "--json")
+        beacon_path = self.data / "runtime.json"
+        old_version = "0.4.5"
+        beacon_path.write_text(json.dumps(
+            {"version": old_version, "last_hook": "guard", "last_seen": self._iso(30)}), encoding="utf-8")
+        me = self._import_me()
+        coherent, mismatches, ev = self._check(me, beacon_path, self.health_path)
+        self.assertNotIn("PreToolUse", ev["observed_hooks"])
+        self.assertFalse(coherent)
+
+    # 8a. Both observability sources absent -> degrades per source, reported
+    #     as an observability gap, never as a false "nothing fired" and never
+    #     silently folded into "coherent" (that flag answers a DIFFERENT
+    #     question -- see release_coherence_check's docstring for why).
+    def test_both_sources_absent_is_an_observability_gap_not_a_false_coherent(self):
         self.run_cli("doctor", "--json")
         missing_health = self.data / "does-not-exist.json"
         missing_beacon = self.data / "also-does-not-exist.json"
         me = self._import_me()
         coherent, mismatches, ev = self._check(me, missing_beacon, missing_health)
-        self.assertFalse(coherent, "absent evidence must never read as coherent")
         self.assertEqual(ev["beacon_status"], "absent")
         self.assertEqual(ev["health_status"], "absent")
-        self.assertTrue(any("cannot be verified" in m for m in mismatches))
+        self.assertTrue(ev["observability_unavailable"])
+        # No version/schema/manifest disagreement was introduced by this
+        # fixture, so coherence (a DIFFERENT question) is unaffected.
+        self.assertTrue(coherent)
+        for event in ev["coverage"]:
+            self.assertEqual(ev["coverage"][event]["state"], me.HOOK_UNOBSERVED,
+                             "absent sources must read as unobserved, never as a confirmed non-firing")
 
-    def test_unreadable_evidence_degrades_to_cannot_verify(self):
+    # 8b. Partial absence (only one source missing) degrades that source
+    #     alone; the other source's evidence still counts.
+    def test_partial_absence_degrades_only_the_missing_source(self):
+        self.run_cli("doctor", "--json")
+        self._insert_recall_event("session-start", self._iso(2))
+        missing_health = self.data / "does-not-exist.json"
+        me = self._import_me()
+        coherent, mismatches, ev = self._check(me, self.data / "runtime.json", missing_health)
+        self.assertEqual(ev["health_status"], "absent")
+        self.assertFalse(ev["observability_unavailable"], "the database still has evidence to read")
+        self.assertEqual(ev["coverage"]["SessionStart"]["state"], me.HOOK_OBSERVED)
+
+    def test_unreadable_health_file_degrades_only_that_source(self):
         self.run_cli("doctor", "--json")
         self.health_path.write_text("{not valid json", encoding="utf-8")
         me = self._import_me()
         coherent, mismatches, ev = self._check(me, self.data / "runtime.json", self.health_path)
         self.assertEqual(ev["health_status"], "unreadable")
-        self.assertFalse(coherent)
+        # An unreadable DECLARATION source is not, by itself, a release
+        # mismatch -- it carries no claim about version/schema/manifest.
+        self.assertTrue(coherent)
 
-    def test_stale_evidence_is_reported_as_a_mismatch(self):
+    # Candidates: weak evidence, never upgraded to OBSERVED on its own.
+    def test_candidate_row_alone_is_never_upgraded_to_observed(self):
         self.run_cli("doctor", "--json")
+        self._insert_candidate(self._iso(5))
         me = self._import_me()
-        stale_at_ms = (time.time() - me.HOOKS_EVIDENCE_STALE_SECONDS - 60) * 1000
+        coherent, mismatches, ev = self._check(me, self.data / "runtime.json", self.health_path)
+        entry = ev["coverage"]["PostToolUseFailure"]
+        self.assertEqual(entry["state"], me.HOOK_UNOBSERVED,
+                         "a bare candidate row carries no release attribution and must not read as OBSERVED")
+        self.assertEqual(entry["evidence"][0]["strength"], "weak")
+
+    def test_health_hooks_map_is_read_as_a_declaration_never_as_evidence(self):
+        # The exact proven rc1 defect: health.hooks is the watchdog's OWN
+        # read of the manifest (hardcoded four-event list), not proof of
+        # firing. Even with every one of those four marked true and fresh,
+        # a hook with no OTHER evidence must stay UNOBSERVED.
+        self.run_cli("doctor", "--json")
         self.health_path.write_text(json.dumps({
-            "at": stale_at_ms,
+            "at": int(time.time() * 1000),
             "health": {"hooks_registered": True,
                       "hooks": {h: True for h in
                                 ("SessionStart", "UserPromptSubmit", "PreToolUse",
-                                 "PostToolUseFailure", "PostToolUse", "SessionEnd", "Stop")}},
+                                 "PostToolUseFailure")}},
         }), encoding="utf-8")
+        me = self._import_me()
         coherent, mismatches, ev = self._check(me, self.data / "runtime.json", self.health_path)
-        self.assertFalse(coherent)
-        self.assertTrue(any("stale" in m for m in mismatches))
+        for event in ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUseFailure"):
+            self.assertEqual(ev["coverage"][event]["state"], me.HOOK_UNOBSERVED,
+                             f"{event}: health.hooks=True must NOT be read as firing evidence")
+        self.assertNotIn("health_evidenced", ev)  # rc1 key, must not resurface under a new name
 
-    def test_doctor_surfaces_hooks_loaded_findings(self):
+    def test_health_version_mismatch_is_a_genuine_mismatch(self):
+        self.run_cli("doctor", "--json")
         self.health_path.write_text(json.dumps({
             "at": int(time.time() * 1000),
-            "health": {"hooks_registered": True, "hooks": {"PreToolUse": True}},
+            "health": {"hooks_registered": True, "hooks": {}, "version": "9.9.9"},
         }), encoding="utf-8")
+        me = self._import_me()
+        coherent, mismatches, ev = self._check(me, self.data / "runtime.json", self.health_path)
+        self.assertFalse(coherent)
+        self.assertTrue(any("9.9.9" in m for m in mismatches))
+
+    def test_doctor_surfaces_hooks_loaded_findings(self):
         self.run_cli("doctor", "--json")
+        self._insert_guard_event(self._iso(5))
         d = json.loads(self.run_cli("doctor", "--json").stdout)
         hl = d["hooks_loaded"]
-        self.assertIn("PreToolUse", hl["evidenced_hooks"])
-        self.assertIn("SessionStart", hl["unverified_hooks"])
+        self.assertIn("PreToolUse", hl["observed_hooks"])
+        self.assertIn("SessionStart", hl["unobserved_hooks"])
         text = self.run_cli("doctor").stdout
         self.assertIn("Hooks ACTUALLY LOADED", text)
-        self.assertIn("unverified", text)
+        self.assertIn("UNOBSERVED", text)
+        self.assertIn("OBSERVED", text)
 
 
 class CrossVersionCompatibilityTest(unittest.TestCase):
