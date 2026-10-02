@@ -11,6 +11,7 @@ import datetime as dt
 import difflib
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -22,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 SCHEMA_VERSION = 9
 MAX_TEXT = 4000
 AUTO_GUARD_TTL_DAYS = 90
@@ -348,13 +349,50 @@ CONDITIONS = {
 # noise budget: this phase fires on every Bash/Write/Edit, so the ceiling is
 # much tighter than prompt-time recall's.
 PRETOOLUSE_RECALL_LIMIT = 2
-PRETOOLUSE_RELEVANCE_FLOOR = 2  # whole-token overlap, OR a tag hit
+# 0.6.1: the floor is RARITY-WEIGHTED evidence, not a raw overlap count.
+# Each shared token is worth its normalized IDF over the lesson pool (1.0 for
+# a token only one lesson has, approaching 0 for one every lesson has), so
+# "2" still means "two pieces of evidence", but only rare tokens count fully.
+# Measured on the live 147-lesson pool (02/10): with a raw count, `git log -1`
+# cleared the floor for a docker-logs lesson, and the Portuguese prose of a
+# heredoc being WRITTEN to a file cleared it for 142 lessons at once
+# ('que', 'sem', 'antes' are in almost every lesson). On a small pool (N=1..4,
+# every test fixture) the weights are ~1.0 and behaviour is unchanged.
+PRETOOLUSE_RELEVANCE_FLOOR = 2.0
 # A path/identifier segment is noisier and shorter than a real word (a path
 # under the user's home directory shares "home" with nearly everything), so
-# segment-only evidence needs more independent agreement than a whole-token
-# hit does before it can clear the floor on its own. It still contributes to
-# score (at a fraction of a whole-token hit's weight) once a lesson is in.
-PRETOOLUSE_SEGMENT_FLOOR = 3
+# a segment counts at this fraction of its weight. Three agreeing rare
+# segments (1.5) no longer clear the floor alone; they need a tag or a word.
+PRETOOLUSE_SEGMENT_WEIGHT = 0.5
+# Heredoc bodies fed to these are CODE for another interpreter and stay in
+# the recall query (SQL inside `python3 - <<EOF` is exactly what a schema
+# lesson is about). Any other heredoc consumer -- cat, tee, git commit -F -
+# -- receives DATA: the text being written says nothing about the risk of
+# the action, and was the single largest noise source measured.
+# Rarity over the LESSON pool measures how specific a token is to a lesson, not
+# how common it is in ACTIONS: `python3`, `eof` and `cat` appear in one lesson
+# each (weight 1.0) yet in 20-45% of real commands (measured over 289 recorded
+# Bash actions, 02/10). These generic shell/Python plumbing words are counted
+# at PRETOOLUSE_VOCAB_WEIGHT of their rarity weight. Deliberately generic and
+# deliberately NOT domain vocabulary: no SQL keywords, no git/docker verbs --
+# those are what schema, staging and container lessons are about.
+PRETOOLUSE_VOCAB_WEIGHT = 0.25
+_ACTION_VOCAB = frozenset({
+    "echo", "printf", "cd", "ls", "cat", "head", "tail", "grep", "sed", "awk", "wc", "sort",
+    "uniq", "tr", "cut", "tee", "xargs", "find", "mkdir", "touch", "cp", "mv", "rm", "chmod",
+    "sleep", "true", "false", "test", "exit", "export", "set", "read", "source", "date",
+    "if", "then", "else", "fi", "for", "while", "do", "done", "case", "esac", "in",
+    "sh", "bash", "exec", "env", "sudo", "eof", "/dev/null", "2>&1", "/tmp",
+    "python", "python3", "py", "import", "print", "open", "len", "def", "return", "json",
+    "json.load", "json.loads", "json.dumps", "os", "sys", "re", "not", "and", "or", "none",
+    "node", "npx", "npm", "const", "let", "var", "new", "require",
+    "-c", "-n", "-e", "-u", "-d", "-p", "-s", "-v", "-l", "-i", "-w", "-x", "-r", "-q",
+    "--short", "--format", "--oneline", "--help", "--quiet", "--version",
+})
+_HEREDOC_CODE_CONSUMERS = frozenset({
+    "python", "python3", "node", "bash", "sh", "zsh", "psql", "sqlite3", "mysql",
+    "ruby", "perl", "deno", "bun", "tsx", "ts-node", "php",
+})
 
 NOT_MEASURABLE = "NOT_MEASURABLE"
 NOT_MEASURABLE_REASON = (
@@ -2137,6 +2175,79 @@ def segment_tokens(raw_tokens: set[str]) -> set[str]:
     return segments
 
 
+def _heredoc_consumer(line_prefix: str) -> str:
+    """Basename of the command word that receives a heredoc opened on this line.
+
+    `line_prefix` is the text before `<<`. The consumer is the first word of the
+    last simple command in it, stepping over `VAR=x` assignments and transparent
+    wrappers the same way `shell_command_offsets` does for guards.
+    """
+    seg = re.split(r"[;|&()]", line_prefix)[-1].split()
+    for word in seg:
+        if _ENV_ASSIGN.match(word) or word in _SHELL_TRANSPARENT:
+            continue
+        return os.path.basename(word)
+    return ""
+
+
+def strip_data_heredocs(cmd: str) -> str:
+    """Drop heredoc bodies that are DATA (see `_HEREDOC_CODE_CONSUMERS`).
+
+    Recall-query only: the guard path keeps using `mask_shell_data`, which must
+    preserve offsets. Here offsets do not matter and deletion is the point --
+    the body of `cat >> notes.md <<EOF` must contribute no tokens at all.
+    """
+    lines = cmd.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        for m in _HEREDOC_OPEN.finditer(line):
+            delim = m.group(1) or m.group(2) or m.group(3) or ""
+            keep = _heredoc_consumer(line[:m.start()]) in _HEREDOC_CODE_CONSUMERS
+            strip = line[m.start():m.start() + 3] == "<<-"
+            while i < len(lines):
+                body = lines[i]
+                i += 1
+                if (body.strip() if strip else body) == delim:
+                    out.append(body)
+                    break
+                if keep:
+                    out.append(body)
+    return "\n".join(out)
+
+
+def _is_evidence_token(t: str) -> bool:
+    """Bare numbers and numeric flags (`-1`, `-50`, `2>&1` fragments) identify no action.
+
+    Alphabetic flags DO stay: `-a` in `git add -A` and `-f` in `pkill -f` are
+    precisely the tokens two real lessons are about. Their commonness is
+    already priced in by the rarity weight, which is where `-c` belongs too.
+    """
+    return not re.fullmatch(r"[\d.:/_-]+", t)
+
+
+def _pool_weights(token_sets: list[set[str]]) -> dict[str, float]:
+    """Normalized IDF of every token in the pool: log(1+N/df) / log(1+N), in (0, 1].
+
+    Normalizing by log(1+N) keeps the floor's unit stable across pool sizes: a
+    token only one lesson has is worth 1.0 whether the pool holds 1 lesson or
+    1,000, so a fixture pool and the live pool apply the same floor.
+    """
+    n = len(token_sets)
+    if n == 0:
+        return {}
+    df: dict[str, int] = {}
+    for ts in token_sets:
+        for t in ts:
+            df[t] = df.get(t, 0) + 1
+    norm = math.log(1 + n)
+    return {t: math.log(1 + n / c) / norm * (PRETOOLUSE_VOCAB_WEIGHT if t in _ACTION_VOCAB else 1.0)
+            for t, c in df.items()}
+
+
 def extract_action(tool_name: str, tool_input: dict[str, Any]) -> str:
     if tool_name == "Bash":
         return redact(tool_input.get("command", "")).strip()
@@ -2419,9 +2530,16 @@ def contextual_recall(db: sqlite3.Connection, pid: str, event: dict[str, Any], s
     already delivered, so a lesson shown at the prompt is not shown again
     one tool call later.
 
-    The floor's MEANING is unchanged from the first cut of this feature:
-    "a whole-token overlap >= PRETOOLUSE_RELEVANCE_FLOOR, OR a tag hit".
-    What changed is what can REACH a tag hit. A command argument or a path
+    The floor (0.6.1): rarity-weighted evidence >= PRETOOLUSE_RELEVANCE_FLOOR.
+    Whole words count at their normalized IDF over the pool (`_pool_weights`),
+    generic shell/Python plumbing (`_ACTION_VOCAB`) at a quarter of that,
+    segments and tags reached only through a segment at
+    PRETOOLUSE_SEGMENT_WEIGHT, and DATA heredoc bodies not at all
+    (`strip_data_heredocs`). It replaced "a raw whole-token overlap >= 2, OR
+    any tag hit", which on the live 147-lesson pool delivered ~13 unrelated
+    lessons out of 16 (see CHANGELOG 0.6.1). The rest of this paragraph is the
+    0.6.0 rationale for segmentation, which still holds.
+    What changed in 0.6.0 is what can REACH a tag hit. A command argument or a path
     tokenizes as one opaque blob under `base_tokens()` (`/home/x/y.3mf` is a
     single token), so a lesson tagged `3mf,downloads` could never match a
     command that reads exactly that file -- the tag literally could not be
@@ -2431,8 +2549,8 @@ def contextual_recall(db: sqlite3.Connection, pid: str, event: dict[str, Any], s
     text mentions `~/Downloads` is reachable the same way), and a segment
     that lands on an actual tag counts as a tag hit exactly like a whole word
     would. A bare segment overlap with no tag and no whole-token agreement
-    needs PRETOOLUSE_SEGMENT_FLOOR independent segments before it can clear
-    the floor on its own -- a single shared fragment like `home` is not
+    counts at PRETOOLUSE_SEGMENT_WEIGHT and cannot clear the floor on three
+    fragments alone (0.6.0 let 3 through) -- a single shared fragment like `home` is not
     evidence of relevance, and letting one through would turn this feature
     into noise on every tool call that happens to touch the home directory.
 
@@ -2466,14 +2584,22 @@ def contextual_recall(db: sqlite3.Connection, pid: str, event: dict[str, Any], s
     tool = str(event.get("tool_name", ""))
     inp = event.get("tool_input") or {}
     action = extract_action(tool, inp)
+    if tool == "Bash":
+        action = strip_data_heredocs(action)
     paths = " ".join(_candidate_paths(event))
     query = f"{action} {paths}"
-    q_whole = base_tokens(query)
-    q_seg = segment_tokens(q_whole)
+    q_whole = {t for t in base_tokens(query) if _is_evidence_token(t)}
+    q_seg = {t for t in segment_tokens(q_whole) if _is_evidence_token(t)}
     q_all = q_whole | q_seg
     q = tokenize(query) | q_seg
     now = utcnow()
     scored: list[tuple[int, float, sqlite3.Row]] = []
+    pool = []
+    for row in lesson_rows(db, pid):
+        hay = f"{row['title']} {row['cause']} {row['rule_text']} {row['tags']}"
+        t_whole = base_tokens(hay)
+        pool.append((row, hay, t_whole, segment_tokens(t_whole)))
+    weight = _pool_weights([tw | ts for _, _, tw, ts in pool])
     # Every row that scored ANY overlap at all (segment or whole), whether or
     # not it cleared the floor -- the instrumentation this function did not
     # have before: it lets `recall-audit` tell "nothing in the pool shared so
@@ -2481,34 +2607,40 @@ def contextual_recall(db: sqlite3.Connection, pid: str, event: dict[str, Any], s
     # enough to clear the floor", which from the OUTSIDE both looked like a
     # silent zero.
     below_floor: list[tuple[float, sqlite3.Row]] = []
-    for row in lesson_rows(db, pid):
-        hay = f"{row['title']} {row['cause']} {row['rule_text']} {row['tags']}"
-        t_whole = base_tokens(hay)
-        t_seg = segment_tokens(t_whole)
+    for row, hay, t_whole, t_seg in pool:
         t_all = t_whole | t_seg
         tag_set = {t.strip() for t in (row["tags"] or "").split(",") if t.strip()}
-        whole_overlap = len(q_whole & t_whole)
-        all_overlap = len(q_all & t_all)
-        seg_only = max(0, all_overlap - whole_overlap)
+        whole_shared = q_whole & t_whole
+        seg_shared = (q_all & t_all) - whole_shared
         # A tag matched via a segment counts exactly like a tag matched via a
         # whole word: tags are short, deliberately-chosen identifiers, and
         # segmentation is precisely what makes one reachable from inside a
-        # path or dotted reference.
-        tag_hit = bool(tag_set & q_all)
-        passes_floor = whole_overlap >= PRETOOLUSE_RELEVANCE_FLOOR or tag_hit or seg_only >= PRETOOLUSE_SEGMENT_FLOOR
-        if not all_overlap and not tag_hit:
+        # path or dotted reference. Since 0.6.1 a tag adds its rarity weight
+        # instead of clearing the floor alone: tags like `git`, `docker`,
+        # `cache` are shared by many lessons and by most commands. A tag
+        # reached ONLY through a path segment counts at segment weight: the
+        # `scratchpad` in `/tmp/claude-1000/<session>/scratchpad` describes the
+        # environment every command of the session runs in, not this action.
+        tags_shared = tag_set & q_all
+        if not whole_shared and not seg_shared and not tags_shared:
             continue  # zero shared evidence of any kind: not even a near miss
+        whole_ev = sum(weight.get(t, 1.0) for t in whole_shared)
+        evidence = (whole_ev
+                    + PRETOOLUSE_SEGMENT_WEIGHT * sum(weight.get(t, 1.0) for t in seg_shared)
+                    + sum(weight.get(t, 1.0) * (1.0 if t in q_whole else PRETOOLUSE_SEGMENT_WEIGHT)
+                          for t in tags_shared))
+        passes_floor = evidence >= PRETOOLUSE_RELEVANCE_FLOOR
         t = tokenize(hay) | t_seg
-        expanded_overlap = len(q & t)
-        semantic_only = max(0, expanded_overlap - all_overlap)
-        score = (whole_overlap * 2.0 + seg_only * 0.5 + semantic_only * 1.15
-                + row["confidence"] + (0.5 if tag_hit else 0.0))
+        semantic_only = max(0, len(q & t) - len(whole_shared | seg_shared))
+        score = evidence * 2.0 + semantic_only * 1.15 * 0.5 + row["confidence"]
         if not passes_floor:
             below_floor.append((score, row))
             continue
         if lesson_seen_in_session(db, row["id"], session, now):
             continue
-        whole_bucket = 1 if whole_overlap > 0 else 0
+        # A whole word only earns the top bucket if it is real evidence, not a
+        # ubiquitous one ('que', 'git') that half the pool shares.
+        whole_bucket = 1 if whole_ev >= 0.5 else 0
         scored.append((whole_bucket, score, row))
     # Whole-token evidence always outranks segment-only evidence, by bucket;
     # score (which already weighs segments fractionally) breaks ties within

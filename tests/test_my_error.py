@@ -2765,6 +2765,94 @@ class ActivePreventionTest(unittest.TestCase):
         self.assertIsNotNone(out)
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
 
+    # --- 0.6.1: rarity-weighted evidence (live WARN measurement, 02/10) -----
+    # With WARN on against the real 147-lesson pool, ~13 of 16 deliveries were
+    # unrelated to the action: `git log -1` cleared the floor for a docker-logs
+    # lesson, and the Portuguese prose of a heredoc being WRITTEN to a file
+    # cleared it for 142 lessons. Every one of these needs a pool where common
+    # words really are common -- a one-lesson fixture weighs every token 1.0
+    # and cannot observe the bug, exactly as the tool-name finding above.
+    def _learn_pool_with_ubiquitous_words(self):
+        filler = [
+            ("git stash nao e rascunho", "stash mexe em estado que pode nao ser seu",
+             "Antes de git stash, confira que a arvore so tem trabalho seu, porque foi assim que se perdeu."),
+            ("git checkout restaura HEAD", "checkout levou trabalho que nao estava commitado",
+             "Antes de restaurar com git checkout, crie um ponto de retorno sem depender da arvore."),
+            ("branch trocada sob a sessao", "outra sessao trocou a branch e foi lida a errada",
+             "Rode git branch --show-current antes de afirmar algo, porque a branch pode mudar."),
+            ("rebase em branch compartilhada", "rebase reescreveu historico que outro ja tinha",
+             "Nunca faca git rebase em branch publicada sem avisar, porque foi o que quebrou."),
+            ("merge sem rodar testes", "merge entrou vermelho e ninguem viu",
+             "Antes de git merge, rode a suite local, porque o CI nao foi suficiente sem isso."),
+        ]
+        for title, cause, rule in filler:
+            self.learn("--scope", "project", "--title", title, "--cause", cause, "--rule", rule,
+                       "--confidence", "high", "--tags", "git,processo")
+        self.learn("--scope", "project", "--title", "Ausencia em docker logs nao prova nada",
+                   "--cause", "o container nasceu depois do evento e o log nao tinha a linha",
+                   "--rule", "Antes de usar a falta de uma linha em docker logs, compare o StartedAt "
+                             "do container com o evento; log rotacionado nao contradiz.",
+                   "--confidence", "high", "--tags", "docker,logs,evidencia")
+        self.learn("--scope", "project", "--title", "git add -A mistura trabalho alheio",
+                   "--cause", "git add -A colocou no commit arquivos de outra sessao",
+                   "--rule", "Nunca use git add -A num host compartilhado; adicione por caminho explicito.",
+                   "--confidence", "verified", "--tags", "git,staging,escopo-de-commit")
+        self.learn("--scope", "project", "--title", "Ler o schema antes de escrever SQL",
+                   "--cause", "a query usou created_at e a coluna era recalled_at",
+                   "--rule", "Antes do primeiro select numa tabela, rode pragma table_info; "
+                             "nome de campo da aplicacao nao e nome de coluna.",
+                   "--confidence", "verified", "--tags", "sql,schema,sqlite")
+        self.learn("--scope", "project", "--title", "Script descartavel roda dentro do pacote",
+                   "--cause", "um script no scratchpad nao achou as dependencias do projeto",
+                   "--rule", "Rode o script descartavel com cwd no pacote, nao no scratchpad.",
+                   "--confidence", "high", "--tags", "node,scratchpad,module-resolution")
+
+    def _pretool(self, cmd, sid):
+        return self.hook("guard", {"session_id": sid, "cwd": str(self.project), "tool_name": "Bash",
+                                   "tool_input": {"command": cmd}}, warn="1")
+
+    def test_ubiquitous_words_and_shell_plumbing_are_not_evidence(self):
+        self._learn_pool_with_ubiquitous_words()
+        for cmd in ("git status --short && git log -1 --oneline",
+                    "python3 tools/report.py --help | head -5",
+                    "cd /tmp/claude-1000/abc/scratchpad && ls -la && cat out.txt"):
+            out = self._pretool(cmd, f"s-{hash(cmd)}")
+            self.assertIsNone(out, f"no lesson is about this action, got: "
+                                   f"{out and out['hookSpecificOutput']['additionalContext']!r} for {cmd!r}")
+
+    def test_heredoc_written_to_a_file_is_data_but_fed_to_python_is_code(self):
+        """A/B on the SAME body: only the consumer changes."""
+        self._learn_pool_with_ubiquitous_words()
+        body = 'c.execute("select recalled_at from recall_events where id=1")\nc.execute("pragma table_info(t)")'
+        as_code = f"python3 - <<'EOF'\n{body}\nEOF"
+        as_data = f"cat >> notes.md <<'EOF'\n{body}\nEOF"
+        out_code = self._pretool(as_code, "code")
+        self.assertIsNotNone(out_code, "SQL handed to an interpreter is the action -- the schema "
+                                       "lesson must be reachable (positive control)")
+        self.assertIn("pragma table_info", out_code["hookSpecificOutput"]["additionalContext"])
+        self.assertIsNone(self._pretool(as_data, "data"),
+                          "the same text appended to a file is payload and must inject nothing")
+
+    def test_prose_heredoc_does_not_flood_recall(self):
+        self._learn_pool_with_ubiquitous_words()
+        prose = ("Antes de seguir, foi medido que o canal tem ruido, porque a lição sem relação "
+                 "chegou; docker logs e git stash apareceram sem motivo.")
+        cmd = f"F=notes.md; cat >> \"$F\" <<'EOF'\n{prose}\nEOF\ngrep -c ruido \"$F\""
+        self.assertIsNone(self._pretool(cmd, "prose"))
+
+    def test_rare_flag_still_reaches_its_lesson_among_ubiquitous_git(self):
+        """Positive control for the weighting: `-a` is rare in the pool even though
+        `git` is everywhere, so the staging lesson must still arrive."""
+        self._learn_pool_with_ubiquitous_words()
+        out = self._pretool("git add -A && git commit -q -m wip", "flag")
+        self.assertIsNotNone(out)
+        self.assertIn("git add -A", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_tag_reached_only_through_an_environment_path_is_not_enough(self):
+        self._learn_pool_with_ubiquitous_words()
+        out = self._pretool("cp report.csv /tmp/claude-1000/abc/scratchpad/report.csv", "env-path")
+        self.assertIsNone(out, "a session's scratchpad path segment is environment, not evidence")
+
     # --- auto-learned guard severity default (user decision 2026-10-01) ----
     def _train_pair(self, bad, error, good, sid="auto-sev"):
         fail = {"session_id": sid, "cwd": str(self.project), "tool_name": "Bash",

@@ -1,3 +1,60 @@
+## 0.6.1 — PreToolUse recall selection: rarity-weighted evidence
+
+Found by measurement, not review. With the WARN channel switched on against a
+live 147-lesson pool (02/10), ~13 of the first 16 PreToolUse deliveries were
+unrelated to the action they preceded: a docker-logs lesson on `git status &&
+git log -1`, an npm lesson on `my_error.py recall-audit`, and 142 lessons at once
+clearing the floor on a `cat >> notes.md <<EOF` whose Portuguese prose ('que',
+'sem', 'antes', 'porque') was the text being WRITTEN, not the action. Stage 4 of
+docs/ROLLOUT.md says a noisy channel is switched off and its selection fixed
+before going further; this is that fix. The WARN channel was switched off on the
+live installation before the change and stays off: turning it back on is a
+separate decision.
+
+Four causes, each measured by replaying the real commands over a copy of the
+live database:
+
+- **Raw overlap counted every shared word equally.** The floor is now
+  rarity-weighted evidence: each word counts at its normalized IDF over the
+  lesson pool (1.0 for a word one lesson has, near 0 for one every lesson has),
+  so "2" still means two pieces of evidence. On fixture-sized pools every weight
+  is ~1.0 and behaviour is unchanged.
+- **Lesson-rarity is not action-rarity.** `python3`, `eof`, `cat` appear in one
+  lesson each but in 20–45% of 289 recorded commands; a small, generic
+  shell/Python vocabulary counts at 0.25x. No SQL, git or docker words in it.
+- **Heredoc bodies fed to `cat`/`tee`/`git commit -F -` are data** and no longer
+  enter the query. Bodies fed to an interpreter (`python3`, `psql`, `node`, …)
+  stay: SQL in `python3 - <<EOF` is exactly what a schema lesson is about.
+- **A tag reached only through a path segment** (`scratchpad` in
+  `/tmp/claude-1000/<session>/scratchpad`) counts at segment weight, and a tag no
+  longer clears the floor alone. Bare numeric flags (`-1`) are dropped;
+  alphabetic flags stay (`-a` in `git add -A` is what a real lesson is about).
+
+Measured on a labeled set built from real data — 23 guard-proven positives
+(a guard pattern matched the action in command position, so the lesson provably
+applied) plus the 8 real commands of the noisy session, hand-labeled:
+
+| | 0.6.0 | 0.6.1 |
+|---|---|---|
+| proven lesson delivered | 3/23 | 17/23 |
+| relevant / irrelevant deliveries | 6 / 56 (10%) | 20 / 31 (39%) |
+| noisy-session commands: irrelevant deliveries | 13 | 3 |
+
+The floor stays 2.0. 2.5 removed 10 more irrelevant deliveries at equal recall,
+but 3.0 collapses recall to 4/23, and choosing a value 0.1–0.4 from that cliff on
+23 samples would be fitting the threshold to the sample. The remaining
+irrelevant deliveries are mostly second-slot fillers on positives, and two
+`pragma table_info` lessons on a read-only query that did use `pragma table_info`.
+
+What this does NOT fix: a PreToolUse injection arrives after the command was
+composed, so it can only inform the NEXT action (observed live: the schema
+lesson arrived on the very command that got the column name wrong). Preventing
+the current action takes a `deny` guard — stage 6, not authorized.
+
+Five regression tests use a multi-lesson pool where common words are actually
+common; four fail against 0.6.0 (negative control), one is a positive control
+that passes on both.
+
 ## Correction: `hooks_evidence()` was reading a declaration as proof of firing (rc2)
 
 Found by proof, not review: `doctor` reported `UserPromptSubmit` unverified on a
