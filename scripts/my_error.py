@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 VERSION = "0.6.0"
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 MAX_TEXT = 4000
 AUTO_GUARD_TTL_DAYS = 90
 RECOVERY_WINDOW_MINUTES = 15
@@ -1449,6 +1449,23 @@ def migrate(db: sqlite3.Connection, current: int) -> None:
         # as unknown-at-fire, a third reading distinct from both "true" and
         # "false", never reconstructed from the guard's current state.
         db.execute("PRAGMA user_version=8")
+    if current < 9:
+        # `guards.fingerprint` was a cache with no invalidator. It is written
+        # at creation and never recomputed, so after any edit to a
+        # behaviour-determining field it still equals the value frozen in the
+        # PRE-edit `guard_events` row -- and the one question the identifier
+        # exists to answer, "is this guard still the definition that fired
+        # then", comes back "unchanged" for a rule that changed.
+        #
+        # Renamed rather than dropped: how a rule was born is worth keeping,
+        # and SQLite would have to rebuild the table to drop it. The honest
+        # name is the fix -- nothing may compare THIS column against
+        # `guard_events.guard_fingerprint`; use `live_guard_fingerprint()`,
+        # which recomputes from the row and cannot go stale.
+        cols = {r[1] for r in db.execute("PRAGMA table_info(guards)").fetchall()}
+        if "fingerprint" in cols and "fingerprint_at_creation" not in cols:
+            db.execute("ALTER TABLE guards RENAME COLUMN fingerprint TO fingerprint_at_creation")
+        db.execute("PRAGMA user_version=9")
 
 
 def _baseline_snapshot(db: sqlite3.Connection, at: str) -> dict[str, Any]:
@@ -2452,7 +2469,7 @@ def make_auto_lesson(db: sqlite3.Connection, pid: str, candidate: sqlite3.Row, g
     fingerprint = guard_fingerprint("Bash", "command", "exact", candidate["bad_action"],
                                     None, None, guard_severity, good_action)
     db.execute("""
-      INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at,origin,severity,fingerprint)
+      INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at,origin,severity,fingerprint_at_creation)
       VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?)
     """, (lesson_id, pid, "Bash", "command", "exact", candidate["bad_action"], good_action,
           f"my-error learned this exact command already failed; use `{good_action}` instead.", now, expires, origin,
@@ -2919,6 +2936,31 @@ def guard_fingerprint(tool_name: str | None, field_name: str | None, match_type:
         tool_name, field_name, match_type, pattern, condition, exceptions, severity, replacement)]
     canon = "\x00".join(parts)
     return "fp1:" + hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+
+def live_guard_fingerprint(guard: sqlite3.Row | dict[str, Any]) -> str:
+    """The guard's fingerprint computed from its CURRENT definition, right now.
+
+    This is the only correct way to ask "is this guard still the definition
+    that fired back then". `guards.fingerprint_at_creation` cannot answer it:
+    it is written once and never recomputed, so after an edit it still equals
+    the fingerprint of the rule as it was born -- which is exactly the value an
+    old `guard_events` row already holds, making the comparison report
+    "unchanged" for a rule that has since changed.
+
+    That stale-cache defect was found by editing a guard's severity and pattern
+    directly and watching the stored column keep matching the pre-edit event.
+    A derived value stored next to its own inputs with no invalidation path is
+    a cache, and this one has no invalidator: there is no guard-edit command in
+    the product, so nothing would ever refresh it. Recomputing is cheap and
+    cannot go stale, so the live value is authoritative and the stored one is
+    kept only as a record of how the rule was born.
+    """
+    g = guard if isinstance(guard, dict) else {k: guard[k] for k in _keys(guard)}
+    return guard_fingerprint(g.get("tool_name"), g.get("field_name"), g.get("match_type"),
+                             g.get("pattern"), g.get("condition"), g.get("exceptions"),
+                             g.get("severity"), g.get("replacement"))
 
 
 def text_fingerprint(text: str | None) -> str:
@@ -3543,7 +3585,7 @@ def cmd_learn(args: argparse.Namespace) -> int:
                                         args.guard_pattern, condition, guard_exceptions,
                                         guard_severity, args.replacement)
         db.execute("""
-          INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at,origin,eval_class,confirm_evidence,severity,condition,exceptions,fingerprint)
+          INSERT INTO guards(lesson_id,project_id,tool_name,field_name,match_type,pattern,replacement,reason,active,created_at,expires_at,origin,eval_class,confirm_evidence,severity,condition,exceptions,fingerprint_at_creation)
           VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?)
         """, (lid, None if scope == "global" else pid, args.guard_tool, args.guard_field, args.guard_match,
               args.guard_pattern, args.replacement, args.guard_reason or args.rule, now, expires, origin,

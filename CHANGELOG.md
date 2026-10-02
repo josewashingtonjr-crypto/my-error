@@ -4,6 +4,31 @@ Built per `docs/ACTIVE-PREVENTION.md`. Machinery only -- no guard is seeded for
 ERR-0001/0003/0017, and the WARN channel ships off by default so the SHADOW v3
 freeze is untouched by this release.
 
+## Correction: schema v9, `guards.fingerprint` was a cache with no invalidator
+
+Found in review by editing a guard and watching the identifier fail to notice.
+
+`guards.fingerprint` was written at creation and never recomputed. After an edit to
+any behaviour-determining field it still equalled the value frozen in the PRE-edit
+`guard_events` row -- so the one question the identifier exists to answer, "is this
+guard still the definition that fired back then", came back "unchanged" for a rule
+that had changed twice. A derived value stored next to its own inputs is a cache, and
+this one had no invalidator: there is no guard-edit command in the product, so nothing
+would ever refresh it.
+
+- Renamed to `guards.fingerprint_at_creation` (v9). Renamed rather than dropped: how a
+  rule was born is worth keeping, and SQLite would have to rebuild the table to drop a
+  column. The honest name IS the fix -- nothing may compare this column against
+  `guard_events.guard_fingerprint`.
+- New `live_guard_fingerprint(guard)` recomputes from the row and cannot go stale. It
+  is the authoritative answer to "has this rule changed since that event".
+- The v8 immutability guarantee was never affected: `run_guard()` already recomputed
+  the fingerprint live at fire time, so every `guard_events` row always held the
+  definition that actually fired. Only the second, cached copy on `guards` could lie.
+
+**If you were relying on `guards.fingerprint`:** it no longer exists under that name,
+and it was never safe to compare against a past event. Use `live_guard_fingerprint()`.
+
 ## Correction: schema v8, frozen fire-time facts (mandatory, blocks ENFORCE)
 
 A reported defect, fixed before ENFORCE/WARN are ever authorized: `actually_blocked`

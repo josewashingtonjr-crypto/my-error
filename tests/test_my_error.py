@@ -21,7 +21,7 @@ def me_version() -> str:
 
 
 # Bumped with SCHEMA_VERSION in my_error.py; named so a schema bump touches one line.
-SCHEMA_VERSION_EXPECTED = 8
+SCHEMA_VERSION_EXPECTED = 9
 
 
 class MyErrorTest(unittest.TestCase):
@@ -3110,7 +3110,7 @@ class FrozenFireTimeFactsTest(unittest.TestCase):
                   "--guard-match", "exact", "--guard-pattern", "doit", "--severity", "deny")
         db = self.db()
         try:
-            fp = db.execute("select fingerprint from guards limit 1").fetchone()[0]
+            fp = db.execute("select fingerprint_at_creation from guards limit 1").fetchone()[0]
         finally:
             db.close()
         self.assertTrue(fp and fp.startswith("fp1:"))
@@ -3124,11 +3124,64 @@ class FrozenFireTimeFactsTest(unittest.TestCase):
                   "--guard-match", "exact", "--guard-pattern", "doit", "--severity", "warn")
         db = self.db()
         try:
-            fps = [r[0] for r in db.execute("select fingerprint from guards order by id")]
+            fps = [r[0] for r in db.execute("select fingerprint_at_creation from guards order by id")]
         finally:
             db.close()
         self.assertEqual(len(fps), 2)
         self.assertNotEqual(fps[0], fps[1], "severity is part of the fingerprint's identity")
+
+    def test_editing_a_guard_is_detectable_against_a_past_events_fingerprint(self):
+        """The question the identifier exists for: is this still the rule that fired?
+
+        `fingerprint_at_creation` cannot answer it. It is written once and never
+        recomputed, so after an edit it still equals the value the PRE-edit
+        `guard_events` row froze -- and comparing the two reports "unchanged"
+        for a rule that has changed. That is a cache with no invalidator, and
+        there is no guard-edit command in the product that would ever refresh
+        it.
+
+        `live_guard_fingerprint()` recomputes from the row and cannot go stale,
+        so it is the authoritative answer. This test pins both halves: the live
+        value must detect the edit, and the stored column must be shown NOT to.
+        """
+        import importlib
+        sys.path.insert(0, str(ROOT / "scripts"))
+        me = importlib.import_module("my_error"); importlib.reload(me)
+
+        self.learn("--scope", "project", "--title", "T", "--cause", "C", "--rule", "R",
+                   "--confidence", "verified", "--guard-tool", "Bash", "--guard-field", "command",
+                   "--guard-match", "exact", "--guard-pattern", "doit", "--severity", "deny")
+        out = self.hook("guard", {"session_id": "s1", "cwd": str(self.project),
+                                  "tool_name": "Bash", "tool_input": {"command": "doit"}})
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        db = self.db()
+        try:
+            frozen = db.execute("select guard_fingerprint from guard_events").fetchone()[0]
+            at_creation_before = db.execute(
+                "select fingerprint_at_creation from guards").fetchone()[0]
+            self.assertEqual(frozen, at_creation_before,
+                             "before any edit the two legitimately agree")
+
+            # A later edit to a behaviour-determining field. Done in SQL because
+            # the product has no guard-edit command -- which is precisely why
+            # nothing would ever refresh a cached fingerprint.
+            db.execute("update guards set severity='warn', pattern='doit-else'")
+            db.commit()
+            row = db.execute("select * from guards").fetchone()
+            row = {k: row[i] for i, k in enumerate([c[0] for c in db.execute(
+                "select * from guards limit 1").description])}
+            live = me.live_guard_fingerprint(row)
+            at_creation_after = db.execute(
+                "select fingerprint_at_creation from guards").fetchone()[0]
+        finally:
+            db.close()
+
+        self.assertNotEqual(live, frozen,
+                            "the live fingerprint must detect that the rule changed")
+        self.assertEqual(at_creation_after, frozen,
+                         "fingerprint_at_creation is stale by design -- it records how the "
+                         "rule was born, and must never be compared against a past event")
 
     def test_fingerprint_identical_for_same_definition_different_reason_text(self):
         import importlib
@@ -3405,7 +3458,7 @@ class CrossVersionCompatibilityTest(unittest.TestCase):
         old.write_text(out.stdout, encoding="utf-8")
         return old
 
-    def test_old_versions_operate_correctly_against_a_v8_database(self):
+    def test_old_versions_operate_correctly_against_a_v9_database(self):
         db_before = (self.data / "my-error.db").read_bytes()
         for label, sha in self.OLD_VERSIONS.items():
             old_script = self._extract(sha)

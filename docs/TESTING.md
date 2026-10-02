@@ -9,7 +9,7 @@ anything, and a live protocol that exercises the real hook pipeline inside Claud
 python3 -m unittest discover -s tests -v
 ```
 
-186 tests, no third-party dependencies. They cover the learning gate, secret redaction,
+187 tests, no third-party dependencies. They cover the learning gate, secret redaction,
 project isolation, guard expiry, concurrency, locale handling, shadow scoring, storage
 resolution, the anti-superstition rules, (0.6.0) active prevention: severity/
 condition/exceptions, contextual recall at PreToolUse, read-only observability on an
@@ -18,6 +18,21 @@ correction: frozen fire-time facts (`severity_at_fire`/`decision`/`guard_fingerp
 `actually_blocked`'s immunity to a guard edited after it fired, unknown-at-fire reporting
 for pre-v8 rows, and hooks-actually-loaded verification (fixtures only, never this
 machine's real watchdog file).
+
+An independent adversarial check lives outside the suite, on purpose -- a check that
+sits inside the suite it judges can be made to pass by editing that suite:
+
+```bash
+python3 benchmarks/review_adversarial.py
+```
+
+Nine black-box checks through the real CLI and the real `hook` stdin contract:
+first-contact observation does not migrate an older database, read-only commands
+survive one, older code still operates on the current schema, `NOT_MEASURABLE` with no
+guards, WARN-off silence, exception anti-bypass, a context condition separating the
+historical mistake from its legitimate twin, and a guard edit neither rewriting a past
+metric nor escaping detection. Three of the four defects found in review presented as
+silence or as green, which is what this file is calibrated against.
 
 ```bash
 python3 benchmarks/ab_benchmark.py && python3 benchmarks/heldout_live_benchmark.py && python3 benchmarks/fuzz_live_benchmark.py
