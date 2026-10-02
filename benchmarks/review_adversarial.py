@@ -36,7 +36,31 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = Path(os.environ.get("REVIEW_SCRIPT") or (ROOT / "scripts" / "my_error.py"))
-INSTALLED_045 = Path.home() / ".claude/plugins/cache/my-error-local/my-error/0.4.5/scripts/my_error.py"
+def _older_binary() -> Path:
+    """An older release to build version-skew fixtures with.
+
+    The live cache is the first choice, but it only holds whatever version is
+    currently installed -- uninstalling the plugin removes the old one, and
+    these checks would then silently degrade to "cannot test" rather than
+    failing honestly. The pre-upgrade backup is the fallback, since the whole
+    point of keeping it was to preserve exactly this. Override with
+    REVIEW_OLD_SCRIPT.
+    """
+    env = os.environ.get("REVIEW_OLD_SCRIPT")
+    if env:
+        return Path(env)
+    cache = Path.home() / ".claude/plugins/cache/my-error-local/my-error"
+    if cache.is_dir():
+        for d in sorted(cache.iterdir()):
+            cand = d / "scripts" / "my_error.py"
+            if cand.exists() and d.name != "0.6.0":
+                return cand
+    backups = sorted((Path.home() / ".claude/plugins/data/my-error").glob(
+        "backup-pre-*/plugin-*/scripts/my_error.py"), reverse=True)
+    return backups[0] if backups else cache / "0.4.5" / "scripts" / "my_error.py"
+
+
+INSTALLED_045 = _older_binary()
 
 results: list[tuple[str, bool, str]] = []
 
