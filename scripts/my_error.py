@@ -1562,6 +1562,32 @@ def schema_compat_note(db: sqlite3.Connection) -> str | None:
 # manufacturing false alarms on every short break between them.
 HOOKS_EVIDENCE_STALE_SECONDS = 24 * 3600
 
+# The beacon records which `hook <kind>` ran, never the Claude Code event
+# name. Anything that maps beacon evidence back onto a hook event goes
+# through this table and nowhere else -- see `hooks/hooks.json` for the
+# kind each event dispatches to.
+KIND_TO_EVENT: dict[str, str] = {
+    "session-start": "SessionStart",
+    "prompt": "UserPromptSubmit",
+    "guard": "PreToolUse",
+    "failure": "PostToolUseFailure",
+    "success": "PostToolUse",
+    "stop": "Stop",
+    "cleanup": "SessionEnd",
+}
+
+# 0.6.0-rc2: the four states a hook's observability can be in. Replaces the
+# rc1 binary evidenced/unverified split, which could never represent "this
+# hook simply has not fired yet" as anything other than a fault.
+HOOK_OBSERVED = "OBSERVED"      # execution proven by evidence causally tied to this hook
+HOOK_UNOBSERVED = "UNOBSERVED"  # declared, no proven execution yet -- NOT a fault
+HOOK_MISMATCH = "MISMATCH"      # concrete evidence of incompatibility
+
+# Hooks that fire only at session end. A live session asking `doctor` a
+# question about itself can never have observed them -- that is expected,
+# not a gap, and must never read as anything else.
+SESSION_END_ONLY_HOOKS = {"Stop", "SessionEnd"}
+
 
 def _default_health_path() -> Path:
     # Same override discipline as MY_ERROR_DATA_DIR: tests (and any sandboxed
@@ -1590,29 +1616,49 @@ def _epoch_seconds(value: Any) -> float | None:
         return None
 
 
-def hooks_evidence(beacon_path: Path, health_path: Path) -> dict[str, Any]:
-    """What actually fired, read from two independently-written artifacts --
-    never from the hooks MANIFEST, which only says what the plugin declares.
+def hooks_evidence(beacon_path: Path, health_path: Path, db: sqlite3.Connection | None = None) -> dict[str, Any]:
+    """Raw observability facts, read from artifacts OTHER than the hooks
+    MANIFEST, which only says what the plugin declares.
 
-    Read-only: `open()`/`read_text()` for reading is not a database write and
-    touches nothing else. Both paths are parameters precisely so tests can
-    point this at fixtures instead of this machine's real files.
+    Read-only: `open()`/`read_text()`/`SELECT` for reading is not a database
+    write and touches nothing else. Paths and `db` are parameters precisely
+    so tests can point this at fixtures instead of this machine's real files
+    and this machine's real database.
 
       - `runtime.json` (my-error's own beacon, written on every hook): proves
-        only the SINGLE most recently fired hook (`last_hook`/`last_seen`).
-      - the external watchdog's `.my-error-health.json`: a broader per-hook
-        boolean map under `health.hooks`, written by a DIFFERENT process on
-        its own schedule (confirmed shape: `{"at": <epoch ms>, "health":
-        {"hooks_registered": bool, "hooks": {"PreToolUse": bool, ...}}}`).
+        only the SINGLE most recently fired hook (`last_hook`/`last_seen`),
+        tagged with the CODE VERSION that wrote it (`version`).
+      - the external watchdog's `.my-error-health.json`: `health.hooks` is
+        **not** execution evidence. Per its own source
+        (`watchdog/my-error-state.cjs`, `structuralHealth()`), it is
+        `Object.fromEntries(required.map((e) => [e, events.includes(e)]))`
+        against a HARDCODED four-event list read from the MANIFEST -- a
+        second declaration, in effect, never a record of anything firing.
+        0.6.0-rc1 treated it as evidence; that was the proven defect this
+        rewrite exists to fix. It is read here only for its OWN two honest
+        uses: cross-checking the installed version it separately records
+        (`health.version`), and reporting its own freshness/availability.
+      - the database itself: `recall_events.phase` rows ('prompt' ->
+        UserPromptSubmit, 'session-start' -> SessionStart, 'pretooluse' ->
+        PreToolUse -- the last only written when the WARN channel is on, so
+        its absence proves nothing, see `contextual_recall`), `guard_events`
+        rows (PreToolUse, via `run_guard`), and `candidates` rows (written by
+        the failure hook, but see `hook_observability()` -- a row alone is
+        WEAK evidence with no release attribution and is never, by itself,
+        enough to call PostToolUseFailure OBSERVED).
 
-    Absent or unreadable degrades EACH source to "absent"/"unreadable"
-    independently -- never silently treated as "no hooks fired" (a negative
-    finding) and never as grounds for "coherent".
+    Every source degrades to "absent"/"unreadable" INDEPENDENTLY of the
+    others -- never silently treated as "no hooks fired" (a negative
+    finding), and the caller (`hook_observability()`) decides what any of
+    this means for a given hook's state. This function only reports facts.
     """
     now = time.time()
     out: dict[str, Any] = {
-        "beacon_status": "absent", "beacon_last_hook": None, "beacon_age_seconds": None,
-        "health_status": "absent", "health_evidenced": [], "health_age_seconds": None,
+        "beacon_status": "absent", "beacon_last_hook": None, "beacon_last_event": None,
+        "beacon_age_seconds": None, "beacon_version": None,
+        "health_status": "absent", "health_declared_hooks": [], "health_age_seconds": None,
+        "health_version": None,
+        "db_observations": {},
     }
     try:
         raw = beacon_path.read_text(encoding="utf-8")
@@ -1625,6 +1671,8 @@ def hooks_evidence(beacon_path: Path, health_path: Path) -> dict[str, Any]:
             beacon = json.loads(raw)
             out["beacon_status"] = "ok"
             out["beacon_last_hook"] = beacon.get("last_hook")
+            out["beacon_last_event"] = KIND_TO_EVENT.get(str(beacon.get("last_hook") or ""))
+            out["beacon_version"] = beacon.get("version")
             age = _epoch_seconds(beacon.get("last_seen"))
             out["beacon_age_seconds"] = (now - age) if age is not None else None
         except (json.JSONDecodeError, AttributeError, TypeError):
@@ -1641,12 +1689,153 @@ def hooks_evidence(beacon_path: Path, health_path: Path) -> dict[str, Any]:
             h = health.get("health") or {}
             hooks_map = h.get("hooks") or {}
             out["health_status"] = "ok"
-            out["health_evidenced"] = sorted(k for k, v in hooks_map.items() if v)
+            # NOT "evidenced" -- this is the watchdog's own declaration read,
+            # kept under its own name so nothing downstream can mistake it for
+            # proof of firing. See the docstring above.
+            out["health_declared_hooks"] = sorted(k for k, v in hooks_map.items() if v)
+            out["health_version"] = h.get("version")
             age = _epoch_seconds(health.get("at"))
             out["health_age_seconds"] = (now - age) if age is not None else None
         except (json.JSONDecodeError, AttributeError, TypeError):
             out["health_status"] = "unreadable"
+    if db is not None:
+        out["db_observations"] = _db_hook_observations(db, now)
     return out
+
+
+# Phase values `record_recall_deliveries`/`recall` write, each tied to exactly
+# one hook kind -- see `_dispatch_hook`. 'pretooluse' is written only by
+# `contextual_recall`, gated on the WARN channel (off by default), so its
+# absence is never grounds to call PreToolUse anything but UNOBSERVED.
+_RECALL_PHASE_TO_EVENT = {"prompt": "UserPromptSubmit", "session-start": "SessionStart",
+                          "pretooluse": "PreToolUse"}
+
+
+def _db_hook_observations(db: sqlite3.Connection, now: float) -> dict[str, list[dict[str, Any]]]:
+    """Evidence of hook execution read from the database itself, independent
+    of the beacon and the external watchdog.
+
+    Every query is defensive: an older database, or one at a schema this code
+    does not fully recognize, may be missing a column or table read here, and
+    that MUST degrade to "no observation from this source" -- never a crash,
+    and never a false claim that nothing fired (absence of an observation is
+    not the same statement as a proven non-firing; see `hook_observability`).
+
+    Each observation is tagged with the timestamp it carries and a
+    `strength`: 'strong' for a row whose write path is causally tied to
+    exactly one hook (`recall_events.phase`, `guard_events`), 'weak' for one
+    where the tie is real but attribution is not (`candidates` -- a row is
+    created by the failure hook, but the row carries no version/release
+    marker, so it cannot prove the EXECUTION it is evidence of belongs to the
+    currently installed release; see the docstring on `hook_observability`).
+    A 'weak' observation is never, by itself, upgraded to OBSERVED.
+    """
+    obs: dict[str, list[dict[str, Any]]] = {}
+
+    def add(event: str, when: Any, strength: str, source: str) -> None:
+        ts = _epoch_seconds(when) if when else None
+        obs.setdefault(event, []).append(
+            {"source": source, "age_seconds": (now - ts) if ts is not None else None, "strength": strength})
+
+    if _table_exists(db, "recall_events") and _column_exists(db, "recall_events", "phase"):
+        try:
+            for row in db.execute(
+                "SELECT phase, MAX(recalled_at) AS latest FROM recall_events "
+                "WHERE phase IN ('prompt','session-start','pretooluse') GROUP BY phase"
+            ):
+                ev_name = _RECALL_PHASE_TO_EVENT.get(row["phase"])
+                if ev_name and row["latest"]:
+                    add(ev_name, row["latest"], "strong", "recall_events")
+        except sqlite3.Error:
+            pass
+    if _table_exists(db, "guard_events"):
+        try:
+            row = db.execute("SELECT MAX(created_at) AS latest FROM guard_events").fetchone()
+            if row and row["latest"]:
+                add("PreToolUse", row["latest"], "strong", "guard_events")
+        except sqlite3.Error:
+            pass
+    if _table_exists(db, "candidates"):
+        try:
+            row = db.execute("SELECT MAX(last_seen) AS latest FROM candidates").fetchone()
+            if row and row["latest"]:
+                add("PostToolUseFailure", row["latest"], "weak", "candidates")
+        except sqlite3.Error:
+            pass
+    return obs
+
+
+def hook_observability(
+    ev: dict[str, Any], declared: set[str],
+) -> dict[str, dict[str, Any]]:
+    """Reduce the raw facts from `hooks_evidence()` to one of the four states
+    per hook event: DECLARED is `event in declared`; the state is one of
+    OBSERVED / UNOBSERVED / MISMATCH.
+
+      - OBSERVED: at least one CURRENT (not stale), STRONG, release-attributable
+        observation exists for this event.
+      - MISMATCH: concrete, positive evidence of incompatibility -- evidence
+        names an event the manifest does NOT declare. This is the only path
+        to MISMATCH; a hook simply having no evidence is never one.
+      - UNOBSERVED: everything else, INCLUDING a declared hook with zero
+        evidence, a declared hook whose only evidence is stale, and a
+        declared hook whose only evidence is 'weak' (no defensible release
+        attribution -- see `_db_hook_observations`). This is the expected,
+        unremarkable state for `Stop`/`SessionEnd` in any live session, and
+        for any hook that simply has not run yet. It is NOT a fault.
+
+    Release attribution for the beacon: the beacon carries the VERSION that
+    wrote it. If that version does not match the code now asking the
+    question, the beacon's evidence belongs to a different release (a restart
+    after `claude plugin update`, most plainly) and must not be silently
+    credited to this one -- it is kept as evidence (so a human can see it)
+    but excluded from OBSERVED. No other source here carries a version
+    marker (a real gap, not fabricated to close it -- see the handback
+    report), so 'strong' db-sourced evidence is accepted on recency alone,
+    same as before this rewrite.
+    """
+    beacon_current_release = (not ev.get("beacon_version")) or ev["beacon_version"] == VERSION
+    events = set(declared)
+    if ev.get("beacon_last_event"):
+        events.add(ev["beacon_last_event"])
+    events |= set(ev.get("db_observations") or {})
+
+    report: dict[str, dict[str, Any]] = {}
+    for event in sorted(events):
+        entry: dict[str, Any] = {"declared": event in declared, "state": HOOK_UNOBSERVED, "evidence": []}
+        has_current_strong = False
+        mismatch_reason = None
+
+        if ev.get("beacon_last_event") == event and ev.get("beacon_status") == "ok":
+            age = ev.get("beacon_age_seconds")
+            stale = age is not None and age > HOOKS_EVIDENCE_STALE_SECONDS
+            item = {"source": "beacon", "age_seconds": age, "strength": "strong",
+                    "stale": stale, "release": "current" if beacon_current_release else "other"}
+            entry["evidence"].append(item)
+            if not stale and beacon_current_release:
+                has_current_strong = True
+            if event not in declared:
+                mismatch_reason = f"the beacon evidences {event!r} firing, which the manifest does not declare"
+
+        for o in (ev.get("db_observations") or {}).get(event, []):
+            age = o["age_seconds"]
+            stale = age is not None and age > HOOKS_EVIDENCE_STALE_SECONDS
+            item = {**o, "stale": stale}
+            entry["evidence"].append(item)
+            if o["strength"] == "strong" and not stale:
+                has_current_strong = True
+            if event not in declared and mismatch_reason is None:
+                mismatch_reason = f"{o['source']} evidences {event!r} firing, which the manifest does not declare"
+
+        if mismatch_reason is not None:
+            entry["state"] = HOOK_MISMATCH
+            entry["mismatch_reason"] = mismatch_reason
+        elif has_current_strong:
+            entry["state"] = HOOK_OBSERVED
+        else:
+            entry["state"] = HOOK_UNOBSERVED
+        report[event] = entry
+    return report
 
 
 def release_coherence_check(
@@ -1654,8 +1843,9 @@ def release_coherence_check(
     beacon_path: Path | None = None,
     health_path: Path | None = None,
 ) -> tuple[bool, list[str], dict[str, Any]]:
-    """Do the running code, the beacon, the installed manifest, the schema,
-    the hooks MANIFEST, and the hooks ACTUALLY LOADED all name the SAME release?
+    """Do the running code, the beacon, the installed manifest and the schema
+    all name the SAME release, and is any hook-observability evidence
+    POSITIVELY INCOMPATIBLE with the installed manifest?
 
     This is the precondition for opening a new SHADOW experiment window
     (`active_experiment_started(create=True)`): the live incident this guards
@@ -1665,15 +1855,24 @@ def release_coherence_check(
     experiment. It never touches the live installation; it only reads files
     already on disk next to this script and the database already open.
 
-    `hooks_declared()` says only what the plugin's manifest ASKS Claude Code
-    to register -- not that Claude Code actually did. 0.6.0's correction:
-    `hooks_evidence()` reads two artifacts written by processes OTHER than a
-    manifest parser (my-error's own beacon, and the external watchdog's
-    health file) to say which hooks have EVIDENCE of having fired. A hook
-    that is declared but never evidenced is reported `unverified`, never
-    silently folded into "present". `beacon_path`/`health_path` default to
-    this machine's real files but are overridable so tests run against
-    fixtures, never against this machine's state.
+    0.6.0-rc2 correction (the proven rc1 defect): `coherent` now answers
+    EXACTLY the question in this docstring's first sentence -- release
+    identity (version/schema/manifest agreement) plus genuine MISMATCHes --
+    and NOTHING about whether a declared hook has been observed firing yet.
+    rc1 folded "declared but never evidenced" into this same gate, which made
+    `coherent: YES` structurally unreachable for `SessionEnd`/`Stop` (neither
+    can have fired in a live session) and, worse, measurably WRONG: it read
+    the watchdog's `health.hooks` map -- itself just a declaration, confirmed
+    from `watchdog/my-error-state.cjs` -- as if it were proof of firing, and
+    on that basis reported `UserPromptSubmit` unverified while the live
+    database held `recall_events` rows with `phase='prompt'` 2 minutes old.
+    Hook EXECUTION COVERAGE is still measured -- see `ev["coverage"]`, the
+    per-event DECLARED/OBSERVED/UNOBSERVED/MISMATCH breakdown from
+    `hook_observability()` -- it is simply a different question, reported
+    separately, and an UNOBSERVED hook never contributes a mismatch here.
+    `beacon_path`/`health_path` default to this machine's real files but are
+    overridable so tests run against fixtures, never against this machine's
+    state.
     """
     mismatches: list[str] = []
     try:
@@ -1704,35 +1903,52 @@ def release_coherence_check(
     if missing:
         mismatches.append(f"hooks manifest is missing: {sorted(missing)}")
 
-    # --- hooks ACTUALLY LOADED, not merely declared -------------------------
-    ev = hooks_evidence(beacon_path or (data_dir() / "runtime.json"), health_path or _default_health_path())
-    evidenced = set(ev["health_evidenced"])
-    if ev["beacon_last_hook"]:
-        evidenced.add(str(ev["beacon_last_hook"]))
-    if ev["health_status"] in ("absent", "unreadable") and ev["beacon_status"] in ("absent", "unreadable"):
-        # Both sources missing: there is no evidence to read at all. This must
-        # degrade to "cannot verify" -- NEVER to "coherent" -- so it is always
-        # a mismatch, distinct in wording from an actual disagreement.
+    # --- hooks ACTUALLY LOADED: execution coverage, kept separate from the
+    # release-identity mismatches above ---------------------------------
+    bp = beacon_path or (data_dir() / "runtime.json")
+    hp = health_path or _default_health_path()
+    ev = hooks_evidence(bp, hp, db=db)
+
+    # The watchdog reads the SAME installed_plugins.json this process could
+    # read itself and separately records the version it found there
+    # (`health.version`, confirmed from `structuralHealth()`). A disagreement
+    # here is concrete, positive evidence of a different installed release --
+    # a genuine MISMATCH, not an execution-coverage question -- so unlike
+    # `health.hooks` (which is treated strictly as a coverage input via
+    # `hook_observability`, never as evidence of firing), this one field is
+    # read for release identity, consistent with how the beacon's own
+    # `version` field is used two paragraphs above.
+    if ev["health_status"] == "ok" and ev["health_version"] and ev["health_version"] != VERSION:
         mismatches.append(
-            "hooks-loaded evidence cannot be verified: both the beacon "
-            f"({ev['beacon_status']}) and the watchdog health file ({ev['health_status']}) "
-            "are unavailable -- declared hooks are UNVERIFIED, not confirmed present")
-    else:
-        unverified = declared - evidenced
-        if unverified:
-            mismatches.append(
-                f"declared but UNVERIFIED (no evidence of ever firing): {sorted(unverified)}")
-        for src, age, status in (("beacon", ev["beacon_age_seconds"], ev["beacon_status"]),
-                                 ("watchdog health file", ev["health_age_seconds"], ev["health_status"])):
-            if status == "unreadable":
-                mismatches.append(f"the {src} exists but could not be parsed -- cannot verify from it")
-            elif status == "ok" and age is not None and age > HOOKS_EVIDENCE_STALE_SECONDS:
-                mismatches.append(
-                    f"the {src}'s hooks-loaded evidence is stale ({age:.0f}s old, "
-                    f"older than {HOOKS_EVIDENCE_STALE_SECONDS}s)")
+            f"code is {VERSION} but the watchdog health file reports the installed plugin as "
+            f"{ev['health_version']}")
+
+    coverage = hook_observability(ev, declared)
+    for event, entry in coverage.items():
+        if entry["state"] == HOOK_MISMATCH:
+            mismatches.append(f"{event}: {entry['mismatch_reason']}")
+
+    ev["coverage"] = coverage
     ev["declared_hooks"] = sorted(declared)
-    ev["evidenced_hooks"] = sorted(evidenced)
-    ev["unverified_hooks"] = sorted(declared - evidenced)
+    ev["observed_hooks"] = sorted(e for e, c in coverage.items() if c["state"] == HOOK_OBSERVED)
+    ev["unobserved_hooks"] = sorted(e for e, c in coverage.items() if c["state"] == HOOK_UNOBSERVED)
+    ev["mismatched_hooks"] = sorted(e for e, c in coverage.items() if c["state"] == HOOK_MISMATCH)
+    # Kept for any external reader still on the rc1 key names. Semantics have
+    # NOT changed to match the old name -- `evidenced_hooks` is OBSERVED
+    # hooks only (never health.hooks declarations) and `unverified_hooks` is
+    # exactly `unobserved_hooks`, which is no longer a mismatch contributor.
+    ev["evidenced_hooks"] = ev["observed_hooks"]
+    ev["unverified_hooks"] = ev["unobserved_hooks"]
+    if ev["health_status"] in ("absent", "unreadable") and ev["beacon_status"] in ("absent", "unreadable") \
+            and not any(ev.get("db_observations") or {}):
+        # No source could be read at all. This is an OBSERVABILITY gap, not a
+        # release-identity mismatch -- it says nothing about whether the
+        # beacon and the manifest agree, so it must not flip `coherent`. It
+        # is still surfaced loudly (doctor's text/json output) so it is never
+        # confused with "fully observed".
+        ev["observability_unavailable"] = True
+    else:
+        ev["observability_unavailable"] = False
     return (not mismatches, mismatches, ev)
 
 
@@ -4703,19 +4919,47 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             L.append(f"    {attr:28} {n}")
     L.append("")
     L.append("Release coherence (precondition for opening a NEW SHADOW window)")
+    L.append("  Version/schema/manifest agreement and genuine hook MISMATCHes only --")
+    L.append("  a declared hook that simply has not fired yet does NOT count against this.")
     L.append(f"  coherent: {'yes' if m['release_coherent'] else 'NO'}")
     for mm in m["release_mismatches"]:
         L.append(f"    MISMATCH: {mm}")
     hl = m.get("hooks_loaded") or {}
     if hl:
         L.append("")
-        L.append("  Hooks ACTUALLY LOADED (not merely declared in the manifest):")
+        L.append("  Hooks ACTUALLY LOADED -- execution coverage (a SEPARATE question from")
+        L.append("  coherence above; see docs/RELEASE-CANDIDATE-0.6.0.md):")
         L.append(f"    declared:    {hl.get('declared_hooks', [])}")
-        L.append(f"    evidenced:   {hl.get('evidenced_hooks', [])}  (evidence they fired, from the beacon + watchdog health file)")
-        L.append(f"    unverified:  {hl.get('unverified_hooks', [])}  (declared, but no evidence of ever firing -- NOT reported as present)")
-        L.append(f"    beacon:              {hl.get('beacon_status')}, last_hook={hl.get('beacon_last_hook')!r}, "
-                 f"age={hl.get('beacon_age_seconds')}")
-        L.append(f"    watchdog health file: {hl.get('health_status')}, age={hl.get('health_age_seconds')}")
+        L.append(f"    OBSERVED:    {hl.get('observed_hooks', [])}  (current, strong, release-attributable evidence of firing)")
+        L.append(f"    UNOBSERVED:  {hl.get('unobserved_hooks', [])}  (declared, no proven current execution yet -- NOT a fault; "
+                 f"expected for {sorted(SESSION_END_ONLY_HOOKS)} in any live session)")
+        if hl.get("mismatched_hooks"):
+            L.append(f"    MISMATCH:    {hl.get('mismatched_hooks', [])}  (evidence contradicts the manifest -- see MISMATCH lines above)")
+        cov = hl.get("coverage") or {}
+        for event in sorted(cov):
+            c = cov[event]
+            bits = []
+            for item in c.get("evidence", []):
+                src = item.get("source")
+                age = item.get("age_seconds")
+                age_s = f"{age:.0f}s" if isinstance(age, (int, float)) else "?"
+                flags = []
+                if item.get("stale"):
+                    flags.append("STALE")
+                if item.get("strength") == "weak":
+                    flags.append("weak attribution")
+                if item.get("release") == "other":
+                    flags.append("different release")
+                flag_s = f" [{', '.join(flags)}]" if flags else ""
+                bits.append(f"{src} ({age_s} old{flag_s})")
+            L.append(f"      {event}: {c['state']}" + (f" -- {', '.join(bits)}" if bits else " -- no evidence"))
+        if hl.get("observability_unavailable"):
+            L.append("    OBSERVABILITY UNAVAILABLE: the beacon, the watchdog health file, and the "
+                     "database all have nothing to read -- coverage above is unknown, not confirmed absent.")
+        L.append(f"    beacon:                {hl.get('beacon_status')}, last_hook={hl.get('beacon_last_hook')!r}, "
+                 f"version={hl.get('beacon_version')!r}, age={hl.get('beacon_age_seconds')}")
+        L.append(f"    watchdog health file:  {hl.get('health_status')}, declares={hl.get('health_declared_hooks', [])} "
+                 f"(a DECLARATION, not firing evidence), version={hl.get('health_version')!r}, age={hl.get('health_age_seconds')}")
     if m.get("shadow_v3_contamination_note"):
         L.append("")
         L.append("SHADOW v3 CONTAMINATION NOTE (window kept open; annotated, not erased):")
