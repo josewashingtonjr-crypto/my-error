@@ -1,3 +1,36 @@
+## Correction: `hooks_evidence()` was reading a declaration as proof of firing (rc2)
+
+Found by proof, not review: `doctor` reported `UserPromptSubmit` unverified on a
+live installation while the database held `recall_events` rows with
+`phase='prompt'` two minutes old. The hook had demonstrably fired; the checker
+said otherwise.
+
+Root cause: `hooks_evidence()`'s second source, the external watchdog's
+`.my-error-health.json` (`health.hooks`), is computed in `watchdog/my-error-state.cjs`
+by reading the plugin's OWN `hooks/hooks.json` manifest against a hardcoded
+four-event list and reporting which of those four are DECLARED. rc1 treated that
+as evidence of firing. It is a second declaration, not a measurement —
+`SessionEnd`/`Stop`/`UserPromptSubmit` could never appear in it at all, so
+`coherent: YES` was structurally unreachable, forever, for any installation.
+
+- Replaced the binary evidenced/unverified split with four explicit states:
+  `DECLARED`, `OBSERVED`, `UNOBSERVED` (not a fault), `MISMATCH` (concrete
+  contradicting evidence). See `hook_observability()`.
+- `health.hooks` is now read only for its two honest uses (its own
+  freshness/availability, and cross-checking the installed version it separately
+  records) — never as firing evidence.
+- Real evidence sources added, each traced to one hook kind:
+  `recall_events.phase`, `guard_events` rows, the beacon's `last_hook`. A
+  `candidates` row is accepted only as WEAK evidence (no release attribution) and
+  is never, alone, upgraded to `OBSERVED`.
+- `coherent` now means version/schema/manifest agreement plus genuine
+  `MISMATCH`es only. A hook that has not fired yet is reported separately
+  (`hooks_loaded.coverage`) and never drags `coherent` down -- `Stop`/`SessionEnd`
+  can be `UNOBSERVED` in every live session without that making the installation
+  incoherent.
+- No schema change. Version stays `0.6.0` (this is rc2 of the same release).
+  See `docs/RELEASE-CANDIDATE-0.6.0.md` section 6 for the full record.
+
 # 0.6.0 — active prevention: schema v7, severity, conditions, contextual recall
 
 Built per `docs/ACTIVE-PREVENTION.md`. Machinery only -- no guard is seeded for
