@@ -1,3 +1,20 @@
+## Correction: doctor read closed generations through the ACTIVE start
+
+Found by reconciling the doctor against the database (02/10). Once v3 opened,
+`active_experiment_started` returned v3's start, and three displays still read
+it as if it were v2's:
+
+- the v2 window printed as zero-length (`2026-09-22T12:47:04 -> 2026-09-22T12:47:04`)
+  instead of its stored `2026-09-02T17:01:05 -> 2026-09-22T12:47:04`;
+- the `Shadow experiment: v3` header printed v2's baseline (0.4.4) instead of v3's (0.4.5);
+- `v1 natural would_block` was 3 on the live database where v1 has **0** natural
+  rows: it still used `created_at < active start`, so v2 rows counted as v1. It now
+  selects on `experiment='v1'` like its sibling counts (project-scoped, as they are).
+
+Display only. The v3 canonical dataset already selected on the stored generation
+and is unchanged (27 on the live database before and after). No row is rewritten.
+Test: `test_E2_closed_generations_report_their_own_stamps_not_the_active_ones`.
+
 ## 0.6.1 — PreToolUse recall selection: rarity-weighted evidence
 
 Found by measurement, not review. With the WARN channel switched on against a

@@ -4417,15 +4417,24 @@ def collect_metrics(db: sqlite3.Connection, pid: str) -> dict[str, Any]:
     # re-deriving a window from whichever generation happens to be active. That
     # derivation broke the moment a third generation existed: `started` moved to
     # v3, and every v2 row silently became "before the start" -- i.e. v1.
-    # (Unlike the block above, this one needs only `created_at`/`mode`/`origin`,
-    # present since schema v2/v3, so it stays a real number on any schema.)
-    v1_natural_would_block = ev(f"AND mode='SHADOW' AND origin=? {v1win}", (ORIGIN_NATURAL,) + v1a)
+    # This count used to be the exception, still reading `v1win` (created_at <
+    # the ACTIVE start), so after v3 opened it counted v2 rows as v1. It now
+    # selects on the column like its siblings. Only a schema without the column
+    # falls back to a window, bounded by v1's own end stamp when there is one.
+    if has_experiment_col:
+        v1_natural_would_block = ev("AND mode='SHADOW' AND origin=? AND experiment='v1'", (ORIGIN_NATURAL,))
+    elif v1_ended:
+        v1_natural_would_block = ev("AND mode='SHADOW' AND origin=? AND created_at<?", (ORIGIN_NATURAL, v1_ended))
+    else:
+        v1_natural_would_block = ev(f"AND mode='SHADOW' AND origin=? {v1win}", (ORIGIN_NATURAL,) + v1a)
 
     out = {
         "mode": mode,
         "shadow_generation": SHADOW_GENERATION,
-        "shadow_started_at": started,   # v2 start; None until the first hook stamps it
-        "shadow_v2_started_at": started,
+        "shadow_started_at": started,   # ACTIVE generation's start; None until the first hook stamps it
+        # v2's own stamp. Never `started`: that moved to v3 and printed the closed
+        # v2 window as zero-length (start == v3 start).
+        "shadow_v2_started_at": meta_get(db, "shadow_v2_started_at"),
         "shadow_v2_baseline_version": meta_get(db, "shadow_v2_baseline_version") or SHADOW_V2_BASELINE_VERSION,
         "shadow_v1_started_at": v1_started,
         "shadow_v1_ended_at": v1_ended,
@@ -4854,7 +4863,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if m["mode"] == MODE_SHADOW:
         if m["shadow_started_at"]:
             L.append(f"Shadow experiment:  v{SHADOW_GENERATION}, day {m['shadow_day']} of {SHADOW_EXPERIMENT_DAYS} "
-                     f"(started {m['shadow_started_at']}, baseline my-error {m['shadow_v2_baseline_version']})")
+                     f"(started {m['shadow_started_at']}, baseline my-error {m['shadow_v3_baseline_version']})")
             v, why = shadow_verdict(m)
             L.append(f"Pre-committed verdict: {v} - {why}")
         else:

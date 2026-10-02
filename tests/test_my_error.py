@@ -1678,6 +1678,39 @@ class ShadowGenerationTest(unittest.TestCase):
         self.assertIn("MISSED_RELEVANT_RECALL", out)
         self.assertIn("recall metric, NOT in the verdict", out)
 
+    # --- E2 --------------------------------------------------------------
+    def test_E2_closed_generations_report_their_own_stamps_not_the_active_ones(self):
+        """Each generation's fields come from that generation's own record.
+
+        Regression: once v3 opened, `active_experiment_started` returned v3's
+        start, and three displays still read it as if it were v2's -- the v2
+        window printed as zero-length (start == v3 start), the header labelled
+        v3 printed v2's baseline version, and `v1_natural_would_block` counted
+        every natural row before v3 (i.e. v2 rows) as v1.
+        """
+        self._bootstrap()
+        self._set_meta("shadow_v1_started_at", "2026-08-18T14:24:26+00:00")
+        self._set_meta("shadow_v1_ended_at", "2026-09-02T00:00:00+00:00")
+        self._set_meta("shadow_v1_status", "INCONCLUSIVE_DUE_TO_MATERIAL_SYSTEM_CHANGES")
+        v2 = self._open_v2()
+        self._set_meta("shadow_v2_ended_at", "2026-09-22T00:00:00+00:00")
+        self._set_meta("shadow_v2_status", "INCONCLUSIVE_DUE_TO_MEASUREMENT_DEFECTS")
+        self._set_meta("shadow_v2_baseline_version", "0.4.4")
+        v3 = self._open_v3()
+        self._set_meta("shadow_v3_baseline_version", "0.4.5")
+        # One genuine v1 row is the positive control: the count must still see it.
+        self._event("2026-08-20T10:00:00+00:00", "natural_usage", "true_positive", experiment="v1")
+        self._event("2026-09-11T10:00:00+00:00", "natural_usage", "true_positive", experiment="v2")
+        d = self._doctor()
+        self.assertEqual(d["v1_natural_would_block"], 1, "a v2 row was counted as v1")
+        self.assertEqual(d["shadow_v2_started_at"], v2)
+        self.assertEqual(d["shadow_started_at"], v3, "the active clock must stay on v3")
+        out = self.run_cli("doctor").stdout
+        self.assertIn(f"  window:    {v2} -> 2026-09-22T00:00:00+00:00", out)
+        header = next(l for l in out.splitlines() if l.startswith("Shadow experiment:"))
+        self.assertIn("Shadow experiment:  v3,", header)
+        self.assertIn("baseline my-error 0.4.5", header)
+
     # --- F ---------------------------------------------------------------
     def test_F_precommitted_rule_is_byte_identical(self):
         """The rule may not drift while the population it reads is redefined."""
